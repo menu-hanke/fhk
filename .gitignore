@@ -1,0 +1,6 @@
+*.o
+*.so
+*.a
+.gdb_history
+/fhk_cdef.lua
+/loader.c

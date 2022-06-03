@@ -1,0 +1,2 @@
+#!/bin/sh
+LD_PRELOAD=../fhk.so luajit tap.lua -P '../?.lua;../ffi-reflect/?.lua' $@

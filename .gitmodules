@@ -1,0 +1,6 @@
+[submodule "libco"]
+	path = libco
+	url = https://github.com/higan-emu/libco
+[submodule "ffi-reflect"]
+	path = ffi-reflect
+	url = https://github.com/corsix/ffi-reflect
