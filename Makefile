@@ -14,10 +14,13 @@ CC             = $(CROSS)gcc
 AR             = $(CROSS)gcc-ar
 LUAJIT         = luajit
 BCLOADER       = $(LUAJIT) bcloader
+PYTHON         = python
+CYTHON         = cython
 PKGCONFIG      = pkg-config
 
 # include paths
 LUAJIT_I       = $(shell $(PKGCONFIG) --cflags-only-I luajit)
+PYTHON_I       = -I$(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_path("include"))')
 
 # embed lua bytecode? [y]/n
 LINKLUA       ?= y
@@ -82,6 +85,7 @@ endif
 # objects
 CORE_O      = arena.o build.o cmd.o debug.o mut.o prune.o solve.o state.o
 EMBED_O     = jtab.o
+PYX_O       = _ctypes.pyx.o
 ifeq (y,$(LINKLUA))
 LUACORE_O   = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o fhk_g.lua.o \
 			  fhk_lib.lua.o fhk_rules.lua.o
@@ -123,8 +127,10 @@ help:
 	@echo "targets:"
 	@echo "    libfhklua.a - Lua static library"
 	@echo "    fhk$(TARGET_SO) - C+Lua shared library"
+	@echo "    libfhkpy.a - Python static library"
 
 libfhklua.a: $(CORE_O) $(EMBED_O) $(LUACORE_O) $(LUALIB_O)
+libfhkpy.a:  $(CORE_O) $(EMBED_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_O)
 
 %.a:
 	$(AR) rcs $@ $^
@@ -147,17 +153,21 @@ fhk$(TARGET_SO): $(CORE_O) $(EMBED_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
 %.lua: %.lua.h
 	$(CC) $(CCDEF) $(LUAHDEF) -P -E -nostdinc $< 2>/dev/null >$@ || true
 
+%.pyx.c: %.pyx
+	$(CYTHON) $< -o $@
+
 loader.c:
 	$(BCLOADER) -o $(TARGET) -n fhk -c fhk_api -L > $@
 loader.o: CFLAGS += $(LUAJIT_I)
 
 fhk_cdef.lua: LUAHDEF = -DFHK_CORO=$(CORO) $(CCGITHASH)
+_ctypes.pyx.o: CCINCLUDE += $(LUAJIT_I) $(PYTHON_I)
 
 #--------------------------------------------------------------------------------
 
 .PHONY: clean
 clean:
-	$(RM) *.o *.a *.so loader.c fhk_cdef.lua
+	$(RM) *.o *.a *.so *.pyx.c *.pyx.h loader.c fhk_cdef.lua
 
 .PHONY: dep
 dep:

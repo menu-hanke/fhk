@@ -1,6 +1,8 @@
 *.o
 *.so
 *.a
+*.pyx.c
+*.pyx.h
 .gdb_history
 /fhk_cdef.lua
 /loader.c

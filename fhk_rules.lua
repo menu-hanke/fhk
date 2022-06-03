@@ -463,7 +463,7 @@ end
 
 ---- rules ----------------------------------------
 
-local function composite(rules)
+local function compose(rules)
 	if #rules == 1 then
 		return rules[1]
 	else
@@ -475,8 +475,12 @@ local function composite(rules)
 	end
 end
 
+local function composite(...)
+	return compose({...})
+end
+
 local function group(name, ...)
-	local rules = composite({...})
+	local rules = composite(...)
 	return function(what, x)
 		if what == "group" and x.name ~= name then return end
 		if what == "var" and lib.groupof(x.name) ~= name then return end
@@ -486,7 +490,7 @@ local function group(name, ...)
 end
 
 local function tagged(what_, ...)
-	local rules = composite({...})
+	local rules = composite(...)
 	return function(what, x)
 		if what_ == what then
 			return rules(what, x)
@@ -495,7 +499,7 @@ local function tagged(what_, ...)
 end
 
 local function named(name, ...)
-	local rules = composite({...})
+	local rules = composite(...)
 	return function(what, x)
 		if x.name and lib.matchname(x.name, name) then
 			return rules(what, x)
@@ -648,6 +652,7 @@ return {
 	read        = read,
 	buildgraph  = buildgraph,
 	buildinit   = buildinit,
+	compose     = compose,
 	composite   = composite,
 	group       = group,
 	tagged      = tagged,

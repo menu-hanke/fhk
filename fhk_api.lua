@@ -392,7 +392,7 @@ local fhk_mt = {
 
 local function new(...)
 	return setmetatable({
-		state   = rules.newstate(rules.composite({...})),
+		state   = rules.newstate(rules.composite(...)),
 		init    = initsolver_template(),
 		solvers = {}
 	}, fhk_mt)
