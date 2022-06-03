@@ -323,7 +323,7 @@ struct fhk_graph {
 	struct fhk_model models[0];
 
 	fhkP_idxN nv; // variable count
-	fhkP_idxN nx; // variable-like count (variables+shadows)
+	fhkP_idxN nx; // variable-like count (variables+guards)
 	fhkP_idxN nm; // model count
 	fhkP_group ng;  // group count
 	fhkP_mapN nk; // constant map count (including groups)

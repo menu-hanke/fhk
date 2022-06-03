@@ -235,26 +235,21 @@ void *fhk_setrootD(struct fhk_solver *S, int idx, fhk_subset ss){
 
 /* ---- setvalue ---------------------------------------- */
 
-// clear [start, end)
-static int vref_clear_missing(fhkX_bitmap bm, int start, int end){
+static void vref_clear_interval(struct fhk_solver *S, int idx, fhkX_bitmap bm, int start, int end) {
 	int off = start/64;
 	uint64_t *M = bitmap_ref64(bm) + off;
 	uint64_t m;
-
 	if(off == end/64){
 		uint64_t mask = bitmapW_ones64(bitmap_shift64(start)) | bitmapW_zeros64(bitmap_shift64(end));
 		m = ~(*M | mask);
 		*M &= mask;
 		goto tail;
 	}
-
 	m = ~(*M | bitmapW_ones64(bitmap_shift64(start)));
 	*M &= bitmapW_ones64(bitmap_shift64(start));
-
 	for(;;){
 		if(UNLIKELY(m))
 			goto fail;
-
 		M++;
 		m = *M;
 		if(++off == end/64){
@@ -266,95 +261,104 @@ static int vref_clear_missing(fhkX_bitmap bm, int start, int end){
 			*M = 0;
 		}
 	}
-
 tail:
 	if(UNLIKELY(m)){
 fail:
-		return 64*off + bitmapW_ffs64(m);
+		fhk_fail(S, ecode(WRITE) | etagA(NODE, idx) | etagB(INST, 64*off+bitmapW_ffs64(m)));
 	}
-
-	return -1;
 }
 
-static void vref_setvalue(struct fhk_solver *S, int idx, fhk_subset ss, void *p, int ephemeral){
-	if(UNLIKELY(subset_isE(ss))) return;
-	if(UNLIKELY(!input_assertV(S, idx))) return;
-
+static void *vref_prep(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p) {
+	if(UNLIKELY(subset_isE(ss))) return NULL;
+	if(UNLIKELY(!input_assertV(S, idx))) return NULL;
 	struct fhk_var *x = &S->G->vars[idx];
-	if(UNLIKELY(!var_isG(x))){
+	if(UNLIKELY(!var_isG(x))) {
 		fhk_fail(S, ecode(GIVEN) | etagA(NODE, idx));
-		return;
+		return NULL;
 	}
-
 	void *vp = valueV(S->value, idx);
-
-	if(!vp){
-		fhkX_anymap amg = S->mapstate[x->group];
-		if(UNLIKELY(anymap_isU(amg))){
-			fhk_fail(S, ecode(NOVALUE) | etagA(MAP, x->group));
-			return;
-		}
-
-		fhk_subset space = anymapK(amg);
-		xinst num = subsetIE_size(space);
-
-		// for given variables, the existence of value buffer implies existence
-		// of the bitmap (the converse is not true).
-		// therefore, it's enough to check the bitmap here.
-		if(!S->stateG[idx])
-			S->stateG[idx] = fhk_solver_newbitmap(S, subsetIE_size(space));
-
-		if(ss == space && !ephemeral){
-			valueV(S->value, idx) = p;
-			// overflow must be zero, so this is fine.
-			memset(bitmap_ref64(S->stateG[idx]), 0, bitmap_size(num));
-			trace(SETVALD, fhk_debug_sym(S->G, idx), p, fhk_debug_value(S, idx, 0));
-			return;
-		}
-
-		vp = fhk_solver_newvalue(S, x->size, num);
-		valueV(S->value, idx) = vp;
+	if(vp) return vp;
+	fhkX_anymap amg = S->mapstate[x->group];
+	if(UNLIKELY(anymap_isU(amg))) {
+		// need to init vp but group size is unknown.
+		fhk_fail(S, ecode(NOVALUE) | etagA(MAP, x->group));
+		return NULL;
 	}
-
-	size_t size = x->size;
-	fhkX_bitmap M = S->stateG[idx];
-	int inst;
-
-	if(LIKELY(subset_isI(ss))){
-		int32_t first = subsetI_first(ss);
-		int32_t num = subsetIE_size(ss);
-		if(UNLIKELY((inst = vref_clear_missing(M, first, first+num)) >= 0))
-			goto ewrite;
-		memcpy(vp + size*first, p, size*num);
-		trace(SETVALI, fhk_debug_sym(S->G, idx), first, num-1, fhk_debug_value(S, idx, first));
-		return;
+	fhk_subset space = anymapK(amg);
+	xinst num = subsetIE_size(space);
+	// maintain invariant: value buffer exists => bitmap exists.
+	if(!S->stateG[idx])
+		S->stateG[idx] = fhk_solver_newbitmap(S, num);
+	if(p && ss == space) {
+		valueV(S->value, idx) = p;
+		// bitmaps overflow to zeros, so a brutal memset is fine.
+		memset(bitmap_ref64(S->stateG[idx]), 0, bitmap_size(num));
+		trace(SETVALR, fhk_debug_sym(S->G, idx), p, fhk_debug_value(S, idx, 0));
+		return NULL;
 	}
-
-	fhkX_pkref pk = subsetC_pk(ss);
-	for(;;){
-		int32_t first = pkref_first(pk);
-		int32_t num = pkref_size(pk);
-		xinst skip = size*num;
-		if(UNLIKELY((inst = vref_clear_missing(M, first, first+num)) >= 0))
-			goto ewrite;
-		memcpy(vp + size*first, p, skip);
-		trace(SETVALI, fhk_debug_sym(S->G, idx), first, num-1, fhk_debug_value(S, idx, first));
-		if(!pkref_more(pk))
-			return;
-		p += skip;
-		pk = pkref_next(pk);
-	}
-
-ewrite:
-	fhk_fail(S, ecode(WRITE) | etagA(NODE, idx) | etagB(INST, inst));
+	vp = fhk_solver_newvalue(S, x->size, num);
+	valueV(S->value, idx) = vp;
+	return vp;
 }
 
-void fhk_setvalue(struct fhk_solver *S, int idx, fhk_subset ss, void *p){
-	vref_setvalue(S, idx, ss, p, 0);
+static void vref_copyvalue(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p, void *px) {
+	void *vp = vref_prep(S, idx, ss, px);
+	if(UNLIKELY(!vp)) return;
+	size_t size = S->G->vars[idx].size;
+	fhkX_bitmap bm = S->stateG[idx];
+	if(LIKELY(subset_isI(ss))) {
+		int start = subsetI_first(ss);
+		int num = subsetIE_size(ss);
+		vref_clear_interval(S, idx, bm, start, start+num);
+		memcpy(vp+start*size, p, size*num);
+		trace(SETVALI, fhk_debug_sym(S->G, idx), start, num-1, fhk_debug_value(S, idx, start));
+	} else {
+		fhkX_pkref pk = subsetC_pk(ss);
+		for(;;) {
+			int start = pkref_first(pk);
+			int num = pkref_size(pk);
+			xinst skip = size*num;
+			vref_clear_interval(S, idx, bm, start, start+num);
+			memcpy(vp + size*start, p, skip);
+			trace(SETVALI, fhk_debug_sym(S->G, idx), start, num-1, fhk_debug_value(S, idx, start));
+			if(!pkref_more(pk)) return;
+			p += skip;
+			pk = pkref_next(pk);
+		}
+	}
 }
 
-void fhk_setvalueC(struct fhk_solver *S, int idx, fhk_subset ss, void *p){
-	vref_setvalue(S, idx, ss, p, 1);
+void fhk_setvalue(struct fhk_solver *S, int idx, fhk_subset ss, void *p) {
+	vref_copyvalue(S, idx, ss, p, p);
+}
+
+void fhk_setvalueC(struct fhk_solver *S, int idx, fhk_subset ss, void *p) {
+	vref_copyvalue(S, idx, ss, p, NULL);
+}
+
+void *fhk_setvalueD(struct fhk_solver *S, int idx, fhk_subset ss) {
+	void *vp = vref_prep(S, idx, ss, NULL);
+	if(UNLIKELY(!vp)) return NULL;
+	size_t size = S->G->vars[idx].size;
+	fhkX_bitmap bm = S->stateG[idx];
+	if(LIKELY(subset_isI(ss))) {
+		int start = subsetI_first(ss);
+		int num = subsetIE_size(ss);
+		vref_clear_interval(S, idx, bm, start, start+num);
+		trace(SETVALD, fhk_debug_sym(S->G, idx), start, num-1);
+		return vp + start*size;
+	} else {
+		fhkX_pkref pk = subsetC_pk(ss);
+		vp += size*pkref_first(pk);
+		for(;;) {
+			int start = pkref_first(pk);
+			int num = pkref_size(pk);
+			vref_clear_interval(S, idx, bm, start, start+num);
+			trace(SETVALD, fhk_debug_sym(S->G, idx), start, num-1);
+			if(!pkref_more(pk)) return vp;
+			pk = pkref_next(pk);
+		}
+	}
 }
 
 /* ---- copysubset ---------------------------------------- */

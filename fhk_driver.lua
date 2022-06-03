@@ -747,16 +747,11 @@ local function vrefv(fb, op)
 	local idx = defidx(op.var and op.var.idx)
 	local inst = definst(op.inst)
 	local f = upval(fb, op.f)
-	local ct = upval(fb, ffi.typeof("$[1]", op.var and op.var.ctype or op.ctype))
+	local ctp = upval(fb, ffi.typeof("$*", op.var and op.var.ctype or op.ctype))
+	fb.upv.cast = ffi.cast
 	fb.src:putf(
-		[[
-			local vp = %s()
-			vp[0] = %s(%s, X)
-			C.fhk_setvalueC(S, %s, %s, vp)
-		]],
-		ct,
-		f, inst,
-		idx, inst
+		"cast(%s, C.fhk_setvalueD(S, %s, %s))[0] = %s(%s, X)\n",
+		ctp, idx, inst, f, inst
 	)
 	fb.name = string.format("=fhk:vrefv<%s>@%s", xname(op.var), funcname(op.f))
 end

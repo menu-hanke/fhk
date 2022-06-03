@@ -129,6 +129,7 @@ void fhk_setmapK(fhk_solver *S, int map, fhk_subset ss);
 void fhk_setmapI(fhk_solver *S, int map, int inst, fhk_subset ss);
 void fhk_setvalue(fhk_solver *S, int idx, fhk_subset ss, void *p);
 void fhk_setvalueC(fhk_solver *S, int idx, fhk_subset ss, void *p);
+void *fhk_setvalueD(fhk_solver *S, int idx, fhk_subset ss);
 fhk_subset fhk_copysubset(fhk_solver *S, fhk_subset ss);
 
 /* building */
