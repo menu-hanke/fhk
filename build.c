@@ -2,6 +2,7 @@
 #include "fhk.h"
 #include "debug.h"
 #include "def.h"
+#include "mut.h"
 #include "trace.h"
 
 #include <assert.h>
@@ -12,10 +13,10 @@
 
 /* ---- layouting ---------------------------------------- */
 
-static void layout_link_edge(struct fhk_mut_graph *M, fhkX_mref ref){
-	struct fhk_mut_edge *edge = mref_ptr(M, ref);
-	struct fhk_mut_var *var = mref_ptr(M, edge->var);
-	struct fhk_mut_model *model = mref_ptr(M, edge->model);
+static void layout_link_edge(struct fhk_mut_graph *M, fhk_mref ref){
+	struct fhk_mut_edge *edge = mrefp(M, ref);
+	struct fhk_mut_var *var = mrefp(M, edge->var);
+	struct fhk_mut_model *model = mrefp(M, edge->model);
 	assert(!mtag_ispruned(model->tag));
 	assert(!mtag_ispruned(var->tag));
 	if(mtagTP(edge->tag) == MTAG(edgeP)){
@@ -32,15 +33,15 @@ static void layout_link_edge(struct fhk_mut_graph *M, fhkX_mref ref){
 	trace(LINKEDGE, fhk_mut_debug_sym(M, edge->var), fhk_mut_debug_sym(M, edge->model));
 }
 
-static void layout_link_check(struct fhk_mut_graph *M, fhkX_mref ref){
-	struct fhk_mut_check *check = mref_ptr(M, ref);
-	struct fhk_mut_guard *guard = mref_ptr(M, check->guard);
-	struct fhk_mut_model *model = mref_ptr(M, check->model);
+static void layout_link_check(struct fhk_mut_graph *M, fhk_mref ref){
+	struct fhk_mut_check *check = mrefp(M, ref);
+	struct fhk_mut_guard *guard = mrefp(M, check->guard);
+	struct fhk_mut_model *model = mrefp(M, check->model);
 	// merged guard
 	if(mtag_isA(guard->tag)){
 		assert(mtag_ispruned(guard->tag));
 		check->guard = guard->nextV;
-		guard = mref_ptr(M, check->guard);
+		guard = mrefp(M, check->guard);
 	}
 	assert(!mtag_ispruned(model->tag));
 	assert(!mtag_ispruned(guard->tag));
@@ -51,8 +52,8 @@ static void layout_link_check(struct fhk_mut_graph *M, fhkX_mref ref){
 	trace(LINKCHK, fhk_mut_debug_sym(M, ref));
 }
 
-static void layout_link_var(struct fhk_mut_graph *M, fhkX_mref ref){
-	struct fhk_mut_var *var = mref_ptr(M, ref);
+static void layout_link_var(struct fhk_mut_graph *M, fhk_mref ref){
+	struct fhk_mut_var *var = mrefp(M, ref);
 	var->next = M->var;
 	var->back = 0;
 	var->fwdM = 0;
@@ -61,8 +62,8 @@ static void layout_link_var(struct fhk_mut_graph *M, fhkX_mref ref){
 	trace(LINKVAR, fhk_mut_debug_sym(M, ref));
 }
 
-static void layout_link_model(struct fhk_mut_graph *M, fhkX_mref ref){
-	struct fhk_mut_model *model = mref_ptr(M, ref);
+static void layout_link_model(struct fhk_mut_graph *M, fhk_mref ref){
+	struct fhk_mut_model *model = mrefp(M, ref);
 	model->next = M->model;
 	model->backV = 0;
 	model->backC = 0;
@@ -71,17 +72,17 @@ static void layout_link_model(struct fhk_mut_graph *M, fhkX_mref ref){
 	trace(LINKMOD, fhk_mut_debug_sym(M, ref));
 }
 
-static void layout_link_guard(struct fhk_mut_graph *M, fhkX_mref ref){
-	struct fhk_mut_guard *guard = mref_ptr(M, ref);
-	struct fhk_mut_var *var = mref_ptr(M, guard->var);
+static void layout_link_guard(struct fhk_mut_graph *M, fhk_mref ref){
+	struct fhk_mut_guard *guard = mrefp(M, ref);
+	struct fhk_mut_var *var = mrefp(M, guard->var);
 	assert(!mtag_ispruned(var->tag));
 	// set 'A' iff it's merged.
 	guard->tag &= ~MTAG_AB;
 	// can we merge it? (XXX: should this be its own pass or part of layouting?)
 	if(guard_isset(guard->opcode)){
 		struct fhk_mut_guard *gm;
-		for(fhkX_mref gh=var->fwdG; gh; gh=gm->nextV){
-			gm = mref_ptr(M, gh);
+		for(fhk_mref gh=var->fwdG; gh; gh=gm->nextV){
+			gm = mrefp(M, gh);
 			if(gm->opcode == guard->opcode && gm->arg.u64 == guard->arg.u64){
 				// merge into `gm`
 				guard->tag |= MTAG_PRUNE | MTAG_A;
@@ -104,7 +105,7 @@ static void layout_relink(struct fhk_mut_graph *M){
 	M->model = 0;
 	M->guard = 0;
 
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 
 	while(ref < M->committed){
 		int tag = mref_tag(M, ref);
@@ -142,7 +143,7 @@ static void layout_relink(struct fhk_mut_graph *M){
 static fhk_status layout_count(struct fhk_mut_graph *M){
 	int num[FHKX_MTAG__max] = { 0 };
 
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
 		fhkX_mtag tag = mref_tag(M, ref);
 		num[mtagT(tag)] += mtag_ispruned(tag) ? 0 : 1;
@@ -151,12 +152,12 @@ static fhk_status layout_count(struct fhk_mut_graph *M){
 
 	int nv = num[MTAG(var)];
 	int nx = nv + num[MTAG(guard)];
-	if(UNLIKELY(nx-1 > MAX_IDX)) return ecode(BOUND) | etagE(NODE, nx-1);
+	if(UNLIKELY(nx-1 > MAX_IDX)) return ecode(BOUND) | etagA(NODE, nx-1);
 	M->nv = nv;
 	M->nx = nx;
 
 	int nm = num[MTAG(model)];
-	if(UNLIKELY(-nm < MIN_IDX)) return ecode(BOUND) | etagE(NODE, -nm);
+	if(UNLIKELY(-nm < MIN_IDX)) return ecode(BOUND) | etagA(NODE, -nm);
 	M->nm = nm;
 
 	// return edges have a reverse edge v->m
@@ -166,19 +167,19 @@ static fhk_status layout_count(struct fhk_mut_graph *M){
 	return 0;
 }
 
-static void layout_order_walkV(struct fhk_mut_graph *M, fhkX_mref ref, int *pv, int *pg, int *pm);
+static void layout_order_walkV(struct fhk_mut_graph *M, fhk_mref ref, int *pv, int *pg, int *pm);
 
-static void layout_order_walkM(struct fhk_mut_graph *M, fhkX_mref ref, int *pv, int *pg, int *pm){
-	struct fhk_mut_model *model = mref_ptr(M, ref);
+static void layout_order_walkM(struct fhk_mut_graph *M, fhk_mref ref, int *pv, int *pg, int *pm){
+	struct fhk_mut_model *model = mrefp(M, ref);
 	if(mtag_isA(model->tag))
 		return;
 
 	model->tag |= MTAG_A;
 
 	struct fhk_mut_check *cm;
-	for(fhkX_mref ch=model->backC; ch; ch=cm->nextM){
-		cm = mref_ptr(M, ch);
-		struct fhk_mut_guard *guard = mref_ptr(M, cm->guard);
+	for(fhk_mref ch=model->backC; ch; ch=cm->nextM){
+		cm = mrefp(M, ch);
+		struct fhk_mut_guard *guard = mrefp(M, cm->guard);
 		if(!mtag_isA(guard->tag)){
 			guard->tag |= MTAG_A;
 			guard->order = (*pg)++;
@@ -186,30 +187,30 @@ static void layout_order_walkM(struct fhk_mut_graph *M, fhkX_mref ref, int *pv, 
 		}
 	}
 
-	for(fhkX_mref ch=model->backC; ch; ch=cm->nextM){
-		cm = mref_ptr(M, ch);
-		struct fhk_mut_guard *guard = mref_ptr(M, cm->guard);
+	for(fhk_mref ch=model->backC; ch; ch=cm->nextM){
+		cm = mrefp(M, ch);
+		struct fhk_mut_guard *guard = mrefp(M, cm->guard);
 		layout_order_walkV(M, guard->var, pv, pg, pm);
 	}
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=model->backV; eh; eh=em->nextM){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=model->backV; eh; eh=em->nextM){
+		em = mrefp(M, eh);
 		layout_order_walkV(M, em->var, pv, pg, pm);
 	}
 }
 
-static void layout_order_walkV(struct fhk_mut_graph *M, fhkX_mref ref, int *pv, int *pg, int *pm){
-	struct fhk_mut_var *var = mref_ptr(M, ref);
+static void layout_order_walkV(struct fhk_mut_graph *M, fhk_mref ref, int *pv, int *pg, int *pm){
+	struct fhk_mut_var *var = mrefp(M, ref);
 	if(mtag_isA(var->tag))
 		return;
 
 	var->tag |= MTAG_A;
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=var->back; eh; eh=em->nextV){
-		em = mref_ptr(M, eh);
-		struct fhk_mut_model *model = mref_ptr(M, em->model);
+	for(fhk_mref eh=var->back; eh; eh=em->nextV){
+		em = mrefp(M, eh);
+		struct fhk_mut_model *model = mrefp(M, em->model);
 		if(!mtag_isB(model->tag)){
 			model->tag |= MTAG_B;
 			model->order = (*pm)++;
@@ -217,8 +218,8 @@ static void layout_order_walkV(struct fhk_mut_graph *M, fhkX_mref ref, int *pv, 
 		}
 	}
 
-	for(fhkX_mref eh=var->back; eh; eh=em->nextV){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=var->back; eh; eh=em->nextV){
+		em = mrefp(M, eh);
 		layout_order_walkM(M, em->model, pv, pg, pm);
 	}
 
@@ -243,19 +244,19 @@ static void layout_order(struct fhk_mut_graph *M){
 	// +------------+----------+--------+
 
 	// step 1. special cases:
-	// * we will put given variables first, so that the caller can use them to eg. index a table
+	// * given variables go first.
 	// * we will put models without any returns last. this doesn't matter much because the solver
 	//   never calls them, but it's a case we must handle. note that if a prune step is run,
 	//   there won't be any of these in the graph.
 	// * we will put guards without any models first. it doesn't matter where we put them,
 	//   and there won't be any in a pruned graph.
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
 		int tag = mref_tag(M, ref);
 		switch(mtagTP(tag)){
 			case MTAG(var):
 			{
-				struct fhk_mut_var *var = mref_ptr(M, ref);
+				struct fhk_mut_var *var = mrefp(M, ref);
 				if(!var->back){
 					var->order = pv++;
 					var->tag |= MTAG_A;
@@ -266,7 +267,7 @@ static void layout_order(struct fhk_mut_graph *M){
 
 			case MTAG(model):
 			{
-				struct fhk_mut_model *model = mref_ptr(M, ref);
+				struct fhk_mut_model *model = mrefp(M, ref);
 				if(UNLIKELY(!model->fwd)){
 					model->order = pm++;
 					model->tag |= MTAG_AB;
@@ -277,7 +278,7 @@ static void layout_order(struct fhk_mut_graph *M){
 
 			case MTAG(guard):
 			{
-				struct fhk_mut_guard *guard = mref_ptr(M, ref);
+				struct fhk_mut_guard *guard = mrefp(M, ref);
 				if(UNLIKELY(!guard->fwd)){
 					guard->order = pg++;
 					guard->tag |= MTAG_A;
@@ -288,6 +289,8 @@ static void layout_order(struct fhk_mut_graph *M){
 		}
 		ref += mtag_size(tag);
 	}
+
+	M->nz = pv;
 
 	// step 2. make a topological sort of the rest.
 	// we sort variables in depth-first order and models in breadth-first order.
@@ -310,6 +313,12 @@ static void layout_order(struct fhk_mut_graph *M){
 	assert(pv == M->nv && pg == M->nx && pm == 0);
 }
 
+static void layout_bias(struct fhk_mut_graph *M) {
+	M->bn = 2 + M->nm;
+	M->bk = M->bn + M->nz;
+	M->bi = M->bk + M->nk + M->ni;
+}
+
 static fhk_status layout_maps(struct fhk_mut_graph *M){
 	if(M->maptable)
 		free(M->maptable);
@@ -318,9 +327,9 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 	M->maptable = malloc(nmap);
 	memset(M->maptable, 0, nmap);
 
-	fhkP_map *mtab = M->maptable + M->c_mapI;
+	fhkP_smap *mtab = M->maptable + M->c_mapI;
 	int cg = M->c_group;
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
 		fhkX_mtag tag = mref_tag(M, ref);
 
@@ -329,7 +338,7 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 			// v->m is used for candidate selection.
 			case MTAG(edgeR):
 			{
-				struct fhk_mut_edge *edge = mref_ptr(M, ref);
+				struct fhk_mut_edge *edge = mrefp(M, ref);
 				if(mhandle_ismapu(edge->mapMV)){
 					mtab[mhandleV(edge->mapMV) + (mhandle_ismapL(edge->mapMV) ? cg : 0)] = 1;
 					mtab[mhandleV(edge->mapVM) + (mhandle_ismapL(edge->mapVM) ? cg : 0)] = 1;
@@ -342,7 +351,7 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 			case MTAG(edgeP):
 			case MTAG(check):
 			{
-				fhk_mhandle map = ((struct fhk_mut_edge *) mref_ptr(M, ref))->mapMV;
+				fhk_mhandle map = ((struct fhk_mut_edge *) mrefp(M, ref))->mapMV;
 				if(mhandle_ismapu(map))
 					mtab[mhandleV(map) + (mhandle_ismapL(map) ? cg : 0)] = 1;
 				break;
@@ -351,7 +360,7 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 			case MTAG(var):
 			case MTAG(model):
 			{
-				int gid = ((struct fhk_mut_var *) mref_ptr(M, ref))->gid;
+				int gid = ((struct fhk_mut_var *) mrefp(M, ref))->gid;
 				mtab[gid] = 1;
 				break;
 			}
@@ -360,8 +369,8 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 		ref += mtag_size(tag);
 	}
 
-	int ni = 0, nk = 0, ng = 0;
-	fhkP_map *p = M->maptable;
+	int ni = 1, nk = 0, ng = 0;
+	fhkP_smap *p = M->maptable;
 
 	for(int i=0;i<M->c_mapI;i++,p++){
 		ni += *p;
@@ -387,9 +396,8 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 		nk += flag;
 	}
 
-	if(UNLIKELY(-ni < MIN_MAPI))   return ecode(BOUND) | etagE(MAP, -ni);
-	if(UNLIKELY(nk-1 > MAX_MAPK))  return ecode(BOUND) | etagE(MAP, nk-1);
-	if(UNLIKELY(ng-1 > MAX_GROUP)) return ecode(BOUND) | etagE(GROUP, ng-1);
+	if(UNLIKELY(-ni < MIN_MAPI))   return ecode(BOUND) | etagA(MAP, -ni);
+	if(UNLIKELY(nk-1 > MAX_MAPK))  return ecode(BOUND) | etagA(MAP, nk-1);
 
 	M->ni = ni;
 	M->nk = nk;
@@ -401,7 +409,7 @@ static fhk_status layout_maps(struct fhk_mut_graph *M){
 static int layout_relocate_map(struct fhk_mut_graph *M, fhk_mhandle map){
 	if(mhandle_isident(map))
 		return MAP_IDENT;
-	fhkP_map *mtab = mgraph_maptable(M);
+	fhkP_smap *mtab = mgraph_maptable(M);
 	return mtab[mhandleV(map) + (mhandle_ismapL(map) ? M->c_group : 0)];
 }
 
@@ -409,9 +417,9 @@ static size_t layout_size(struct fhk_mut_graph *M){
 	size_t size = sizeof(struct fhk_graph)
 		+ M->nm * sizeof(struct fhk_model)
 		+ M->nx * sizeof(struct fhk_var) // this includes guards
-		+ M->ne * sizeof(fhk_edge) 
+		+ M->ne * sizeof(fhk_edge)
 		+ M->nc * sizeof(fhk_check)
-		+ M->ni * sizeof(fhkP_group);
+		+ (M->ni-1) * sizeof(fhkP_group);
 
 #if FHK_DSYM
 	if(M->dsym){
@@ -423,57 +431,55 @@ static size_t layout_size(struct fhk_mut_graph *M){
 	return size;
 }
 
-static int layout_query_ref(struct fhk_mut_graph *M, fhkX_mref ref){
-	switch(mtagTP(mref_tag(M, ref))){
+static fhk_query layout_query_ref(struct fhk_mut_graph *M, fhk_mref ref) {
+	switch(mtagTP(mref_tag(M, ref))) {
 		case MTAG(edgeP):
 		case MTAG(edgeR):
 		case MTAG(check):
-			// edge reordering is not saved, so we either give 0 for included,
-			// or FHK_PRUNED for pruned
-			return 0;
-
+			// edge reordering is not saved, so it's just included/pruned.
+			return QUERY_INCLUDE;
 		case MTAG(var):
+		{
+			struct fhk_mut_var *x = mrefp(M, ref);
+			return query_new(x->order, x->back ? 0 : M->bn+x->order);
+		}
 		case MTAG(model):
+		{
+			int idx = ((struct fhk_mut_model *) mrefp(M, ref))->order;
+			return query_new(idx, M->bn+idx);
+		}
 		case MTAG(guard):
-			return mrefVMG_order(M, ref);
+			return query_idx(((struct fhk_mut_guard *)mrefp(M, ref))->order);
 	}
-
-	return FHK_PRUNED;
+	return QUERY_PRUNED;
 }
 
-static int layout_query_map(struct fhk_mut_graph *M, fhk_mhandle mapH){
+static fhk_query layout_query_map(struct fhk_mut_graph *M, fhk_mhandle mapH) {
 	if(mhandle_isident(mapH))
-		return MAP_IDENT;
-
-	fhkP_map *maptab = mgraph_maptable(M);
-
-	if(mhandle_ismapL(mapH)){
-		int idx = maptab[M->c_group + mhandleU(mapH)];
-		return idx >= 0 ? mapL_toext(idx, (int)M->ng) : FHK_PRUNED;
-	}
-
-	if(mhandle_ismapJ(mapH)){
-		int idx = maptab[mhandleV(mapH)];
-		return idx < 0 ? idx : FHK_PRUNED;
-	}
-
-	if(mhandle_isgroup(mapH)){
+		return query_idx(MAP_IDENT);
+	fhkP_smap *maptab = mgraph_maptable(M);
+	if(mhandle_isgroup(mapH)) {
 		int idx = maptab[mhandleU(mapH)];
-		return idx >= 0 ? idx : FHK_PRUNED;
+		if(idx >= 0) return query_new(idx, M->bk+idx);
+	} else if(mhandle_ismapL(mapH)) {
+		int idx = maptab[M->c_group + mhandleU(mapH)];
+		if(idx >= 0) return query_new(idx, M->bk+idx);
+	} else if(mhandle_ismapJ(mapH)) {
+		int idx = maptab[mhandleV(mapH)];
+		if(idx < 0) return query_new(idx, M->bi+idx);
 	}
-
-	return FHK_PRUNED;
+	return QUERY_PRUNED;
 }
 
-int fhk_mut_query(fhk_mut_ref *mp, fhk_mhandle handle){
+fhk_query fhk_mut_query(fhk_mut_ref *mp, fhk_mhandle handle) {
 	struct fhk_mut_graph *M = mgraph(mp);
-	if(LIKELY(M->layout_valid)){
+	if(LIKELY(M->layout_valid)) {
 		if(mhandle_isref(handle))
 			return layout_query_ref(M, handle);
 		if(mhandle_ismap(handle))
 			return layout_query_map(M, handle);
 	}
-	return FHK_PRUNED;
+	return QUERY_PRUNED;
 }
 
 int fhk_mut_size(fhk_mut_ref *mp){
@@ -490,6 +496,7 @@ fhk_status fhk_mut_layout(fhk_mut_ref *mp){
 	if(UNLIKELY((s = layout_count(M)))) return s;
 	layout_order(M);
 	if(UNLIKELY((s = layout_maps(M)))) return s;
+	layout_bias(M);
 	M->layout_valid = 1;
 	return 0;
 }
@@ -497,6 +504,10 @@ fhk_status fhk_mut_layout(fhk_mut_ref *mp){
 /* ---- building ---------------------------------------- */
 
 static void build_base(struct fhk_mut_graph *M, struct fhk_graph *G){
+	G->bn = M->bn;
+	G->bk = M->bk;
+	G->bi = M->bi;
+	G->nz = M->nz;
 	G->nv = M->nv;
 	G->nx = M->nx;
 	G->nm = M->nm;
@@ -513,12 +524,12 @@ static fhk_status build_models(struct fhk_mut_graph *M, struct fhk_graph *G){
 	for(int64_t i=0;i<G->nm;i++)
 		G->models[~i].k = 0;
 
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
 		int tag = mref_tag(M, ref);
 		if(mtagTP(tag) == (MTAG_PRUNE|MTAG(check))){
-			struct fhk_mut_check *cm = mref_ptr(M, ref);
-			struct fhk_mut_model *mm = mref_ptr(M, cm->model);
+			struct fhk_mut_check *cm = mrefp(M, ref);
+			struct fhk_mut_model *mm = mrefp(M, cm->model);
 			if(!mtag_ispruned(mm->tag))
 				G->models[mm->order].k += cm->penalty;
 		}
@@ -528,14 +539,14 @@ static fhk_status build_models(struct fhk_mut_graph *M, struct fhk_graph *G){
 	// now we can build the models.
 	// the order matters here because of the inverse computation.
 
-	fhkP_map *map = mgraph_maptable(M);
+	fhkP_smap *map = mgraph_maptable(M);
 	struct fhk_mut_model *mm;
-	for(fhkX_mref mh=M->model; mh; mh=mm->next){
-		mm = mref_ptr(M, mh);
+	for(fhk_mref mh=M->model; mh; mh=mm->next){
+		mm = mrefp(M, mh);
 		if(mtag_ispruned(mm->tag))
 			continue;
 		if(UNLIKELY(!cost_isset(mm->k) || !cost_isset(mm->c)))
-			return ecode(UNSET) | etagE(HANDLE, mh);
+			return ecode(UNSET) | etagA(HANDLE, mh);
 		struct fhk_model *mg = G->models + mm->order;
 		mg->group = map[mm->gid];
 		mg->k += mm->k;
@@ -544,19 +555,21 @@ static fhk_status build_models(struct fhk_mut_graph *M, struct fhk_graph *G){
 		mg->ci = 1/mg->c;
 		mg->cmin = mm->clo;
 		mg->dsym = mm->dsym;
+		mg->exp = 1; // edge builder will toggle off
+		mg->fwdj = 0; // edge builder will toggle on
 	}
 
 	return 0;
 }
 
 static fhk_status build_vars(struct fhk_mut_graph *M, struct fhk_graph *G){
-	fhkP_map *map = mgraph_maptable(M);
+	fhkP_smap *map = mgraph_maptable(M);
 	struct fhk_mut_var *vm;
-	for(fhkX_mref vh=M->var; vh; vh=vm->next){
-		vm = mref_ptr(M, vh);
+	for(fhk_mref vh=M->var; vh; vh=vm->next){
+		vm = mrefp(M, vh);
 		if(mtag_ispruned(vm->tag))
 			continue;
-		if(UNLIKELY(!size_isset(vm->size))) return ecode(UNSET) | etagE(HANDLE, vh);
+		if(UNLIKELY(!size_isset(vm->size))) return ecode(UNSET) | etagA(HANDLE, vh);
 		struct fhk_var *vg = G->vars + vm->order;
 		vg->group = map[vm->gid];
 		vg->size = vm->size;
@@ -566,15 +579,15 @@ static fhk_status build_vars(struct fhk_mut_graph *M, struct fhk_graph *G){
 }
 
 static fhk_status build_guards(struct fhk_mut_graph *M, struct fhk_graph *G){
-	fhkP_map *map = mgraph_maptable(M);
+	fhkP_smap *map = mgraph_maptable(M);
 	struct fhk_mut_guard *gm;
-	for(fhkX_mref gh=M->guard; gh; gh=gm->next){
-		gm = mref_ptr(M, gh);
+	for(fhk_mref gh=M->guard; gh; gh=gm->next){
+		gm = mrefp(M, gh);
 		if(mtag_ispruned(gm->tag))
 			continue;
-		if(UNLIKELY(!guard_isset(gm->opcode))) return ecode(UNSET) | etagE(HANDLE, gh);
+		if(UNLIKELY(!guard_isset(gm->opcode))) return ecode(UNSET) | etagA(HANDLE, gh);
 		struct fhk_guard *gg = G->guards + gm->order;
-		struct fhk_mut_var *vm = mref_ptr(M, gm->var);
+		struct fhk_mut_var *vm = mrefp(M, gm->var);
 		gg->xi = vm->order;
 		gg->group = map[vm->gid];
 		gg->opcode = gm->opcode;
@@ -584,30 +597,32 @@ static fhk_status build_guards(struct fhk_mut_graph *M, struct fhk_graph *G){
 	return 0;
 }
 
-static fhk_status build_back_edgesM(struct fhk_mut_graph *M, fhkX_mref modelH,
+static fhk_status build_back_edgesM(struct fhk_mut_graph *M, fhk_mref modelH,
 		struct fhk_model *mg, void **bp){
 
-	struct fhk_mut_model *mm = mref_ptr(M, modelH);
+	struct fhk_mut_model *mm = mrefp(M, modelH);
 
 	struct fhk_mut_check *cm;
 	int nc = 0;
-	for(fhkX_mref ch=mm->backC; ch; ch=cm->nextM){
-		cm = mref_ptr(M, ch);
+	for(fhk_mref ch=mm->backC; ch; ch=cm->nextM){
+		cm = mrefp(M, ch);
 		fhk_check *cg = *bp;
 		*bp += sizeof(*cg);
 
-		struct fhk_mut_guard *gm = mref_ptr(M, cm->guard);
-		struct fhk_mut_var *vm = mref_ptr(M, gm->var);
+		struct fhk_mut_guard *gm = mrefp(M, cm->guard);
+		struct fhk_mut_var *vm = mrefp(M, gm->var);
 
 		cg->idx = gm->order;
 		cg->map = layout_relocate_map(M, cm->mapMG);
 		cg->flags = vm->back ? CHECK_COMPUTED : 0;
 		cg->penalty = cm->penalty;
+		if(mhandle_ismapJ(cm->mapMG))
+			mg->exp = 0;
 
 		nc++;
 	}
 
-	if(UNLIKELY(nc-1 > MAX_CHECK)) return ecode(BOUND) | etagE(EDGE, nc-1);
+	if(UNLIKELY(nc-1 > MAX_CHECK)) return ecode(BOUND) | etagA(EDGE, nc-1);
 	mg->p_check = -nc;
 	mg->params = *bp;
 
@@ -629,20 +644,22 @@ static fhk_status build_back_edgesM(struct fhk_mut_graph *M, fhkX_mref modelH,
 
 	struct fhk_mut_edge *pm;
 	int np = 0, ncp = 0;
-	for(fhkX_mref ph=mm->backV; ph; ph=pm->nextM){
-		if(UNLIKELY(np > MAX_PARAM)) return ecode(BOUND) | etagE(EDGE, np);
+	for(fhk_mref ph=mm->backV; ph; ph=pm->nextM){
+		if(UNLIKELY(np > MAX_PARAM)) return ecode(BOUND) | etagA(EDGE, np);
 
-		pm = mref_ptr(M, ph);
+		pm = mrefp(M, ph);
 		fhk_edge *pg = *bp;
 		*bp += sizeof(*pg);
 
-		struct fhk_mut_var *vm = mref_ptr(M, pm->var);
+		struct fhk_mut_var *vm = mrefp(M, pm->var);
 		pg->idx = vm->order;
 		pg->map = layout_relocate_map(M, pm->mapMV);
 		order[np] = vm->back ? fu32(vm->chi - vm->clo) : ~(uint32_t)0;
 		ncp += !!vm->back;
 		np++;
 		pg->ex = -np;
+		if(mhandle_ismapJ(pm->mapMV))
+			mg->exp = 0;
 	}
 
 	// the parameter linked list is initially in reverse order. this fixes the indexing.
@@ -674,40 +691,40 @@ static fhk_status build_back_edgesM(struct fhk_mut_graph *M, fhkX_mref modelH,
 	return 0;
 }
 
-static fhk_status build_check_back_edgesM(struct fhk_mut_graph *M, fhkX_mref modelH,
+static fhk_status build_check_back_edgesM(struct fhk_mut_graph *M, fhk_mref modelH,
 		struct fhk_model *mg, void **bp){
 
 	return mg->params ? 0 : build_back_edgesM(M, modelH, mg, bp);
 }
 
-static fhk_status build_back_edgesV(struct fhk_mut_graph *M, struct fhk_graph *G, fhkX_mref varH,
+static fhk_status build_back_edgesV(struct fhk_mut_graph *M, struct fhk_graph *G, fhk_mref varH,
 		struct fhk_var *vg, void **bp){
 
-	struct fhk_mut_var *vm = mref_ptr(M, varH);
+	struct fhk_mut_var *vm = mrefp(M, varH);
 	vg->models = *bp;
 	int nm = 0;
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=vm->back; eh; eh=em->nextV){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=vm->back; eh; eh=em->nextV){
+		em = mrefp(M, eh);
 		fhk_edge *e = *bp;
 		*bp += sizeof(*e);
 
-		e->idx = ((struct fhk_mut_model *) mref_ptr(M, em->model))->order;
+		e->idx = ((struct fhk_mut_model *) mrefp(M, em->model))->order;
 		e->map = layout_relocate_map(M, em->mapVM);
 		e->ex = ~0; // unused for v->m back edges
 
 		nm++;
 	}
 
-	if(UNLIKELY(nm-1 > MAX_MOD)) return ecode(BOUND) | etagE(EDGE, nm-1);
+	if(UNLIKELY(nm-1 > MAX_MOD)) return ecode(BOUND) | etagA(EDGE, nm-1);
 	vg->n_mod = nm;
 
 	fhk_status status;
 	fhk_edge *e = vg->models;
 
-	for(fhkX_mref eh=vm->back; eh; eh=em->nextV, e++){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=vm->back; eh; eh=em->nextV, e++){
+		em = mrefp(M, eh);
 		struct fhk_model *m = G->models + e->idx;
 		if(UNLIKELY((status = build_check_back_edgesM(M, em->model, m, bp))))
 			return status;
@@ -717,7 +734,7 @@ static fhk_status build_back_edgesV(struct fhk_mut_graph *M, struct fhk_graph *G
 }
 
 static fhk_status build_back_edges(struct fhk_mut_graph *M, struct fhk_graph *G, void **bp){
-	fhkX_mref *orderv = NULL;
+	fhk_mref *orderv = NULL;
 
 	// we will build the edges in topological order,
 	// this buffer is for collecting the topo order.
@@ -725,8 +742,8 @@ static fhk_status build_back_edges(struct fhk_mut_graph *M, struct fhk_graph *G,
 	if(UNLIKELY(!orderv)) return ecode(MEM);
 
 	struct fhk_mut_var *vm;
-	for(fhkX_mref vh=M->var; vh; vh=vm->next){
-		vm = mref_ptr(M, vh);
+	for(fhk_mref vh=M->var; vh; vh=vm->next){
+		vm = mrefp(M, vh);
 		orderv[vm->order] = vh;
 	}
 
@@ -745,18 +762,18 @@ static fhk_status build_fwd_edges(struct fhk_mut_graph *M, struct fhk_graph *G, 
 	// first just allocate the edge list pointers.
 	// we can't yet build the actual edges here, because they are in reverse order.
 	struct fhk_mut_model *mm;
-	for(fhkX_mref mh=M->model; mh; mh=mm->next){
-		mm = mref_ptr(M, mh);
+	for(fhk_mref mh=M->model; mh; mh=mm->next){
+		mm = mrefp(M, mh);
 		struct fhk_model *mg = G->models + mm->order;
 		mg->returns = *bp;
 		mg->p_return = 0;
 		int nr = 0;
 		struct fhk_mut_edge *rm;
-		for(fhkX_mref rh=mm->fwd; rh; rh=rm->nextM){
-			rm = mref_ptr(M, rh);
+		for(fhk_mref rh=mm->fwd; rh; rh=rm->nextM){
+			rm = mrefp(M, rh);
 			nr++;
 		}
-		if(UNLIKELY(nr-1 > MAX_RETURN)) return ecode(BOUND) | etagE(EDGE, nr-1);
+		if(UNLIKELY(nr-1 > MAX_RETURN)) return ecode(BOUND) | etagA(EDGE, nr-1);
 		*bp += nr * sizeof(fhk_edge);
 	}
 
@@ -767,13 +784,13 @@ static fhk_status build_fwd_edges(struct fhk_mut_graph *M, struct fhk_graph *G, 
 	// build the actual edges in chrono order.
 	// NOTE: this step assumes that the reverse edges are in reverse chrono order
 	//       (ie. the link list order).
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
 		int tag = mref_tag(M, ref);
 		if(mtagTP(tag) == MTAG(edgeR)){
-			struct fhk_mut_edge *me = mref_ptr(M, ref);
-			struct fhk_mut_model *mm = mref_ptr(M, me->model);
-			struct fhk_mut_var *vm = mref_ptr(M, me->var);
+			struct fhk_mut_edge *me = mrefp(M, ref);
+			struct fhk_mut_model *mm = mrefp(M, me->model);
+			struct fhk_mut_var *vm = mrefp(M, me->var);
 			struct fhk_model *mg = G->models + mm->order;
 			struct fhk_var *vg = G->vars + vm->order;
 			fhk_edge *e = mg->returns + mg->p_return;
@@ -782,6 +799,8 @@ static fhk_status build_fwd_edges(struct fhk_mut_graph *M, struct fhk_graph *G, 
 			e->idx = vm->order;
 			e->map = layout_relocate_map(M, me->mapMV);
 			e->ex = -vg->n_mod;
+			if(mhandle_ismapJ(me->mapMV))
+				mg->fwdj = 1;
 		}
 		ref += mtag_size(tag);
 	}
@@ -827,16 +846,14 @@ static fhk_status build_edges(struct fhk_mut_graph *M, struct fhk_graph *G, void
 }
 
 static fhk_status build_associate_map(struct fhk_mut_graph *M, fhkP_group *assoc, fhk_mhandle mapH,
-		fhkX_mref source){
-
-	fhkP_map *mtab = mgraph_maptable(M);
+		fhk_mref source){
+	fhkP_smap *mtab = mgraph_maptable(M);
 	int map = mtab[mhandleV(mapH)];
 	int group = mtab[mrefVM_gid(M, source)];
-
-	if(group_isvalid(assoc[map]) && UNLIKELY(assoc[map] != group))
+	fhkP_group *ap = &assoc[map_zext(map)];
+	if(group_isvalid(*ap) && UNLIKELY(*ap != group))
 		return ecode(MAPASSOC) | etagA(MAP, map) | etagB(GROUP, group);
-
-	assoc[map] = group;
+	*ap = group;
 	return 0;
 }
 
@@ -848,17 +865,18 @@ static fhk_status build_maps(struct fhk_mut_graph *M, struct fhk_graph *G, void 
 	//     (2) return      m->v   model group is source
 	//     (3) return      v->m   var group is source     (reverse edge)
 	// the check<->var is edge is (implicit) ident, so only m<->v edges need to be checked.
-
-	memset(buf, GROUP_INVALID, M->ni);
-	fhkP_group *assoc = buf + M->ni;
-	G->assoc_mapJ = assoc;
-
+	memset(buf, GROUP_INVALID, M->ni-1);
+	// ident (-1 = 255) will never be used as an index,
+	// -2 is the first valid one and -ni is the last one.
+	// ie: the valid incides are (inlusive): [256-ni..254]
+	fhkP_group *assoc = buf + M->ni - 256;
+	G->mapg = assoc;
 	fhk_status status;
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->used){
 		fhkX_mtag tag = mref_tag(M, ref);
 		if(mtagT_isedge(mtagTP(tag))){
-			struct fhk_mut_edge *e = mref_ptr(M, ref);
+			struct fhk_mut_edge *e = mrefp(M, ref);
 			// (1) & (2)
 			if(mhandle_ismapJ(e->mapMV)
 					&& UNLIKELY((status = build_associate_map(M, assoc, e->mapMV, e->model))))
@@ -871,7 +889,6 @@ static fhk_status build_maps(struct fhk_mut_graph *M, struct fhk_graph *G, void 
 		}
 		ref += mtag_size(tag);
 	}
-
 	return 0;
 }
 
@@ -901,7 +918,7 @@ fhk_status fhk_mut_build(fhk_mut_ref *mp, void *buf){
 	if(UNLIKELY((status = build_maps(M, G, buf)))) goto fail;
 
 #if FHK_DSYM
-	buf += M->ni*sizeof(fhkP_group);
+	buf += (M->ni-1)*sizeof(fhkP_group);
 	if(M->dsym){
 		buf = (void *) ALIGN((intptr_t)buf, alignof(*M->dsym));
 		memcpy(buf, M->dsym, dsym_tabsize(M->dsym));
@@ -926,15 +943,15 @@ fail:
 #define handle_assertref(M, h, t) ({ \
 		fhk_mhandle _h = (h); \
 		if(UNLIKELY(!mhandle_isref(h))) return ecode(INVAL); \
-		fhkX_mtag *tag = mref_ptr((M), _h); \
+		fhkX_mtag *tag = mrefp((M), _h); \
 		if(UNLIKELY(mtagTP(*tag) != (t))) return ecode(INVAL); \
 		(void *) tag; \
 	})
 
 /* ---- buffer management ---------------------------------------- */
 
-static fhkX_mref mgraph_alloc(fhk_mut_ref *mp, fhkX_mref size){
-	assert(size%alignof(fhkX_mref) == 0);
+static fhk_mref mgraph_alloc(fhk_mut_ref *mp, fhk_mref size){
+	assert(size%alignof(fhk_mref) == 0);
 
 	struct fhk_mut_graph *M = mgraph(mp);
 	if(UNLIKELY(M->committed + size > M->cap)){
@@ -1010,11 +1027,11 @@ fhk_status fhk_mut_add_model(fhk_mut_ref *mp, fhk_mhandle group, float k, float 
 	// this comparison also works for unset costs (NaN)
 	if(UNLIKELY(k < 0 || c < 1)) return ecode(INVAL);
 
-	fhkX_mref modH = mgraph_newobj(mp, struct fhk_mut_model);
+	fhk_mref modH = mgraph_newobj(mp, struct fhk_mut_model);
 	if(UNLIKELY(!modH)) return ecode(MEM);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_model *mod = mref_ptr(M, modH);
+	struct fhk_mut_model *mod = mrefp(M, modH);
 
 	mod->tag = MTAG(model);
 	mod->gid = mhandleU(group);
@@ -1041,11 +1058,11 @@ fhk_status fhk_mut_add_model(fhk_mut_ref *mp, fhk_mhandle group, float k, float 
 fhk_status fhk_mut_add_var(fhk_mut_ref *mp, fhk_mhandle group){
 	if(UNLIKELY(!mhandle_isgroup(group))) return ecode(INVAL);
 
-	fhkX_mref varH = mgraph_newobj(mp, struct fhk_mut_var);
+	fhk_mref varH = mgraph_newobj(mp, struct fhk_mut_var);
 	if(UNLIKELY(!varH)) return ecode(MEM);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_var *var = mref_ptr(M, varH);
+	struct fhk_mut_var *var = mrefp(M, varH);
 
 	var->tag = MTAG(var);
 	var->size = SIZE_UNSET;
@@ -1065,11 +1082,11 @@ fhk_status fhk_mut_add_var(fhk_mut_ref *mp, fhk_mhandle group){
 }
 
 fhk_status fhk_mut_add_guard(fhk_mut_ref *mp, fhk_mhandle varH){
-	fhkX_mref guardH = mgraph_newobj(mp, struct fhk_mut_guard);
+	fhk_mref guardH = mgraph_newobj(mp, struct fhk_mut_guard);
 	if(UNLIKELY(!guardH)) return ecode(MEM);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_guard *guard = mref_ptr(M, guardH);
+	struct fhk_mut_guard *guard = mrefp(M, guardH);
 	struct fhk_mut_var *var = handle_assertref(M, varH, MTAG(var));
 
 	guard->tag = MTAG(guard);
@@ -1116,11 +1133,11 @@ static int edge_unpack_map(struct fhk_mut_edge *edge, struct fhk_mut_model *mode
 }
 
 fhk_status fhk_mut_add_param(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle varH, fhk_mhandle2 map){
-	fhkX_mref edgeH = mgraph_newobj(mp, struct fhk_mut_edge);
+	fhk_mref edgeH = mgraph_newobj(mp, struct fhk_mut_edge);
 	if(UNLIKELY(!edgeH)) return ecode(MEM);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_edge *edge = mref_ptr(M, edgeH);
+	struct fhk_mut_edge *edge = mrefp(M, edgeH);
 	struct fhk_mut_model *model = handle_assertref(M, modelH, MTAG(model));
 	struct fhk_mut_var *var = handle_assertref(M, varH, MTAG(var));
 
@@ -1141,11 +1158,11 @@ fhk_status fhk_mut_add_param(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle va
 }
 
 fhk_status fhk_mut_add_return(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle varH, fhk_mhandle2 map){
-	fhkX_mref edgeH = mgraph_newobj(mp, struct fhk_mut_edge);
+	fhk_mref edgeH = mgraph_newobj(mp, struct fhk_mut_edge);
 	if(UNLIKELY(!edgeH)) return ecode(MEM);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_edge *edge = mref_ptr(M, edgeH);
+	struct fhk_mut_edge *edge = mrefp(M, edgeH);
 	struct fhk_mut_model *model = handle_assertref(M, modelH, MTAG(model));
 	struct fhk_mut_var *var = handle_assertref(M, varH, MTAG(var));
 
@@ -1168,11 +1185,11 @@ fhk_status fhk_mut_add_return(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle v
 fhk_status fhk_mut_add_check(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle guardH, fhk_mhandle2 map,
 		float penalty){
 
-	fhkX_mref checkH = mgraph_newobj(mp, struct fhk_mut_check);
+	fhk_mref checkH = mgraph_newobj(mp, struct fhk_mut_check);
 	if(UNLIKELY(!checkH)) return ecode(INVAL);
 
 	struct fhk_mut_graph *M = mgraph(mp);
-	struct fhk_mut_check *check = mref_ptr(M, checkH);
+	struct fhk_mut_check *check = mrefp(M, checkH);
 	struct fhk_mut_model *model = handle_assertref(M, modelH, MTAG(model));
 	struct fhk_mut_guard *guard = handle_assertref(M, guardH, MTAG(guard));
 
@@ -1182,7 +1199,7 @@ fhk_status fhk_mut_add_check(fhk_mut_ref *mp, fhk_mhandle modelH, fhk_mhandle gu
 	check->guard = guardH;
 	check->model = modelH;
 	check->penalty = penalty;
-	if(UNLIKELY(!edge_unpack_map((struct fhk_mut_edge *) check, model, mref_ptr(M, guard->var), map)))
+	if(UNLIKELY(!edge_unpack_map((struct fhk_mut_edge *) check, model, mrefp(M, guard->var), map)))
 		return ecode(INVAL);
 
 	mgraph_invalidate(M);
@@ -1206,9 +1223,9 @@ void fhk_mut_set_dsym(fhk_mut_ref *mp, fhk_mhandle handle, const char *sym){
 
 	fhkX_dsym dsym = fhk_debug_sym_add(&M->dsym, sym);
 	switch(tag){
-		case MTAG(var): ((struct fhk_mut_var *) mref_ptr(M, handle))->dsym = dsym; break;
-		case MTAG(model): ((struct fhk_mut_model *) mref_ptr(M, handle))->dsym = dsym; break;
-		case MTAG(guard): ((struct fhk_mut_guard *) mref_ptr(M, handle))->dsym = dsym; break;
+		case MTAG(var): ((struct fhk_mut_var *) mrefp(M, handle))->dsym = dsym; break;
+		case MTAG(model): ((struct fhk_mut_model *) mrefp(M, handle))->dsym = dsym; break;
+		case MTAG(guard): ((struct fhk_mut_guard *) mrefp(M, handle))->dsym = dsym; break;
 	}
 #else
 	(void)mp;
@@ -1218,7 +1235,7 @@ void fhk_mut_set_dsym(fhk_mut_ref *mp, fhk_mhandle handle, const char *sym){
 }
 
 void fhk_mut_set_costM(fhk_mut_ref *M, fhk_mhandle modelH, float k, float c){
-	struct fhk_mut_model *model = mref_ptr(mgraph(M), modelH);
+	struct fhk_mut_model *model = mrefp(mgraph(M), modelH);
 	model->k = k;
 	model->c = c;
 	model->clo = k;
@@ -1227,15 +1244,15 @@ void fhk_mut_set_costM(fhk_mut_ref *M, fhk_mhandle modelH, float k, float c){
 }
 
 fhk_status fhk_mut_set_sizeV(fhk_mut_ref *mp, fhk_mhandle varH, uint16_t size){
-	struct fhk_mut_var *var = mref_ptr(mgraph(mp), varH);
-	if(UNLIKELY(size_isset(var->size))) return ecode(WRITE) | etagE(HANDLE, varH);
+	struct fhk_mut_var *var = mrefp(mgraph(mp), varH);
+	if(UNLIKELY(size_isset(var->size))) return ecode(WRITE) | etagA(HANDLE, varH);
 	var->size = size;
 	return 0;
 }
 
 fhk_status fhk_mut_set_opcodeG(fhk_mut_ref *mp, fhk_mhandle guardH, int opcode, fhk_gvalue arg){
-	struct fhk_mut_guard *guard = mref_ptr(mgraph(mp), guardH);
-	if(UNLIKELY(guard_isset(guard->opcode))) return ecode(WRITE) | etagE(HANDLE, guardH);
+	struct fhk_mut_guard *guard = mrefp(mgraph(mp), guardH);
+	if(UNLIKELY(guard_isset(guard->opcode))) return ecode(WRITE) | etagA(HANDLE, guardH);
 	guard->opcode = opcode;
 	guard->arg = arg;
 	return 0;

@@ -5,15 +5,9 @@ local ffi = require "ffi"
 //-- note: we may not use this for resolving symbols here, use `fhk_clib` instead.
 local C = ffi.C
 
-//-- XXX: hack, because we're telling gcc not to include <libco.h>
-ffi.cdef "typedef void *cothread_t;"
-
 ffi.cdef[[
-#include "arena.h"
 #include "def.h"
 #include "fhk.h"
-#include "jtab.h"
-#include "prune.h"
 #include "solve.h"
 ]]
 
@@ -27,7 +21,7 @@ local config = {
 #else
 	version = "fhk (unknown commit)",
 #endif
-	coro = stringify(FHK_CORO),
+	coro = stringify(FHK_TARGET_CO),
 #if FHK_DEBUG
 	debug = true,
 #else

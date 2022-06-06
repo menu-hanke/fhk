@@ -5,6 +5,7 @@
 #include "def.h"
 #include "fhk.h"
 #include "trace.h"
+#include "vm.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -125,11 +126,6 @@ typedef fhkX_checkword *fhkX_checkmap;
 #define checkmap_checkE(cm,i) (!!(bitmap_ref64(cm)[2*bitmap_idx64(i)+1]&(1LL<<bitmap_shift64(i))))
 
 /* work stack */
-typedef int64_t fhkX_slot __attribute__((may_alias));
-typedef fhkX_slot *fhkX_slotref;
-#define slotref(p)            ((fhkX_slotref) (p))
-#define slotnum(S,W)          (slotref(W) - (S)->stack)
-#define slots(t)              ((sizeof(t)+7)/8)
 
 typedef struct {
 	int16_t idx;
@@ -137,55 +133,30 @@ typedef struct {
 } fhkX_candinfo;
 
 struct fhkX_cselector {
-	// slot 0: iterator
-	fhkX_iter it;
-
-	// slot 1: iterator pk
-	fhkX_pkref pk;
-
-	// slot 2: precomputed start sp
-	fhkX_sp *sp;
-
-	// slot 3: candidate info
-	fhkX_candinfo info;
+	fhkX_iter it;        // iterator
+	fhkX_pkref pk;       // pk if iterator is complex
+	fhkX_sp *sp;         // precomputed sp start
+	fhkX_candinfo info;  // candidate info
 };
 
 struct fhkX_work {
-	// slot 0
-	int16_t prev;
-	int8_t where;
-	// 8 unused
-	float ecost; // (parameter only)
-
-	// slot 1
-	fhkX_candinfo cinfo;
-	uint32_t cinst;
-
-	// slot 2: variable info
-	fhkX_sp *sp;
-
-	// slot 3: cost info
-	float CI;
-	float BI;
-
-	// slot 4
-	float B;
-	int16_t cnum;
-	// 16 unused
-
-	// slot 5: active edge
-	void *edge;
-
-	// slot 6: active iterator
-	fhkX_iter it;
-
-	// slot 7: active iterator pk
-	fhkX_pkref pk;
-
+	struct fhkX_cselector sel[0]; // candidate selectors go below this
+	fhkX_sp *sp;         // variable sp
+	void *edge;          // active edge
+	fhkX_iter it;        // active iterator
+	fhkX_pkref pk;       // active iterator pk
+	fhkX_candinfo cinfo; // candidate info
+	fhkP_inst cinst;     // this candidate instance
+	float CI;            // saved CI
+	float BI;            // saved BI
+	float B;             // high bound (beta)
+	float ecost;         // accumulated edge cost (parameter only)
+	fhk_sref prev;       // previous frame link
+	int16_t cnum;        // number of candidates
+	int8_t where;        // param/check
 #if FHK_TRACEON(solver)
-	// slot 8: debug info
-	fhkP_idx idx;
-	fhkP_inst inst;
+	fhkP_idx idx;        // (debug) variable index
+	fhkP_inst inst;      // (debug) variable instance
 #endif
 };
 
@@ -193,6 +164,87 @@ struct fhkX_work {
 #define WHERE_PARAM   0
 #define where_isC(w)  ((w) < 0)
 #define where_isP(w)  ((w) == 0)
+
+/* mapping state */
+typedef union {
+	fhk_subset *imap;
+	fhk_subset kmap;
+} fhkX_anymap;
+
+#define ANYMAP_UNDEF        ((fhkX_anymap){.kmap=SUBSET_UNDEF})
+#define anymap_isU(am)      subset_isU((am).kmap)
+#define anymapK(am)         (am).kmap
+#define anymapI(am)         (am).imap
+#define anymapII(am,inst)   (am).imap[(inst)]
+
+/* scatter info */
+
+struct fhkX_sbuf {
+	int32_t size;
+	fhk_mref vp;
+	fhk_mref off;
+};
+
+struct fhkX_scatter {
+	int32_t num;
+	fhk_mref next;
+	fhk_mref data;
+	struct fhkX_sbuf sbuf[];
+	// uint8_t data[...]
+};
+
+struct fhkX_scatter_state {
+	struct fhk_mem *mem;
+	void *mp;
+	fhk_mref *prev;
+	fhk_mref next;
+	fhk_mref vp;
+	fhkP_idx idx;
+	uint16_t size;
+	uint32_t templ;
+};
+
+#define scatter_prev(sct) ((struct fhkX_scatter *) (((void *)(sct)->prev)-offsetof(struct fhkX_scatter, next)))
+
+/* value state */
+typedef union {
+	uint8_t *m; // models: 0 -> value not expanded, 1 -> value expanded
+	void **v;   // vars: value buffer
+} fhkX_valueref;
+
+#define valueM(r,i)  (r).m[(i)]
+#define valueV(r,i)  (r).v[(i)]
+
+/* shared solver memory.
+ *
+ *   +------------------------------------- contiguous mmap --------------------------+
+ *   |                                                                                |
+ *   |                   +----------- single contiguous allocation -------------+     |
+ *   |                   |                                                      |     |
+ *   v                   v                                                      v     v
+ *   +-----+-------+-----+----------------+--------+--------+--------+----------+-----+
+ *   | map | ident | ... | <-- call stack | stateM | solver | stateV | work --> | ... |
+ *   +-----+-------+-----+----------------+--------+--------+--------+----------+-----+
+ *   ^     ^                               ^
+ *   |     |                               |
+ *   |     +--- interned ident map         |
+ *   |                                     |
+ *   +-- struct fhk_mem *                  +--- struct fhk_solver *
+ *
+ * the pointer can be copied and restored to rollback to restore state if no solver functions
+ * have been called on any solver that was created before the copy was made. */
+struct fhk_mem {
+	fhkX_vmmap map;     // memory mapping
+	fhkP_inst ident;    // ident map size
+	fhk_mref ptr;       // alloc pointer
+	fhk_subset ip[];    // ident map
+};
+
+/* model calls */
+typedef struct fhk_cedge {
+	void *p;
+	size_t n;
+} fhk_cedge;
 
 /* root slots
  *
@@ -214,112 +266,38 @@ typedef int64_t fhkX_root;
 #define root_newpk(pk)      ({ uint64_t u64 = pkref_load64(pk); ((u64 & 0xfffff) << 28) | (u64 & 0xfffff00000) >> 12; })
 
 struct fhkX_bucket {
-	struct fhkX_bucket *next;
-	uint8_t used;
+	fhk_mref next;
+	uint8_t num;
 	uint8_t flags;
 	fhkX_root roots[MAX_ROOT];
-	// only valid if BUCKET_COPY is set
-	void *p[];
+	void *ptr[]; // [MAX_ROOT] if BUCKET_COPY is set, otherwise [0]
 };
 
-#define BUCKET_GIVEN     0x40
-#define BUCKET_COPY      0x80
-#define bucket_checkG(f) ((f) & BUCKET_GIVEN)
-#define bucket_checkC(f) ((f) & BUCKET_COPY)
-#define bucket_size(f)   (sizeof(struct fhkX_bucket) + (bucket_checkC(f) ? (MAX_ROOT)*sizeof(void *) : 0))
-#define bucket_free(b)   (MAX_ROOT - (b)->used)
+#define BUCKET_GIVEN        0x40
+#define BUCKET_COPY         0x80
+#define bucket_checkG(f)    ((f) & BUCKET_GIVEN)
+#define bucket_checkC(f)    ((f) & BUCKET_COPY)
 
-/* mapping state */
-typedef union {
-	fhk_subset *imap;
-	fhk_subset kmap;
-} fhkX_anymap;
-
-#define ANYMAP_UNDEF      ((fhkX_anymap){.kmap=SUBSET_UNDEF})
-#define anymap_isU(am)    subset_isU((am).kmap)
-#define anymapK(am)       (am).kmap
-#define anymapI(am)       (am).imap
-#define anymapII(am,inst) (am).imap[(inst)]
-
-/* scatter info
- *
- *          +--------+--------+--------+--------+-------+
- *          | 63..60 | 59..40 | 39..32 | 32..20 | 19..0 |
- * +--------+--------+--------+--------+--------+-------+
- * | range  |   0    |  bpos  |      vpos       |  num  |
- * +--------+--------+--------+--------+--------+-------+
- * | header |   -1   |        0        |   edge index   |
- * +--------+--------+-----------------+----------------+
- * |  end   |                    -1                     |
- * +--------+-------------------------------------------+
- */
-typedef int64_t fhkX_scatter;
-#define SCATTER_END         (-1)
-#define scatter_isR(s)      ((s) >= 0)
-#define scatter_isH(s)      ((s) < -1)
-#define scatter_isE(s)      ((s) == -1)
-#define scatterR_num(s)     ((s) & 0xfffff)
-#define scatterR_vpos(s)    (((s) >> 20) & 0xfffff)
-#define scatterR_bpos(s)    (((s) >> 40) & 0xfffff)
-#define scatterR_new(n,v,b) ((n) | ((int64_t)(v) << 20) | (int64_t)(b) << 40)
-#define scatterH_edge(s)    ((int32_t)(s))
-#define scatterH_new(e)     ((1LL << 63) | (e))
-#define scatter_mark(sz)    ((void *) ~(intptr_t)(sz)) /* mark to allocate scatter later */
-#define scatter_checkM(p)   ((intptr_t)(p) < 0)
-#define scatterM_size(p)    (~(intptr_t)(p))
-
-/* value state */
-typedef union {
-	uint8_t *m; // models: 0 -> value not expanded, 1 -> value expanded
-	void **v;   // vars: value buffer
-} fhkX_valueref;
-
-#define valueM(r,i)         (r).m[(i)]
-#define valueV(r,i)         (r).v[(i)]
-
-/* scratch space */
-struct fhkX_scratchref {
-	uint32_t size;
-	uint32_t used;
-	uint32_t mark;
-	void *p;
-};
-
-#define SCRATCH_ALIGN      8
-#define SCRATCH_MINSIZE    (2*(sizeof(fhk_modcall) + (MAX_PARAM+MAX_RETURN)*sizeof(fhk_cedge)))
-#define SCRATCH_NOMARK     (~(uint32_t)0)
-#define scratch_checkM(m)  ((m) != SCRATCH_NOMARK)
-
-/* solver state */
+/* solver state. */
 struct fhk_solver {
 	fhkX_sp *stateM[0];      // model search state (must be first)
 	fhk_co C;                // coroutine (must be next)
-
 	struct fhk_graph *G;     // graph
-	fhkX_anymap *mapstate;   // mapping state
 	fhkX_valueref value;     // value state
-	struct fhkX_scratchref scratch; // scratch space
-
-	fhk_arena *arena;          // allocator
-	struct fhkX_bucket *root; // root bucket head
-
-	fhkX_slot stack[FHK_MAX_STACK]; // work stack
-
+	fhk_mref mem;            // shared solver memory   (struct fhk_mem *)
+	fhk_mref bucket;         // root bucket   (struct fhkX_bucket *)
+	fhkP_inst ident;         // interned ident map size
+	fhk_sref work;           // work stack head pointer    (void *)
+	fhkP_idx idx;            // request idx (vref, modcall, mapcall)
+	fhkP_inst inst;          // request instance (vref, modcall, mapcall/i)
+	union {
+		fhk_cedge *edges;    // request edges (modcall)
+		fhk_status error;    // fail status if the solver returned 0
+	};
+	fhkX_anymap map[256];    // mapping state  (indexed by zero-extended map id)
 	union {                  // variable-like states (must be last)
 		fhkX_sp *stateV[0];  // computed variable search state
 		fhkX_bitmap stateG[0]; // given variable missing state (1: missing, 0: have)
 		fhkX_checkmap stateC[0]; // check state bitmap, see description above
 	};
 };
-
-/* coroutine entry point. */
-NOAPI void fhk_yf_solver_main(fhk_solver *S);
-
-/* state manipulation. */
-NOAPI struct fhk_solver *fhk_solver_new(fhk_graph *G, fhk_arena *arena);
-NOAPI fhk_subset *fhk_solver_newmapI(struct fhk_solver *S, xinst size);
-NOAPI fhkX_sp *fhk_solver_newsp(struct fhk_solver *S, xinst size, fhkX_sp init);
-NOAPI void *fhk_solver_newvalue(struct fhk_solver *S, xinst size, xinst num);
-NOAPI fhkX_bitmap fhk_solver_newbitmap(struct fhk_solver *S, xinst size);
-NOAPI fhkX_checkmap fhk_solver_newcheckmap(struct fhk_solver *S, xinst size);
-NOAPI struct fhkX_bucket *fhk_solver_newbucket(struct fhk_solver *S, int flags);

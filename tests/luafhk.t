@@ -314,7 +314,7 @@ test_custom_opcode = function()
 					event.setcts("double")
 					event.setjfunc(function(fb)
 						fb.upv.g = gtab
-						fb.src:putf("C.fhk_setvalue(S, D.idx, D.inst, g['%s']+D.inst)", event.name)
+						fb.src:putf("C.fhk_setvalue(S, S.idx, S.inst, g['%s']+S.inst)", event.name)
 					end)
 				end
 			end),

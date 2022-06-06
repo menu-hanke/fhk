@@ -83,8 +83,7 @@ endif
 #--------------------------------------------------------------------------------
 
 # objects
-CORE_O      = arena.o build.o cmd.o debug.o mut.o prune.o solve.o state.o
-EMBED_O     = jtab.o
+CORE_O      = build.o cmd.o debug.o mem.o mut.o prune.o solve.o vm.o
 PYX_O       = _ctypes.pyx.o
 ifeq (y,$(LINKLUA))
 LUACORE_O   = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o fhk_g.lua.o \
@@ -106,13 +105,13 @@ endif
 endif
 
 ifeq (builtin,$(CORO))
-CORE_O += co_asm.o co_builtin.o
-CCDEF += -DFHK_CO=builtin
+CORE_O += co_asm.o
+CCDEF += -DFHK_TARGET_CO=builtin
 endif
 
 ifeq (libco,$(CORO))
 CORE_O += co_libco.o
-CCDEF += -DFHK_CO=libco
+CCDEF += -DFHK_TARGET_CO=libco
 endif
 
 # build version
@@ -129,14 +128,14 @@ help:
 	@echo "    fhk$(TARGET_SO) - C+Lua shared library"
 	@echo "    libfhkpy.a - Python static library"
 
-libfhklua.a: $(CORE_O) $(EMBED_O) $(LUACORE_O) $(LUALIB_O)
-libfhkpy.a:  $(CORE_O) $(EMBED_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_O)
+libfhklua.a: $(CORE_O) $(LUACORE_O) $(LUALIB_O)
+libfhkpy.a:  $(CORE_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_O)
 
 %.a:
 	$(AR) rcs $@ $^
 
 fhk$(TARGET_SO): CFLAGS += -fPIC
-fhk$(TARGET_SO): $(CORE_O) $(EMBED_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
+fhk$(TARGET_SO): $(CORE_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
 	$(CC) -shared $^ $(BCL_LDFLAGS) -o $@
 
 #--------------------------------------------------------------------------------

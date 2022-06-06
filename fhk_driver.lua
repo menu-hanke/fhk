@@ -11,7 +11,6 @@ local function graph()
 	ctypes.gc(M)
 	return {
 		M      = M,
-		D      = ctypes.dispatch(),
 		J      = {},
 		buf    = buffer.new(),
 
@@ -20,6 +19,7 @@ local function graph()
 		--     tag = "group"
 		--     name
 		--     idx               L
+		--     slot              L
 		--     jfunc?             J
 		-- }
 		groups = {},
@@ -31,6 +31,7 @@ local function graph()
 		--     flags
 		--     rank?
 		--     idx               L
+		--     slot              L
 		--     jfunc?             J
 		-- }
 		maps   = {},
@@ -41,6 +42,7 @@ local function graph()
 		--     name
 		--     ctype                          before layout: possible ctidset,  after layout: ctype
 		--     idx               L
+		--     slot?             L
 		--     jfunc?             J
 		-- }
 		vars   = {},
@@ -50,6 +52,7 @@ local function graph()
 		--     tag = "model"
 		--     name
 		--     idx               L
+		--     slot              L
 		--     jfunc?             J
 		--     params, returns [] => {
 		--         handle
@@ -442,9 +445,10 @@ end
 local function layouttab(M, tab)
 	local newtab = {}
 	for _,x in ipairs(tab) do
-		local idx = M:query(x.handle)
+		local idx, slot = M:query(x.handle)
 		if idx then
 			x.idx = idx
+			x.slot = slot
 			table.insert(newtab, x)
 		end
 	end
@@ -488,9 +492,8 @@ end
 
 local function errfunc(graph)
 	local tags = nametags(graph)
-	local D = graph.D
-	return function()
-		local err = ctypes.err(D.status)
+	return function(S)
+		local err = ctypes.err(S.error)
 		for k,tab in pairs(tags) do
 			if err[k] and tab[err[k]] then
 				err[k] = string.format("%s <%s>", tab[err[k]], err[k])
@@ -506,65 +509,21 @@ end
 
 local function ok() end
 
-local function jftab(J, tab)
-	local lo, hi = math.huge, -math.huge
+local function setjtab(J, tab)
 	for _,x in ipairs(tab) do
-		if x.jfunc then
-			hi = math.max(hi, x.idx)
-			lo = math.min(lo, x.idx)
+		if x.slot then
+			J[x.slot] = x.jfunc or hole
 		end
 	end
-
-	if lo > hi then
-		-- no entries in this slice, it doesn't matter what we write into the index
-		return 0, 0
-	end
-
-	local start = #J+1
-
-	-- prefill with "holes" to prevent J from becoming sparse
-	for i=0, hi-lo do
-		J[start+i] = hole
-	end
-
-	for _,x in ipairs(tab) do
-		if x.jfunc then
-			J[start+x.idx-lo] = x.jfunc
-		end
-	end
-
-	return lo, hi
-end
-
-local function jfmaps(J, maps, flag)
-	local tab = {}
-	for _,map in ipairs(maps) do
-		if map.jfunc and map.flags:match(flag) then
-			table.insert(tab, map)
-		end
-	end
-	return jftab(J, tab)
 end
 
 local function jtab(graph)
-	local index = graph.D.index
-	local J = graph.J
-	J[0] = errfunc(graph)
-
-	index.ok = 1
-	J[1] = ok
-
-	index.shape = #J+1 - jftab(J, graph.groups)
-	index.vref = #J+1 - jftab(J, graph.vars)
-	index.mapcallk = #J+1 - jfmaps(J, graph.maps, "k")
-
-	-- i-map and modcall indices are negative
-
-	local _,hi = jfmaps(J, graph.maps, "i")
-	index.mapcalli = #J - hi
-
-	_,hi = jftab(J, graph.models)
-	index.modcall = #J - hi
+	graph.J[0] = errfunc(graph)
+	graph.J[1] = ok
+	setjtab(graph.J, graph.vars)
+	setjtab(graph.J, graph.models)
+	setjtab(graph.J, graph.groups)
+	setjtab(graph.J, graph.maps)
 end
 
 ---- func buffers ----------------------------------------
@@ -594,8 +553,7 @@ end
 --     S  solver
 --     X  parameter
 --     C  ffi.C
--- variables that are defined for jtab functions:
---     D  dispatch table
+-- for jfuncs only:
 --     J  jump table
 
 local function emit_upvdef(buf, upv)
@@ -620,14 +578,14 @@ end
 
 local function emit_jfunc(graph, fb)
 	local buf = graph.buf:reset()
-	buf:put("local C, D, J")
+	buf:put("local C, J")
 	local uvals = emit_upvdef(buf, fb.upv)
 	buf:put("= ...\n")
 	buf:put("return function(S, X)\n")
 	buf:put(fb.src)
-	buf:put("\treturn J[C.fhk_jtab_continue(S, D)](S, X)\n")
+	buf:put("\treturn J[C.fhk_continue(S)](S, X)\n")
 	buf:put("end\n")
-	return load(buf, fb.name)(C, graph.D, graph.J, unpack(uvals))
+	return load(buf, fb.name)(C, graph.J, unpack(uvals))
 end
 
 local function jfunc(graph, x, fb)
@@ -650,11 +608,11 @@ local function xname(x)
 end
 
 local function defidx(idx)
-	return idx or "D.idx"
+	return idx or "S.idx"
 end
 
 local function definst(inst)
-	return inst or "D.inst"
+	return inst or "S.inst"
 end
 
 ---- vref/setvalue ----------------------------------------
@@ -729,7 +687,7 @@ local function vrefk(fb, op)
 	if op.ss then
 		fb.src:putf("rt_setvalue_intptr(S, %s, 0x%xLL, 0x%xLL)", idx, op.ss, ptr)
 	else
-		fb.src:putf("rt_setvalue_intptr(S, %s, D.inst, 0x%xLL)", idx, ptr)
+		fb.src:putf("rt_setvalue_intptr(S, %s, S.inst, 0x%xLL)", idx, ptr)
 	end
 	fb.name = string.format("=fhk:vrefk<%s>@0x%x", xname(op.var), ptr)
 end
@@ -892,7 +850,6 @@ end
 local function sigct(model)
 	local buf = buffer.new()
 	buf:put("struct {\n")
-	buf:put("intptr_t ___header;\n")
 	local cts = {}
 	for i,p in ipairs(model.params) do
 		buf:putf("$ param%d;\n", i)
@@ -974,7 +931,7 @@ local function modcalllua(fb, op)
 	local f = upval(fb, op.f)
 	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
 	fb.upv.cast = ffi.cast
-	fb.src:putf("local call = cast(%s, D.modcall)\n", ct)
+	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
 	fb.src:putf("%s = %s(%s)\n", table.concat(returns, ","), f, table.concat(params, ","))
 	fb.src:putf("%s\n", table.concat(conv, "\n"))
 	fb.name = string.format("=fhk:modcalllua<%s>@%s", op.model.name, funcname(op.f))
@@ -1006,7 +963,7 @@ local function modcallffi(fb, op)
 	local f = upval(fb, op.f)
 	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
 	fb.upv.cast = ffi.cast
-	fb.src:putf("local call = cast(%s, D.modcall)\n", ct)
+	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
 	if #returns > 0 then
 		fb.src:putf("%s = ", table.concat(returns, ", "))
 	end
@@ -1025,7 +982,7 @@ end
 local function modcallconst(fb, op)
 	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
 	fb.upv.cast = ffi.cast
-	fb.src:putf("local call = cast(%s, D.modcall)\n", ct)
+	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
 
 	for i,r in ipairs(op.model.returns) do
 		local v

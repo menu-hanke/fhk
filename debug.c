@@ -1,5 +1,6 @@
 #include "debug.h"
 #include "def.h"
+#include "mut.h"
 #include "solve.h"
 
 #include <stdio.h>
@@ -112,9 +113,9 @@ const char *fhk_mut_debug_sym(struct fhk_mut_graph *M, fhk_mhandle handle){
 #if FHK_DSYM
 		fhkX_dsym dsym = 0;
 		switch(mtagT(tag)){
-			case MTAG(var): dsym = ((struct fhk_mut_var *) mref_ptr(M, handle))->dsym; break;
-			case MTAG(model): dsym = ((struct fhk_mut_model *) mref_ptr(M, handle))->dsym; break;
-			case MTAG(guard): dsym = ((struct fhk_mut_guard *) mref_ptr(M, handle))->dsym; break;
+			case MTAG(var): dsym = ((struct fhk_mut_var *) mrefp(M, handle))->dsym; break;
+			case MTAG(model): dsym = ((struct fhk_mut_model *) mrefp(M, handle))->dsym; break;
+			case MTAG(guard): dsym = ((struct fhk_mut_guard *) mrefp(M, handle))->dsym; break;
 		}
 		if(dsym){
 			strcpy(buf+5, dsym_ptr(M->dsym, dsym));
@@ -126,7 +127,7 @@ const char *fhk_mut_debug_sym(struct fhk_mut_graph *M, fhk_mhandle handle){
 		return buf;
 	}else{
 		const char *fmt = mhandle_ismapu(handle)  ? "umap[%d]"
-			            : mhandle_ismapss(handle) ? "group[%d]"
+			            : mhandle_isgroup(handle) ? "group[%d]"
 						:                           "(invalid map 0x%x)";
 		sprintf(buf+5, fmt, mhandleV(handle));
 		return buf;

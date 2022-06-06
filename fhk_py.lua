@@ -2,6 +2,7 @@ local ffi = require "ffi"
 local driver = require "fhk_driver"
 local rules = require "fhk_rules"
 local C = require "fhk_clib"
+local cast = ffi.cast
 
 -- keep in sync with fhk.pyx!
 ffi.cdef [[
@@ -90,7 +91,7 @@ local function vrefpyvector(fb, var, pf, copy)
 	if copy then flags = flags + 0x80000000 end
 	fb.upv.pf = pf
 	fb.src:putf(
-		"C.fhk_py_vref_vector(S, %d, pf.ptr, X, D.inst, %d)\n",
+		"C.fhk_py_vref_vector(S, %d, pf.ptr, X, S.inst, %d)\n",
 		var.idx, bit.tobit(flags)
 	)
 	fb.name = string.format("=fhk:vrefpyvec<%s>@0x%x", var.name, pf.ptr)
@@ -110,7 +111,7 @@ local function vrefpyscalar(fb, var, pf)
 	fb.upv.cast = ffi.cast
 	fb.upv.ctp = ffi.typeof("$*", var.ctype)
 	fb.src:putf(
-		"cast(ctp, C.fhk_setvalueD(S, %d, D.inst))[0] = %s(pf.ptr, X, D.inst)\n",
+		"cast(ctp, C.fhk_setvalueD(S, %d, S.inst))[0] = %s(pf.ptr, X, S.inst)\n",
 		var.idx,
 		what == "fp" and "C.fhk_py_vref_scalar_fp" or "C.fhk_py_vref_scalar_int"
 	)
@@ -120,7 +121,7 @@ end
 local function mapcallpy(fb, map, pf)
 	fb.upv.pf = pf
 	if map.flags:match("i") then
-		fb.src:putf("C.fhk_setmapI(S, %d, D.inst, C.fhk_py_getmapI(pf.ptr, X, D.inst))\n", map.idx)
+		fb.src:putf("C.fhk_setmapI(S, %d, S.inst, C.fhk_py_getmapI(pf.ptr, X, S.inst))\n", map.idx)
 	else
 		fb.src:putf("C.fhk_setmapK(S, %d, C.fhk_py_getmapK(pf.ptr, X))\n", map.idx)
 	end
@@ -166,9 +167,15 @@ local function getroot(var)
 	return idx, fmt
 end
 
+local function convjump(jump)
+	return function(S, X)
+		return jump(cast("fhk_solver *", S), X)
+	end
+end
+
 local function ready(state, G)
 	local graph = rules.buildgraph(state)
-	local jump = driver.jump(graph)
+	local jump = convjump(driver.jump(graph))
 	local init = rules.buildinit(state)
 	G = ffi.cast("fhk_graph **", G)
 	G[0] = driver.build(graph, function(size) return C.PyMem_RawMalloc(size) end)

@@ -96,21 +96,21 @@ end
 
 local function initsolver_template()
 	return load([[
-		local C, G, init, solverctp, arenactp, istype
+		local C, G, init, solverctp, memctp, istype
 		return function(S, X)
 			if istype(solverctp, S) then
 				init(S, X)
 			else
-				local A
-				if istype(arenactp, S) then
-					A = S
+				local mem
+				if istype(memctp, S) then
+					mem = S
 				else
 					X = S
-					A = C.fhk_create_arena(2^17)
+					mem = C.fhk_create_mem()
 				end
-				S = C.fhk_create_solver(G, A)
+				S = C.fhk_create_solver(G, mem)
 				init(S, X)
-				return S, A
+				return S, mem
 			end
 		end
 	]], "=fhk:init")()
@@ -129,12 +129,12 @@ local function solver_template(solver, chunkname)
 				return R
 			else
 				X = S
-				local S, A = initsolver(X)
+				local S, mem = initsolver(X)
 	]])
 	if anchored then
 		src:put([[
-				local R = cast(rctp, C.fhk_alloc(A, sizeof(rct), alignof(rct)))
-				R.__fhk_arena = A
+				local R = cast(rctp, C.fhk_mem_alloc(mem, sizeof(rct), alignof(rct)))
+				R.__fhk_mem = mem
 		]])
 	else
 		src:put([[
@@ -147,7 +147,7 @@ local function solver_template(solver, chunkname)
 	]])
 	if not anchored then
 		src:put([[
-				C.fhk_destroy_arena(A)
+				C.fhk_destroy_mem(mem)
 		]])
 	end
 	src:put([[
@@ -236,20 +236,18 @@ local function rctinit(solver, rct)
 				upv[f] = subset.f
 				upv.type = type
 				upv.tosubset = ctypes.tosubset
-				upv.arenaof = ctypes.arenaof
 				if neednum then buf:put("local num\n") end
 				buf:putf("local subset = %s(X)\n", f)
 				buf:put("if type(subset) == 'table' then\n")
 				if neednum then buf:put("num = #subset\n") end
-				buf:put("subset = tosubset(subset, arenaof(S))\n")
+				buf:put("subset = tosubset(subset, S:getmem())\n")
 				if neednum then
 					upv.sizeofss = ctypes.sizeof
 					buf:put("else num = sizeofss(subset)\n")
 				end
 				buf:put("end\n")
 			elseif subset.tag == "space" then
-				upv.mapstateK = ctypes.mapstateK
-				buf:putf("local subset = mapstateK(S, %d)\n", subset.group.idx)
+				buf:putf("local subset = S.map[%d].kmap\n", subset.group.idx)
 				if neednum then
 					upv.sizeofss = ctypes.sizeof
 					buf:put("local num = sizeofss(subset)\n")
@@ -293,9 +291,9 @@ local function rctinit(solver, rct)
 	return load(out, string.format("=fhk:init-%s", solver.desc))(C, unpack(uval))
 end
 
-local function rct_gcarena(result)
-	if result.__fhk_arena ~= nil then
-		C.fhk_destroy_arena(result.__fhk_arena)
+local function rct_gc(result)
+	if result.__fhk_mem ~= nil then
+		C.fhk_destroy_mem(result.__fhk_mem)
 	end
 end
 
@@ -325,8 +323,8 @@ local function rctype(solver)
 		end
 	end
 	if isanchored(solver) then
-		buf:put("fhk_arena *__fhk_arena;\n")
-		meta.__gc = rct_gcarena
+		buf:put("fhk_mem *__fhk_mem;\n")
+		meta.__gc = rct_gc
 	end
 	buf:put("}")
 	local rct = ffi.typeof(tostring(buf), unpack(ctv))
@@ -353,13 +351,13 @@ local function fhk_ready(fhk, alloc)
 	local G = driver.build(graph, alloc)
 	local jump = driver.jump(graph)
 	local solverctp = ffi.typeof("fhk_solver *")
-	local arenactp = ffi.typeof("fhk_arena *")
+	local memctp = ffi.typeof("fhk_mem *")
 	setupvalues(fhk.init, {
 		C         = C,
 		G         = G,
 		init      = rules.buildinit(fhk.state),
 		solverctp = solverctp,
-		arenactp  = arenactp,
+		memctp    = memctp,
 		istype    = ffi.istype
 	})
 	for _,s in ipairs(fhk.solvers) do

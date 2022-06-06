@@ -1,5 +1,5 @@
+#include "co.h"
 #include "conf.h"
-#include "co_libco.h"
 #include "def.h"
 #include "solve.h"
 
@@ -11,7 +11,7 @@
 #include "libco/libco.c"
 
 // note: this is NOT thread safe.
-static union { struct fhk_solver *S; fhk_status status; } fhk_arg;
+static union { struct fhk_solver *S; int r; } fhk_arg;
 
 static void yf_main(){
 	fhk_yf_solver_main(fhk_arg.S);
@@ -19,34 +19,33 @@ static void yf_main(){
 
 ERRFUNC static void yf_error(){
 	struct fhk_solver *S = fhk_arg.S;
-	fhk_status status = *(fhk_status *) S->C.stack;
 	for(;;)
-		fhk_yield(S, status);
+		fhk_yield(S, 0);
 }
 
-fhk_solver *fhk_create_solver(fhk_graph *G, fhk_arena *arena){
-	// libco will not align the stack pointer for us.
-	// this is kind of platform dependent, but aligning to 16 should work everywhere.
-	void *stack = fhk_alloc(arena, FHK_MAX_COSTACK, 16);
-	struct fhk_solver *S = fhk_solver_new(G, arena);
-	S->C.stack = stack;
-	S->C.coro = co_derive(stack, FHK_MAX_COSTACK, yf_main);
-	S->C.caller = co_active();
-	return S;
+static void *fhk_co_derive(void *sp, void *fp) {
+	intptr_t start = ((intptr_t)sp - FHK_MAX_COSTACK + 15) & ~15;
+	return co_derive((void *) start, (intptr_t)sp - start, fp);
 }
 
-fhk_status fhk_continue(struct fhk_solver *S){
+void fhk_co_setup_stack(fhk_co *C, void *sp) {
+	C->stack = sp;
+	C->coro = fhk_co_derive(sp, yf_main);
+	C->caller = co_active();
+}
+
+int fhk_continue(struct fhk_solver *S){
 	fhk_arg.S = S;
 	co_switch(S->C.coro);
-	return fhk_arg.status;
+	return fhk_arg.r;
 }
 
-void fhk_yield(struct fhk_solver *S, fhk_status status){
-	fhk_arg.status = status;
+void fhk_yield(struct fhk_solver *S, int r){
+	fhk_arg.r = r;
 	co_switch(S->C.caller);
 }
 
-void fhk_fail(struct fhk_solver *S, fhk_status status){
-	S->C.coro = co_derive(S->C.stack+sizeof(status), FHK_MAX_COSTACK, yf_error);
-	*(fhk_status *)S->C.stack = status;
+void fhk_fail(struct fhk_solver *S, fhk_status error){
+	S->C.coro = fhk_co_derive(S->C.stack, yf_error);
+	S->error = error;
 }

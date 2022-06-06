@@ -1,20 +1,15 @@
-arena.o: arena.c arena.h def.h conf.h fhk.h trace.h
-build.o: build.c conf.h fhk.h debug.h def.h trace.h
-cmd.o: cmd.c fhk.h co.h co_builtin.h conf.h def.h trace.h target.h \
- debug.h solve.h
-co_builtin.o: co_builtin.c co.h co_builtin.h conf.h def.h fhk.h trace.h \
- target.h solve.h
-co_libco.o: co_libco.c conf.h co_libco.h def.h fhk.h trace.h \
- libco/libco.h solve.h co.h co_builtin.h target.h libco/libco.c \
- libco/amd64.c libco/libco.h libco/settings.h
-debug.o: debug.c debug.h def.h conf.h fhk.h trace.h solve.h co.h \
- co_builtin.h target.h
-jtab.o: jtab.c fhk.h def.h conf.h trace.h jtab.h
-mut.o: mut.c def.h conf.h fhk.h trace.h
-prune.o: prune.c conf.h debug.h def.h fhk.h trace.h prune.h
-solve.o: solve.c co.h co_builtin.h conf.h def.h fhk.h trace.h target.h \
- debug.h solve.h
-state.o: state.c def.h conf.h fhk.h trace.h solve.h co.h co_builtin.h \
- target.h
-fhk_cdef.lua.o: fhk_cdef.lua.h target.h arena.h def.h conf.h fhk.h \
- trace.h jtab.h prune.h solve.h co.h co_builtin.h errmsg.h
+build.o: build.c conf.h fhk.h debug.h def.h trace.h mut.h
+cmd.o: cmd.c fhk.h co.h conf.h def.h trace.h target.h debug.h mem.h \
+ solve.h vm.h
+co_libco.o: co_libco.c co.h conf.h def.h fhk.h trace.h target.h \
+ libco/libco.c libco/amd64.c libco/libco.h libco/settings.h
+debug.o: debug.c debug.h def.h conf.h fhk.h trace.h mut.h solve.h co.h \
+ target.h vm.h
+mem.o: mem.c co.h conf.h def.h fhk.h trace.h target.h mem.h solve.h vm.h
+mut.o: mut.c def.h conf.h fhk.h trace.h mut.h
+prune.o: prune.c conf.h debug.h def.h fhk.h trace.h mut.h prune.h
+solve.o: solve.c co.h conf.h def.h fhk.h trace.h target.h debug.h mem.h \
+ solve.h vm.h
+vm.o: vm.c def.h conf.h fhk.h trace.h target.h vm.h
+fhk_cdef.lua.o: fhk_cdef.lua.h target.h def.h conf.h fhk.h trace.h \
+ solve.h co.h vm.h errmsg.h

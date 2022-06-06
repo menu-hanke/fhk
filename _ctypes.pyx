@@ -139,10 +139,10 @@ cdef extern from *:
     #define fhk_py_var_group(G,i) (G)->vars[(i)].group
     #define fhk_py_var_size(G,i)  (G)->vars[(i)].size
     #define fhk_py_G(S)           (S)->G
-    #define fhk_py_space(S,i)     anymapK((S)->mapstate[(i)])
+    #define fhk_py_space(S,i)     anymapK((S)->map[(i)])
     """
 
-    ctypedef struct fhk_arena
+    ctypedef struct fhk_mem
     ctypedef struct fhk_graph
     ctypedef struct fhk_solver
     ctypedef int64_t fhk_subset
@@ -151,9 +151,9 @@ cdef extern from *:
     fhk_subset SUBSET_EMPTY
     fhk_subset subsetI_newZ(int zs, int first)
 
-    fhk_arena *fhk_create_arena(size_t hint)
-    void fhk_destroy_arena(fhk_arena *arena)
-    fhk_solver *fhk_create_solver(fhk_graph *G, fhk_arena *arena)
+    fhk_mem *fhk_create_mem()
+    void fhk_destroy_mem(fhk_mem *mem)
+    fhk_solver *fhk_create_solver(fhk_graph *G, fhk_mem *mem)
     void fhk_setshape(fhk_solver *S, int group, int shape)
     void *fhk_setrootD(fhk_solver *S, int idx, fhk_subset ss)
     void fhk_setvalueC(fhk_solver *S, int idx, fhk_subset ss, void *p)
@@ -368,14 +368,14 @@ cdef class GCPin:
 
 #---- solver ----------------------------------------
 
-cdef class GCArena:
-    cdef fhk_arena *A
+cdef class GCMem:
+    cdef fhk_mem *mem
 
-    def __cinit__(self, size_t hint = 2**17):
-        self.A = fhk_create_arena(hint)
+    def __cinit__(self):
+        self.mem = fhk_create_mem()
 
     def __dealloc__(self):
-        fhk_destroy_arena(self.A)
+        fhk_destroy_mem(self.mem)
 
 cdef class GCDriver:
     cdef fhk_graph *G
@@ -389,8 +389,8 @@ cdef class GCDriver:
 cdef class GCSolver:
     cdef fhk_solver *S
     # these fields are only for holding a reference to prevent gc.
-    # we are in trouble if the arena or graph gets gced while the solver is running.
-    cdef GCArena _arena
+    # we are in trouble if the mem or graph gets gced while the solver is running.
+    cdef GCMem _mem
     cdef GCDriver _driver
 
 cdef class CRoot:
@@ -421,14 +421,14 @@ def ready(GCPin state):
     driver.jump = jump
     return driver
 
-def init(GCDriver driver, GCArena arena, X):
+def init(GCDriver driver, GCMem gcm, X):
     cdef fhk_graph *G = driver.G
-    cdef fhk_solver *S = fhk_create_solver(G, arena.A)
+    cdef fhk_solver *S = fhk_create_solver(G, gcm.mem)
     if not fhk_py_lua_callsx(driver.lua.L, driver.init, S, <void*> X):
         raise FhkError(pop(driver.lua))
     cdef GCSolver solver = GCSolver()
     solver.S = S
-    solver._arena = arena
+    solver._mem = gcm
     solver._driver = driver
     return solver
 

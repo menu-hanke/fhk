@@ -40,35 +40,35 @@
 
 #if FHK_TRACEON(solver)
 
-#define TRACE_YSHAPE   "solver", trace_fhk, "-> SHAPE        %ld"
-#define TRACE_YVAR     "solver", trace_fhk, "-> VREF         %s:%ld"
-#define TRACE_YMAPK    "solver", trace_fhk, "-> MAPCALLK     %ld (%ld)"
-#define TRACE_YMAPI    "solver", trace_fhk, "-> MAPCALLI     %ld:%ld"
-#define TRACE_YMOD     "solver", trace_fhk, "-> MODCALL      %s:%d (%u -> %u)"
-#define TRACE_YOK      "solver", trace_fhk, "-> OK"
+#define TRACE_YERR     "solver", trace_fhk, "->   0 ERR"
+#define TRACE_YOK      "solver", trace_fhk, "->   1 OK"
+#define TRACE_YVAR     "solver", trace_fhk, "-> %3d VREF      %s:%d"
+#define TRACE_YMOD     "solver", trace_fhk, "-> %3d MODCALL   %s:%d"
+#define TRACE_YMAPK    "solver", trace_fhk, "-> %3d MAPCALLK  %d"
+#define TRACE_YMAPI    "solver", trace_fhk, "-> %3d MAPCALLI  %d:%d"
 
-#define TRACE_ENTERV   "solver", trace_fhk, "(%3ld) ENTER     %s:%ld: beta: %g"
-#define TRACE_ENTERM   "solver", trace_fhk, "(%3ld) ENTER/m   %s:%d [%s:%d]: min: %g (%g)   beta: %g (%g)"
-#define TRACE_BOUND    "solver", trace_fhk, "(%3ld) BOUND     %s:%d [%s:%d]: inverse: (%g) > (%g)"
-#define TRACE_CHOSEN   "solver", trace_fhk, "(%3ld) CHOOSE    %s:%d [%s:%d]: cost: %g / %g   <#%u>"
-#define TRACE_FAILED   "solver", trace_fhk, "(%3ld) FAIL      %s:%d: cost: %g > %g"
-#define TRACE_PENALTY  "solver", trace_fhk, "(%3ld) ++++      %s:%d [%s:%d]: penalty  %s~%x [+%g] [%g/%g]"
-#define TRACE_PARAM    "solver", trace_fhk, "(%3ld) ++++      %s:%d [%s:%d]: param    %s~%x [+%g] [%g/%g]"
-#define TRACE_PARAMB   "solver", trace_fhk, "(%3ld) ++++ (!)  %s:%d [%s:%d]: param    %s~%x > %g"
-#define TRACE_CHAIN    "solver", trace_fhk, "(%3ld) CHAIN     %s:%d [%s:%d]: inverse: %g / %g"
+#define TRACE_ENTERV   "solver", trace_fhk, "(%4ld) ENTER     %s:%ld: beta: %g"
+#define TRACE_ENTERM   "solver", trace_fhk, "(%4ld) ENTER/m   %s:%d [%s:%d]: min: %g (%g)   beta: %g (%g)"
+#define TRACE_BOUND    "solver", trace_fhk, "(%4ld) BOUND     %s:%d [%s:%d]: inverse: (%g) > (%g)"
+#define TRACE_CHOSEN   "solver", trace_fhk, "(%4ld) CHOOSE    %s:%d [%s:%d]: cost: %g / %g   <#%u>"
+#define TRACE_FAILED   "solver", trace_fhk, "(%4ld) FAIL      %s:%d: cost: %g > %g"
+#define TRACE_PENALTY  "solver", trace_fhk, "(%4ld) ++++      %s:%d [%s:%d]: penalty  %s~%x [+%g] [%g/%g]"
+#define TRACE_PARAM    "solver", trace_fhk, "(%4ld) ++++      %s:%d [%s:%d]: param    %s~%x [+%g] [%g/%g]"
+#define TRACE_PARAMB   "solver", trace_fhk, "(%4ld) ++++ (!)  %s:%d [%s:%d]: param    %s~%x > %g"
+#define TRACE_CHAIN    "solver", trace_fhk, "(%4ld) CHAIN     %s:%d [%s:%d]: inverse: %g / %g"
 
 #endif
 
 
 #if FHK_TRACEON(cmd)
 
-#define TRACE_SETMAPK  "cmd",    trace_fhk, "<- SETMAPK      %ld :: 0x%lx"
-#define TRACE_SETMAPI  "cmd",    trace_fhk, "<- SETMAPI      [%d]:%d :: 0x%lx"
-#define TRACE_SETROOT  "cmd",    trace_fhk, "<- SETROOT      (0x%x) %d:%d..+%d"
-#define TRACE_SETROOTP "cmd",    trace_fhk, "<- SETROOT      (0x%x) %d:%d..+%d  -->  %p"
-#define TRACE_SETVALR  "cmd",    trace_fhk, "<- SETVALUE     (ref) %s  -->  %p :: %s"
-#define TRACE_SETVALI  "cmd",    trace_fhk, "<- SETVALUE     %s:%d..+%d :: %s"
-#define TRACE_SETVALD  "cmd",    trace_fhk, "<- SETVALUE     (direct) %s:%d..+%d"
+#define TRACE_SETMAPK  "cmd",    trace_fhk, "<- SETMAPK       %ld :: 0x%lx"
+#define TRACE_SETMAPI  "cmd",    trace_fhk, "<- SETMAPI       [%d]:%d :: 0x%lx"
+#define TRACE_SETROOT  "cmd",    trace_fhk, "<- SETROOT       (0x%x) %d:%d..+%d"
+#define TRACE_SETROOTP "cmd",    trace_fhk, "<- SETROOT       (0x%x) %d:%d..+%d  -->  %p"
+#define TRACE_SETVALR  "cmd",    trace_fhk, "<- SETVALUE      (ref) %s  -->  %p :: %s"
+#define TRACE_SETVALI  "cmd",    trace_fhk, "<- SETVALUE      %s:%d..+%d :: %s"
+#define TRACE_SETVALD  "cmd",    trace_fhk, "<- SETVALUE      (direct) %s:%d..+%d"
 
 #endif
 

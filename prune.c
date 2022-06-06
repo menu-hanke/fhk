@@ -1,6 +1,7 @@
 #include "conf.h"
 #include "debug.h"
 #include "def.h"
+#include "mut.h"
 #include "prune.h"
 #include "trace.h"
 
@@ -116,8 +117,8 @@ static fhkX_bound bheap_remove(struct fhkX_bheap *H){
 
 static fhk_status prune_init_vars(struct fhk_mut_graph *M, fhkX_href *hp){
 	struct fhk_mut_var *vm;
-	for(fhkX_mref vh=M->var; vh; vh=vm->next){
-		vm = mref_ptr(M, vh);
+	for(fhk_mref vh=M->var; vh; vh=vm->next){
+		vm = mrefp(M, vh);
 		// mark white
 		vm->clo = INFINITY;
 		vm->chi = INFINITY;
@@ -136,22 +137,22 @@ static fhk_status prune_color_modelL(struct fhk_mut_graph *M, fhkX_href *hp,
 
 	float cost = 0;
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=mm->backV; eh; eh=em->nextM){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=mm->backV; eh; eh=em->nextM){
+		em = mrefp(M, eh);
 		if(mhandle_ismapu(em->mapMV))
 			continue;
-		struct fhk_mut_var *vm = mref_ptr(M, em->var);
+		struct fhk_mut_var *vm = mrefp(M, em->var);
 		assert(prog_isfinite(fu32(vm->clo)));
 		cost += vm->clo;
 	}
 
-	trace(PLMOD, fhk_mut_debug_sym(M, ptr_mref(M, mm)), costf(mm, cost), cost);
+	trace(PLMOD, fhk_mut_debug_sym(M, pmref(M, mm)), costf(mm, cost), cost);
 	cost = costf(mm, cost);
 	mm->clo = cost;
 
 	if(LIKELY(cost < INFINITY)){
-		for(fhkX_mref eh=mm->fwd; eh; eh=em->nextM){
-			em = mref_ptr(M, eh);
+		for(fhk_mref eh=mm->fwd; eh; eh=em->nextM){
+			em = mrefp(M, eh);
 			if(UNLIKELY(!bheap_insert(hp, bound_newL(em->var, cost))))
 				return ecode(MEM);
 		}
@@ -166,15 +167,15 @@ static fhk_status prune_color_modelH(struct fhk_mut_graph *M, fhkX_href *hp,
 	float cost = 0;
 
 	struct fhk_mut_check *cm;
-	for(fhkX_mref ch=mm->backC; ch; ch=cm->nextM){
-		cm = mref_ptr(M, ch);
+	for(fhk_mref ch=mm->backC; ch; ch=cm->nextM){
+		cm = mrefp(M, ch);
 		cost += cm->penalty;
 	}
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=mm->backV; eh; eh=em->nextM){
-		em = mref_ptr(M, eh);
-		struct fhk_mut_var *vm = mref_ptr(M, em->var);
+	for(fhk_mref eh=mm->backV; eh; eh=em->nextM){
+		em = mrefp(M, eh);
+		struct fhk_mut_var *vm = mrefp(M, em->var);
 		// even for high bounds we will never propagate infinities, so the fact that
 		// this function is called means all the variables have finite high bounds.
 		// this does _not_ mean that the model itself has a finite high bound, though.
@@ -182,13 +183,13 @@ static fhk_status prune_color_modelH(struct fhk_mut_graph *M, fhkX_href *hp,
 		cost += vm->chi;
 	}
 
-	trace(PHMOD, fhk_mut_debug_sym(M, ptr_mref(M, mm)), costf(mm, cost), cost);
+	trace(PHMOD, fhk_mut_debug_sym(M, pmref(M, mm)), costf(mm, cost), cost);
 	cost = costf(mm, cost);
 	mm->chi = cost;
 
 	if(LIKELY(cost < INFINITY)){
-		for(fhkX_mref eh=mm->fwd; eh; eh=em->nextM){
-			em = mref_ptr(M, eh);
+		for(fhk_mref eh=mm->fwd; eh; eh=em->nextM){
+			em = mrefp(M, eh);
 			if(mhandle_ismapu(em->mapMV))
 				continue;
 			if(UNLIKELY(!bheap_insert(hp, bound_newH(em->var, cost))))
@@ -208,12 +209,12 @@ static fhk_status prune_color_model(struct fhk_mut_graph *M, fhkX_href *hp,
 static fhk_status prune_init_models(struct fhk_mut_graph *M, fhkX_href *hp){
 	fhk_status status;
 	struct fhk_mut_model *mm;
-	for(fhkX_mref mh=M->model; mh; mh=mm->next){
-		mm = mref_ptr(M, mh);
+	for(fhk_mref mh=M->model; mh; mh=mm->next){
+		mm = mrefp(M, mh);
 		int remlo = 0, remhi = 0;
 		struct fhk_mut_edge *em;
-		for(fhkX_mref eh=mm->backV; eh; eh=em->nextM){
-			em = mref_ptr(M, eh);
+		for(fhk_mref eh=mm->backV; eh; eh=em->nextM){
+			em = mrefp(M, eh);
 			remlo += !mhandle_ismapu(em->mapMV);
 			remhi++;
 		}
@@ -229,7 +230,7 @@ static fhk_status prune_prop_fwd(struct fhk_mut_graph *M, fhkX_href *hp){
 	while((*hp)->used){
 		fhkX_bound b = bheap_remove(*hp);
 		int hi = bound_isH(b.state);
-		struct fhk_mut_var *vm = mref_ptr(M, bound_ref(b.state));
+		struct fhk_mut_var *vm = mrefp(M, bound_ref(b.state));
 		float *cv = &vm->clo + hi;
 		if(prog_isfinite(fu32(*cv)))
 			continue;
@@ -237,11 +238,11 @@ static fhk_status prune_prop_fwd(struct fhk_mut_graph *M, fhkX_href *hp){
 		if(hi) trace(PHVAR, fhk_mut_debug_sym(M, bound_ref(b.state)), b.cost);
 		else   trace(PLVAR, fhk_mut_debug_sym(M, bound_ref(b.state)), b.cost);
 		struct fhk_mut_edge *em;
-		for(fhkX_mref eh=vm->fwdM; eh; eh=em->nextV){
-			em = mref_ptr(M, eh);
+		for(fhk_mref eh=vm->fwdM; eh; eh=em->nextV){
+			em = mrefp(M, eh);
 			if(!hi && mhandle_ismapu(em->mapVM))
 				continue;
-			struct fhk_mut_model *mm = mref_ptr(M, em->model);
+			struct fhk_mut_model *mm = mrefp(M, em->model);
 			float *cm = &mm->clo + hi;
 			assert(!prog_isfinite(fu32(*cm)));
 			uint32_t rem = fu32(*cm) + 1;
@@ -272,10 +273,10 @@ static void prune_markM(struct fhk_mut_graph *M, struct fhk_mut_model *mm){
 	if(!prog_isfinite(fu32(mm->chi))) mm->chi = INFINITY;
 
 	struct fhk_mut_check *cm;
-	for(fhkX_mref ch=mm->backC; ch; ch=cm->nextM){
-		cm = mref_ptr(M, ch);
-		struct fhk_mut_guard *gm = mref_ptr(M, cm->guard);
-		struct fhk_mut_var *vm = mref_ptr(M, gm->var);
+	for(fhk_mref ch=mm->backC; ch; ch=cm->nextM){
+		cm = mrefp(M, ch);
+		struct fhk_mut_guard *gm = mrefp(M, cm->guard);
+		struct fhk_mut_var *vm = mrefp(M, gm->var);
 		if(LIKELY(prog_isfinite(fu32(vm->clo)))){
 			cm->tag |= MTAG_A;
 			gm->tag |= MTAG_A;
@@ -289,13 +290,13 @@ static void prune_markM(struct fhk_mut_graph *M, struct fhk_mut_model *mm){
 	}
 
 	assert(mm->clo <= mm->chi);
-	trace(PMMOD, fhk_mut_debug_sym(M, ptr_mref(M, mm)), mm->clo, mm->chi);
+	trace(PMMOD, fhk_mut_debug_sym(M, pmref(M, mm)), mm->clo, mm->chi);
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=mm->backV; eh; eh=em->nextM){
-		em = mref_ptr(M, eh);
+	for(fhk_mref eh=mm->backV; eh; eh=em->nextM){
+		em = mrefp(M, eh);
 		em->tag |= MTAG_A;
-		prune_markV(M, mref_ptr(M, em->var));
+		prune_markV(M, mrefp(M, em->var));
 	}
 }
 
@@ -304,7 +305,7 @@ static void prune_markV(struct fhk_mut_graph *M, struct fhk_mut_var *vm){
 		return;
 
 	vm->tag |= MTAG_A;
-	trace(PMVAR, fhk_mut_debug_sym(M, ptr_mref(M, vm)), vm->clo, vm->chi);
+	trace(PMVAR, fhk_mut_debug_sym(M, pmref(M, vm)), vm->clo, vm->chi);
 
 	if(!vm->back)
 		return;
@@ -316,9 +317,9 @@ static void prune_markV(struct fhk_mut_graph *M, struct fhk_mut_var *vm){
 	// low bound may be infinite: this means we have to include any model to keep this variable
 	// computed. it doesn't matter which one, the algoritm will fail on any of them.
 	if(UNLIKELY(!prog_isfinite(vm->clo))){
-		struct fhk_mut_edge *em = mref_ptr(M, vm->back);
+		struct fhk_mut_edge *em = mrefp(M, vm->back);
 		em->tag |= MTAG_A;
-		prune_markM(M, mref_ptr(M, em->model));
+		prune_markM(M, mrefp(M, em->model));
 		return;
 	}
 
@@ -326,9 +327,9 @@ static void prune_markV(struct fhk_mut_graph *M, struct fhk_mut_var *vm){
 	uint32_t beta = ~(uint32_t)0;
 
 	struct fhk_mut_edge *em;
-	for(fhkX_mref eh=vm->back; eh; eh=em->nextV){
-		em = mref_ptr(M, eh);
-		struct fhk_mut_model *mm = mref_ptr(M, em->model);
+	for(fhk_mref eh=vm->back; eh; eh=em->nextV){
+		em = mrefp(M, eh);
+		struct fhk_mut_model *mm = mrefp(M, em->model);
 		uint32_t mlo = fu32(mm->clo);
 		if(mlo < hi){
 			em->tag |= MTAG_A;
@@ -347,9 +348,9 @@ static void prune_markV(struct fhk_mut_graph *M, struct fhk_mut_var *vm){
 	// ---> we don't need to consider usermaps in either case in the next loop.
 
 	if(UNLIKELY(hi < beta)){
-		for(fhkX_mref eh=vm->back; eh; eh=em->nextV){
-			em = mref_ptr(M, eh);
-			struct fhk_mut_model *mm = mref_ptr(M, em->model);
+		for(fhk_mref eh=vm->back; eh; eh=em->nextV){
+			em = mrefp(M, eh);
+			struct fhk_mut_model *mm = mrefp(M, em->model);
 			if(fu32(mm->chi) == hi && !mhandle_ismapu(em->mapVM)){
 				assert(!mtag_isA(em->tag));
 				em->tag |= MTAG_A;
@@ -362,11 +363,11 @@ static void prune_markV(struct fhk_mut_graph *M, struct fhk_mut_var *vm){
 
 static fhk_status prune_prop_back(struct fhk_mut_graph *M){
 	struct fhk_mut_var *vm;
-	for(fhkX_mref vh=M->var; vh; vh=vm->next){
-		vm = mref_ptr(M, vh);
+	for(fhk_mref vh=M->var; vh; vh=vm->next){
+		vm = mrefp(M, vh);
 		if(mtag_ispinned(vm->tag)){
 			if(UNLIKELY(!prog_isfinite(fu32(vm->clo))))
-				return ecode(CHAIN) | etagE(HANDLE, vh);
+				return ecode(CHAIN) | etagA(HANDLE, vh);
 			prune_markV(M, vm);
 		}
 	}
@@ -374,14 +375,14 @@ static fhk_status prune_prop_back(struct fhk_mut_graph *M){
 }
 
 static void prune_mark_returns(struct fhk_mut_graph *M){
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
-		fhkX_mtag *tag = mref_ptr(M, ref);
+		fhkX_mtag *tag = mrefp(M, ref);
 		int t = *tag;
 		if(t == MTAG(edgeR)){
-			struct fhk_mut_edge *em = mref_ptr(M, ref);
-			struct fhk_mut_var *vm = mref_ptr(M, em->var);
-			struct fhk_mut_model *mm = mref_ptr(M, em->model);
+			struct fhk_mut_edge *em = mrefp(M, ref);
+			struct fhk_mut_var *vm = mrefp(M, em->var);
+			struct fhk_mut_model *mm = mrefp(M, em->model);
 			if((mm->tag & MTAG_A) && !(vm->tag & MTAG_A))
 				trace(PMRET, fhk_mut_debug_sym(M, em->var));
 			em->tag |= mm->tag & MTAG_A;
@@ -392,9 +393,9 @@ static void prune_mark_returns(struct fhk_mut_graph *M){
 }
 
 static void prune_sweep(struct fhk_mut_graph *M){
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
-		fhkX_mtag *tag = mref_ptr(M, ref);
+		fhkX_mtag *tag = mrefp(M, ref);
 		uint32_t tv = *tag;
 		*tag |= mtag_isA(tv) ? 0 : MTAG_PRUNE;
 		if(mtag_ispruned(*tag))

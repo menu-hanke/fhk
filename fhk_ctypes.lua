@@ -3,6 +3,7 @@ local cdef = require "fhk_cdef"
 local C = require "fhk_clib"
 local band, bor, bnot, i32, lshift, rshift, arshift
 	= bit.band, bit.bor, bit.bnot, bit.tobit, bit.lshift, bit.rshift, bit.arshift
+local cast = ffi.cast
 
 ---- status/error ----------------------------------------
 
@@ -11,25 +12,13 @@ local function ok(status)
 end
 
 local function errparse(status)
-	local code = tonumber(band(status, 0xff))
-	local a = tonumber(band(rshift(status, 8), 0x7))
-	local b = tonumber(band(rshift(status, 11), 0x7))
-	if b == C.FHK_ETAG_EXT then
-		return code, a, tonumber(band(rshift(status, 14), 0xfffffffff))
-	else
-		local av, bv
-		if a ~= 0 then
-			av = tonumber(arshift(lshift(status, 24), 44))
-		else
-			a = nil
-		end
-		if b ~= 0 then
-			bv = tonumber(arshift(lshift(status, 4), 44))
-		else
-			b = nil
-		end
-		return code, a, av, b, bv
-	end
+	local code = -tonumber(arshift(status, 58))
+	local a = tonumber(band(rshift(status, 52), 0x7))
+	local b = tonumber(band(rshift(status, 55), 0x7))
+	b = b ~= 0 and b or nil
+	local av = bit.tobit(status)
+	local bv = b and tonumber(band(rshift(status, 32), 0xfffff))
+	return code, a, av, b, bv
 end
 
 local err_mt = {
@@ -341,26 +330,6 @@ local function handle2(lo, hi)
 	return bor(u32(lo), lshift(i64(hi), 32))
 end
 
----- debugging ----------------------------------------
-
-local function dump_index(index)
-	return string.format("[ok:%d s:%d v:%d k:%d i:%d m:%d]",
-		index.ok, index.shape, index.vref, index.mapcallk, index.mapcalli, index.modcall)
-end
-
-local function dump_dispatch(disp)
-	return string.format("[status: 0x%x index: %s]", disp.status, disp.index)
-end
-
----- black magic ----------------------------------------
--- internal struct access goes here and only here.
--- the only exception is the inspection api, which accesses almost all internals.
--- try to keep these to a minimum, prefer public api.
-
-local function mapstateK(S, map) return S.mapstate[map].kmap end
-local function mapstateI(S, map) return S.mapstate[map].imap end
-local function arenaof(S) return S.arena end
-
 ---- metatypes ----------------------------------------
 
 local function checkhandle(status)
@@ -377,15 +346,20 @@ local function checkstatus(status)
 	end
 end
 
+local function parsequery(r)
+	if r == -1 then return end -- pruned
+	if r == -2 then return true end -- included
+	local idx = bit.tobit(r)
+	local slot = tonumber(rshift(r, 32))
+	return idx, (slot ~= 0 and slot or nil)
+end
+
 ffi.metatype("fhk_mut_ref", {
 	__index = {
 		destroy = C.fhk_destroy_mut,
 		layout = function(self) return checkstatus(C.fhk_mut_layout(self)) end,
 		prune = function(self) return checkstatus(C.fhk_prune(self)) end,
-		query = function(self, handle)
-			local i = C.fhk_mut_query(self, handle)
-			return (i ~= i32(0x80000000)) and i or nil
-		end,
+		query = function(self, handle) return parsequery(C.fhk_mut_query(self, handle)) end,
 		size = function(self)
 			local size = C.fhk_mut_size(self)
 			return size > 0 and size or nil
@@ -425,6 +399,22 @@ ffi.metatype("fhk_mut_ref", {
 	}
 })
 
+local function mrefp(b, p)
+	return cast("uint8_t *", b) + p
+end
+
+ffi.metatype("fhk_mem", {
+	__index = {
+		destroy = C.fhk_destroy_mem
+	},
+	__call = C.fhk_mem_alloc
+})
+
+
+local function solver_mem(S)
+	return cast("fhk_mem *", mrefp(S, S.mem))
+end
+
 ffi.metatype("fhk_solver", {
 	__index = {
 		continue = function(self)
@@ -440,23 +430,10 @@ ffi.metatype("fhk_solver", {
 		setmapI = C.fhk_setmapI,
 		setvalue = C.fhk_setvalue,
 		setvalueC = C.fhk_setvalueC,
-		copysubset = C.fhk_copysubset
+		setvalueD = C.fhk_setvalueD,
+		copysubset = C.fhk_copysubset,
+		getmem = solver_mem
 	}
-})
-
-ffi.metatype("fhk_arena", {
-	__index = {
-		destroy = C.fhk_destroy_arena
-	},
-	__call = C.fhk_alloc
-})
-
-ffi.metatype("fhk_jtab_offset", {
-	__tostring = dump_index
-})
-
-ffi.metatype("fhk_jtab_state", {
-	__tostring = dump_dispatch
 })
 
 local function gc(x)
@@ -466,8 +443,9 @@ local function gc(x)
 	end
 end
 
-local function arena(size)
-	return C.fhk_create_arena(size or (2^17))
+local function mem()
+	local r = C.fhk_create_mem()
+	return r ~= nil and r or nil
 end
 
 local function mut(mp)
@@ -480,17 +458,13 @@ local function mut(mp)
 	end
 end
 
-local function solver(G, a)
-	if a then
-		return C.fhk_create_solver(G, a)
+local function solver(G, m)
+	if m then
+		return C.fhk_create_solver(G, m)
 	else
-		a = arena()
-		return ffi.gc(C.fhk_create_solver(G, a),  function() C.fhk_destroy_arena(a) end)
+		m = mem()
+		return ffi.gc(C.fhk_create_solver(G, m),  function() C.fhk_destroy_mem(m) end)
 	end
-end
-
-local function dispatch()
-	return ffi.new("fhk_jtab_state")
 end
 
 --------------------------------------------------------------------------------
@@ -512,13 +486,9 @@ return {
 	guard     = guard,
 	handles   = handles,
 	handle2   = handle2,
-	mapstateK = mapstateK,
-	mapstateI = mapstateI,
-	arenaof   = arenaof,
 	gc        = gc,
-	arena     = arena,
+	mem       = mem,
 	mut       = mut,
 	solver    = solver,
-	dispatch  = dispatch,
 	dsym      = C.fhk_is_dsym() ~= 0
 }

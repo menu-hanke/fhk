@@ -4,7 +4,7 @@ import inspect
 from collections.abc import Iterable
 from types import GenericAlias
 from typing import Any, Callable, Dict, Generic, List, Optional, Protocol, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin, overload
-from fhk._ctypes import CRoot, GCArena, GCDriver, GCLua, GCPin, GCSolver as Solver, init, newlua, ready, solve
+from fhk._ctypes import CRoot, GCDriver, GCLua, GCMem, GCPin, GCSolver as Solver, init, newlua, ready, solve
 
 #---- subsets ----------------------------------------
 from fhk._ctypes import (
@@ -158,7 +158,7 @@ class SolverFn(Generic[T]):
         subset: Dict[str, Subset] = {}
     ) -> T:
         if solver is None:
-            solver = init(self._driver, GCArena(), state)
+            solver = init(self._driver, GCMem(), state)
         result = self._result()
         solve(self._driver, solver, self._roots, subset, state, result)
         return result

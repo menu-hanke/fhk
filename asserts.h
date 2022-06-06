@@ -2,6 +2,7 @@
 
 #include "def.h"
 #include "fhk.h"
+#include "mut.h"
 #include "solve.h"
 
 #include <stdalign.h>
@@ -20,12 +21,11 @@
 #define ftypeof(s,f) typeof(((s*)0)->f)
 
 /* data type sanity checks */
-FHK_STATIC_ASSERT(MAX_GROUP <= maxof(fhkP_group), "MAX_GROUP too large");
 FHK_STATIC_ASSERT(MAX_IDX <= maxof(fhkP_idx), "MAX_IDX too large");
 FHK_STATIC_ASSERT(MIN_IDX >= minof(fhkP_idx), "MIN_IDX too small");
 FHK_STATIC_ASSERT(MAX_INST <= maxof(fhkP_inst), "MAX_INST too large");
 FHK_STATIC_ASSERT(MAX_MAPK <= maxof(ftypeof(fhk_edge, map)), "MAX_MAPK too large");
-FHK_STATIC_ASSERT(MIN_MAPI >= minof(ftypeof(fhk_edge, map)), "MIN_MAPI too small");
+FHK_STATIC_ASSERT(MIN_MAPI >= (typeof(MIN_MAPI))minof(ftypeof(fhk_edge, map)), "MIN_MAPI too small");
 FHK_STATIC_ASSERT(-MAX_CHECK <= -minof(ftypeof(struct fhk_model, p_check)), "MAX_CHECK too large");
 FHK_STATIC_ASSERT(MAX_PARAM <= maxof(ftypeof(struct fhk_model, p_param)), "MAX_PARAM too large");
 FHK_STATIC_ASSERT(MAX_RETURN <= maxof(ftypeof(struct fhk_model, p_return)), "MAX_RETURN too large");
@@ -41,6 +41,9 @@ FHK_STATIC_ASSERT(sizeof(struct fhk_var) == sizeof(struct fhk_guard),
 /* subsets */
 FHK_STATIC_ASSERT(subsetI_first(subsetI_newZ(0, MAX_INST)) == MAX_INST, "subset: inst(MAX_INST) unrepresentable");
 FHK_STATIC_ASSERT(subsetIE_znum(subsetI_newZ(MAX_INST, 0)) == MAX_INST, "subset: znum(MAX_INST) unrepresentable");
+
+/* memory */
+FHK_STATIC_ASSERT(alignof(struct fhk_solver) == alignof(void *), "alignment mismatch: struct fhk_solver");
 
 /* solver */
 FHK_STATIC_ASSERT(sizeof(ftypeof(struct fhk_solver, stateM[0])) == sizeof(void *), "size mismatch: S->stateM");
@@ -67,6 +70,6 @@ FHK_STATIC_ASSERT(offsetof(struct fhk_mut_var, order) == offsetof(struct fhk_mut
 FHK_STATIC_ASSERT(offsetof(struct fhk_mut_var, order) == offsetof(struct fhk_mut_guard, order),
 		"mut: VMG order layout mismatch");
 
-#define CHECKALIGN(_,t) FHK_STATIC_ASSERT(alignof(t) == alignof(fhkX_mref), "mut: packed array has holes");
+#define CHECKALIGN(_,t) FHK_STATIC_ASSERT(alignof(t) == alignof(fhk_mref), "mut: packed array has holes");
 MUT_OBJDEF(CHECKALIGN)
 #undef CHECKALIGN

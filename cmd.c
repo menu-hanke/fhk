@@ -2,6 +2,7 @@
 #include "co.h"
 #include "debug.h"
 #include "def.h"
+#include "mem.h"
 #include "solve.h"
 #include "trace.h"
 
@@ -11,9 +12,9 @@
 
 /* ---- input checks ---------------------------------------- */
 
-static int input_assertV(struct fhk_solver *S, int idx){
-	if(UNLIKELY((uint32_t)(S->G->nv - idx - 1) >= S->G->nv)){
-		fhk_fail(S, ecode(INVAL) | etagE(NODE, idx));
+static int input_assertV(struct fhk_solver *S, int idx) {
+	if(UNLIKELY((uint32_t)(S->G->nv - idx - 1) >= S->G->nv)) {
+		fhk_fail(S, ecode(INVAL) | etagA(NODE, idx));
 		return 0;
 	}
 	return 1;
@@ -21,214 +22,173 @@ static int input_assertV(struct fhk_solver *S, int idx){
 
 /* ---- setmap ---------------------------------------- */
 
-static int setmapK(struct fhk_solver *S, xmap map, fhk_subset ss){
-	if(UNLIKELY(!anymap_isU(S->mapstate[map]))){
+static void setmapK(struct fhk_solver *S, xmap map, fhk_subset ss) {
+	if(UNLIKELY(!anymap_isU(S->map[map]))) {
 		fhk_fail(S, ecode(WRITE) | etagA(MAP, map));
-		return 0;
+		return;
 	}
-
-	anymapK(S->mapstate[map]) = ss;
+	if(map_zext(map) < S->G->ng) {
+		assert(subset_isE(ss) || (subset_isI(ss) && subsetI_first(ss) == 0));
+		fhk_mem_checkident(S, subsetIE_size(map));
+	}
+	anymapK(S->map[map]) = ss;
 	trace(SETMAPK, map, ss);
-	return 1;
 }
 
-void fhk_setmapK(struct fhk_solver *S, int map, fhk_subset ss){
-	if(UNLIKELY(map >= S->G->nk)){
-		fhk_fail(S, ecode(BOUND) | etagE(MAP, map));
+void fhk_setmapK(struct fhk_solver *S, int map, fhk_subset ss) {
+	if(UNLIKELY(map_zext(map) >= S->G->nk)) {
+		fhk_fail(S, ecode(BOUND) | etagA(MAP, map));
 		return;
 	}
-
-	setmapK(S, mapL_fromext(map, S->G->ng), ss);
+	setmapK(S, map, ss);
 }
 
-void fhk_setmapI(struct fhk_solver *S, int map, int inst, fhk_subset ss){
-	if(UNLIKELY(map < -S->G->ni)){
-		fhk_fail(S, ecode(BOUND) | etagE(MAP, map));
+void fhk_setmapI(struct fhk_solver *S, int map, int inst, fhk_subset ss) {
+	if(UNLIKELY((uint32_t)map < (uint32_t)-S->G->ni)) {
+		fhk_fail(S, ecode(BOUND) | etagA(MAP, map));
 		return;
 	}
-
-	fhkX_anymap am = S->mapstate[map];
+	fhkX_anymap am = S->map[map_zext(map)];
 	if(UNLIKELY(anymap_isU(am))){
-		xgroup group = S->G->assoc_mapJ[map];
-		if(UNLIKELY(anymap_isU(S->mapstate[group]))){
+		xgroup group = S->G->mapg[map_zext(map)];
+		if(UNLIKELY(anymap_isU(S->map[group]))) {
 			fhk_fail(S, ecode(NOVALUE) | etagA(MAP, group));
 			return;
 		}
-		anymapI(am) = fhk_solver_newmapI(S, subsetIE_size(anymapK(S->mapstate[group])));
-		S->mapstate[map] = am;
+		anymapI(am) = fhk_mem_newmapI(S, subsetIE_size(anymapK(S->map[group])));
+		S->map[map_zext(map)] = am;
 	}
-
-	if(UNLIKELY(!subset_isU(anymapII(am, inst)))){
+	if(UNLIKELY(!subset_isU(anymapII(am, inst)))) {
 		fhk_fail(S, ecode(WRITE) | etagA(MAP, map) | etagB(INST, inst));
 		return;
 	}
-
 	anymapII(am, inst) = ss;
 	trace(SETMAPI, map, inst, ss);
 }
 
 /* ---- shape ---------------------------------------- */
 
-static int shape_setg(struct fhk_solver *S, xgroup group, uint32_t shape){
-	if(UNLIKELY(shape > MAX_INST)){
-		fhk_fail(S, ecode(INVAL) | etagE(INST, shape));
-		return 0;
-	}
-
-	return setmapK(S, group, shape ? subsetI_newZ(shape-1, 0) : FHK_EMPTYSET);
+void fhk_setshape(struct fhk_solver *S, int group, int shape) {
+	fhk_setmapK(S, group, shape ? subsetI_newZ(shape-1, 0) : SUBSET_EMPTY);
 }
 
-void fhk_setshape(struct fhk_solver *S, int group, int shape){
-	if(UNLIKELY(group > S->G->ng)){
-		fhk_fail(S, ecode(BOUND) | etagE(GROUP, group));
-		return;
-	}
-
-	shape_setg(S, group, shape);
-}
-
-void fhk_setshapeT(struct fhk_solver *S, uint32_t *shape){
+void fhk_setshapeT(struct fhk_solver *S, uint32_t *shape) {
 	int ng = S->G->ng;
-	for(int i=0;i<ng;i++){
-		if(UNLIKELY(!shape_setg(S, i, shape[i])))
-			return;
+	for(int i=0; i<ng; i++) {
+		uint32_t s = shape[i];
+		setmapK(S, i, s ? subsetI_newZ(s-1, 0) : SUBSET_EMPTY);
 	}
 }
 
 /* ---- setroot ---------------------------------------- */
 
-static struct fhkX_bucket *root_find_bucket(struct fhk_solver *S, struct fhkX_bucket *hint,
-		int flags){
-
-	while(hint){
-		if(hint->flags == flags && bucket_free(hint) > 0)
-			return hint; // exact match
-		if(hint->used == 0 && (hint->flags ^ (flags & BUCKET_COPY)) == 0){
-			// compatible empty
-			hint->flags = flags;
-			return hint;
+static struct fhkX_bucket *root_find_bucket(struct fhk_solver *S, int flags, fhk_mref hint) {
+	while(hint) {
+		struct fhkX_bucket *bucket = mrefp(S, hint);
+		if(bucket->flags == flags && bucket->num < MAX_ROOT)
+			return bucket;
+		if(bucket->num == 0 && (bucket->flags ^ (flags & BUCKET_COPY)) == 0) {
+			bucket->flags = flags;
+			return bucket;
 		}
-		hint = hint->next;
+		hint = bucket->next;
 	}
-
-	return fhk_solver_newbucket(S, flags);
+	struct fhk_mem *mem = mrefp(S, S->mem);
+	fhk_mem_alignT(mem, struct fhkX_bucket *);
+	struct fhkX_bucket *bucket = mrefp(mem, mem->ptr);
+	fhk_mem_bump(mem, MAX_ROOT*sizeof(fhkX_root));
+	if(flags & BUCKET_COPY)
+		fhk_mem_bump(mem, MAX_ROOT*sizeof(void *));
+	fhk_mem_commit(mem);
+	bucket->next = S->bucket;
+	S->bucket = pmref(S, bucket);
+	bucket->num = 0;
+	bucket->flags = flags;
+	return bucket;
 }
 
-static void root_put(struct fhkX_bucket *bucket, fhkX_root root){
-	assert(bucket_free(bucket) > 0 && !bucket_checkC(bucket->flags));
-	bucket->roots[bucket->used++] = root;
-	trace(SETROOT, bucket->flags, (int)root_idx(root), (int)root_start(root), (int)root_znum(root));
-}
-
-static void root_putP(struct fhkX_bucket *bucket, fhkX_root root, void *p){
-	assert(bucket_free(bucket) > 0 && bucket_checkC(bucket->flags));
-	bucket->roots[bucket->used] = root | bucket->used;
-	bucket->p[bucket->used] = p;
-	bucket->used++;
-	trace(SETROOTP, (uint8_t)bucket->flags, (int)root_idx(root), (int)root_start(root), (int)root_znum(root), p);
-}
-
-static void root_put_subsetIE(struct fhk_solver *S, fhkX_root tmpl, fhk_subset ss, void *p, int flags){
+void fhk_setroot(struct fhk_solver *S, int idx, fhk_subset ss) {
 	if(UNLIKELY(subset_isE(ss))) return;
-	struct fhkX_bucket *bucket = root_find_bucket(S, S->root, flags);
-	fhkX_root root = tmpl | root_newsubsetI(ss);
-	if(bucket_checkC(flags))
-		root_putP(bucket, root, p);
-	else
-		root_put(bucket, root);
+	int flags = idx < S->G->nz ? BUCKET_GIVEN : 0;
+	struct fhkX_bucket *bucket = root_find_bucket(S, flags, S->bucket);
+	if(LIKELY(subset_isI(ss))) {
+		bucket->roots[bucket->num++] = root_newidx(idx) | root_newsubsetI(ss);
+		// TODO trace
+	} else {
+		fhkX_pkref pk = subsetC_pk(ss);
+		for(;;) {
+			if(UNLIKELY(bucket->num == MAX_ROOT))
+				bucket = root_find_bucket(S, flags, pmref(S, bucket));
+			bucket->roots[bucket->num++] = root_newidx(idx) | root_newpk(pk);
+			// TODO trace
+			if(!pkref_more(pk)) return;
+			pk = pkref_next(pk);
+		}
+	}
 }
 
-static void root_put_pk_copy(struct fhk_solver *S, fhkX_root tmpl, int flags, fhkX_pkref pk,
-		void *p, int size){
-
-	struct fhkX_bucket *bucket = root_find_bucket(S, S->root, flags);
-
-	for(;;){
-		root_putP(bucket, tmpl | root_newpk(pk), p);
-		if(!pkref_more(pk))
-			break;
+static void root_setC_pk(struct fhk_solver *S, int idx, fhkX_pkref pk, void *p,
+		struct fhkX_bucket *bucket, size_t size) {
+	for(;;) {
+		if(UNLIKELY(bucket->num == MAX_ROOT))
+			bucket = root_find_bucket(S, bucket->flags, pmref(S, bucket));
+		bucket->roots[bucket->num] = root_newidx(idx) | root_newpk(pk) | bucket->num;
+		bucket->ptr[bucket->num++] = p;
+		// TODO trace
+		if(!pkref_more(pk)) return;
 		p += size*pkref_size(pk);
 		pk = pkref_next(pk);
-		if(!bucket_free(bucket))
-			bucket = root_find_bucket(S, bucket->next, flags);
 	}
 }
 
-static void root_put_pk(struct fhk_solver *S, fhkX_root tmpl, int flags, fhkX_pkref pk){
-	struct fhkX_bucket *bucket = root_find_bucket(S, S->root, flags);
-
-	for(;;){
-		root_put(bucket, tmpl | root_newpk(pk));
-		if(!pkref_more(pk))
-			break;
-		pk = pkref_next(pk);
-		if(!bucket_free(bucket))
-			bucket = root_find_bucket(S, bucket->next, flags);
+void fhk_setrootC(struct fhk_solver *S, int idx, fhk_subset ss, void *p) {
+	if(UNLIKELY(subset_isE(ss))) return;
+	int flags = idx < S->G->nz ? (BUCKET_GIVEN|BUCKET_COPY) : BUCKET_COPY;
+	struct fhkX_bucket *bucket = root_find_bucket(S, flags, S->bucket);
+	if(LIKELY(subset_isI(ss))) {
+		bucket->roots[bucket->num] = root_newidx(idx) | root_newsubsetI(ss) | bucket->num;
+		bucket->ptr[bucket->num++] = p;
+	} else {
+		root_setC_pk(S, idx, subsetC_pk(ss), p, bucket, S->G->vars[idx].size);
 	}
 }
 
-static void root_put_subset(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p, int flags){
-	if(UNLIKELY(!input_assertV(S, idx))) return;
-
-	if(var_isG(&S->G->vars[idx]))
-		flags |= BUCKET_GIVEN;
-
-	if(subset_isIE(ss)){
-		root_put_subsetIE(S, root_newidx(idx), ss, p, flags);
-	}else if(bucket_checkC(flags)){
-		root_put_pk_copy(S, root_newidx(idx), flags, subsetC_pk(ss), p, S->G->vars[idx].size);
-	}else{
-		root_put_pk(S, root_newidx(idx), flags, subsetC_pk(ss));
-	}
-}
-
-void fhk_setroot(struct fhk_solver *S, int idx, fhk_subset ss){
-	root_put_subset(S, idx, ss, NULL, 0);
-}
-
-void fhk_setrootC(struct fhk_solver *S, int idx, fhk_subset ss, void *p){
-	root_put_subset(S, idx, ss, p, BUCKET_COPY);
-}
-
-void *fhk_setrootD(struct fhk_solver *S, int idx, fhk_subset ss){
-	if(UNLIKELY(!input_assertV(S, idx))) return NULL;
+void *fhk_setrootD(struct fhk_solver *S, int idx, fhk_subset ss) {
+	if(UNLIKELY(subset_isE(ss))) return NULL;
 	struct fhk_var *x = &S->G->vars[idx];
-
-	if(subset_isIE(ss)){
+	size_t size = x->size;
+	int given = var_isG(x) ? BUCKET_GIVEN : 0;
+	if(LIKELY(subset_isI(ss))) {
 		void *vp = valueV(S->value, idx);
-		if(UNLIKELY(!vp)){
-			fhkX_anymap space = S->mapstate[x->group];
-			if(UNLIKELY(anymap_isU(space))){
+		if(!vp) {
+			fhkX_anymap space = S->map[x->group];
+			if(UNLIKELY(anymap_isU(space))) {
 				fhk_fail(S, ecode(NOVALUE) | etagA(MAP, x->group));
 				return NULL;
 			}
-
 			int shape = subsetIE_size(anymapK(space));
-			vp = fhk_solver_newvalue(S, x->size, shape);
+			vp = fhk_mem_newvalue(S, size, shape);
 			valueV(S->value, idx) = vp;
-
 			// maintain invariant: vp implies bitmap for given variables
-			if(UNLIKELY(var_isG(x) && !S->stateG[idx]))
-				S->stateG[idx] = fhk_solver_newbitmap(S, shape);
+			if(UNLIKELY(given && !S->stateG[idx]))
+				S->stateG[idx] = fhk_mem_newbitmap(S, shape);
 		}
-
-		root_put_subsetIE(S, root_newidx(idx), ss, NULL, var_isG(x) ? BUCKET_GIVEN : 0);
-		return vp + x->size*subsetI_first(ss);
-	}else{
-		fhkX_pkref pk = subsetC_pk(ss);
-		int bufnum = 0;
-		for(;;){
-			bufnum += pkref_size(pk);
-			if(!pkref_more(pk))
-				break;
+		struct fhkX_bucket *bucket = root_find_bucket(S, given, S->bucket);
+		bucket->roots[bucket->num++] = root_newidx(idx) | root_newsubsetI(ss);
+		// TODO trace
+		return vp + size*subsetI_first(ss);
+	} else {
+		fhkX_pkref spk = subsetC_pk(ss);
+		fhkX_pkref pk = spk;
+		int bufsize = 0;
+		for(;;) {
+			bufsize += pkref_size(pk);
+			if(!pkref_more(pk)) break;
 			pk = pkref_next(pk);
 		}
-		void *p = fhk_alloc(S->arena, bufnum*x->size, GUESS_ALIGN(x->size));
-		root_put_pk_copy(S,
-				root_newidx(idx),
-				BUCKET_COPY | (var_isG(x) ? BUCKET_GIVEN : 0),
-				subsetC_pk(ss),
-				p, x->size);
+		struct fhkX_bucket *bucket = root_find_bucket(S, given|BUCKET_COPY, S->bucket);
+		void *p = fhk_mem_alloc(mrefp(S, S->mem), bufsize*size, GUESS_ALIGN(size));
+		root_setC_pk(S, idx, spk, p, bucket, size);
 		return p;
 	}
 }
@@ -276,9 +236,9 @@ static void *vref_prep(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p) {
 		fhk_fail(S, ecode(GIVEN) | etagA(NODE, idx));
 		return NULL;
 	}
-	void *vp = valueV(S->value, idx);
-	if(vp) return vp;
-	fhkX_anymap amg = S->mapstate[x->group];
+	void **vp = &valueV(S->value, idx);
+	if(*vp) return *vp;
+	fhkX_anymap amg = S->map[x->group];
 	if(UNLIKELY(anymap_isU(amg))) {
 		// need to init vp but group size is unknown.
 		fhk_fail(S, ecode(NOVALUE) | etagA(MAP, x->group));
@@ -288,17 +248,15 @@ static void *vref_prep(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p) {
 	xinst num = subsetIE_size(space);
 	// maintain invariant: value buffer exists => bitmap exists.
 	if(!S->stateG[idx])
-		S->stateG[idx] = fhk_solver_newbitmap(S, num);
+		S->stateG[idx] = fhk_mem_newbitmap(S, num);
 	if(p && ss == space) {
-		valueV(S->value, idx) = p;
+		*vp = p;
 		// bitmaps overflow to zeros, so a brutal memset is fine.
 		memset(bitmap_ref64(S->stateG[idx]), 0, bitmap_size(num));
 		trace(SETVALR, fhk_debug_sym(S->G, idx), p, fhk_debug_value(S, idx, 0));
 		return NULL;
 	}
-	vp = fhk_solver_newvalue(S, x->size, num);
-	valueV(S->value, idx) = vp;
-	return vp;
+	return *vp = fhk_mem_newvalue(S, x->size, num);
 }
 
 static void vref_copyvalue(struct fhk_solver *S, xidx idx, fhk_subset ss, void *p, void *px) {
@@ -369,11 +327,15 @@ static fhk_subset subset_copyC(struct fhk_solver *S, fhk_subset ss){
 	do {
 		pk = pkref_next(pk);
 	} while(pkref_more(pk));
-
-	size_t sz = PKWORD_FULL + (intptr_t)pk - (intptr_t)pk0;
-	fhkX_pkref spk = fhk_alloc(S->arena, sz, PKWORD_ALIGN);
-	memcpy(spk, pk0, sz);
-	return subsetC_new(spk);
+	struct fhk_mem *mem = mrefp(S, S->mem);
+	void *p = mrefp(mem, mem->ptr);
+	// no alignment needed here.
+	// pk points to the last range, so we have 5+3 = PKWORD_FULL bytes after pk to copy.
+	size_t size = PKWORD_FULL + (intptr_t)pk - (intptr_t)pk0;
+	fhk_mem_bump(mem, size);
+	fhk_mem_commit(mem);
+	memcpy(p, pk0, size);
+	return subsetC_new(p);
 }
 
 fhk_subset fhk_copysubset(struct fhk_solver *S, fhk_subset ss){

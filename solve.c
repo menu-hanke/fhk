@@ -2,6 +2,7 @@
 #include "debug.h"
 #include "def.h"
 #include "fhk.h"
+#include "mem.h"
 #include "solve.h"
 #include "trace.h"
 
@@ -14,207 +15,166 @@
 
 /* ---- flow control ---------------------------------------- */
 
-static void yield_ok(struct fhk_solver *S){
+static void yield_ok(struct fhk_solver *S) {
 	trace(YOK);
+	fhk_yield(S, 1);
+}
+
+static void yield_node(struct fhk_solver *S, int idx, int inst) {
+	S->idx = idx;
+	S->inst = inst;
+	int r = S->G->bn + idx;
+	if(idx_isX(idx)) {
+		trace(YVAR, r, fhk_debug_sym(S->G, idx), inst);
+	} else {
+		trace(YMOD, r, fhk_debug_sym(S->G, idx), inst);
+	}
+	fhk_yield(S, r);
+}
+
+static void yield_mapcallK(struct fhk_solver *S, int idx) {
+	S->idx = idx;
+	int r = S->G->bk + idx;
+	trace(YMAPK, r, idx);
+	fhk_yield(S, r);
+}
+
+static void yield_mapcallI(struct fhk_solver *S, int idx, int inst) {
+	S->idx = idx;
+	S->inst = inst;
+	int r = S->G->bi + idx;
+	trace(YMAPI, r, (int8_t)idx, inst);
+	fhk_yield(S, r);
+}
+
+COLD static void yield_err(struct fhk_solver *S, fhk_status err) {
+	trace(YERR);
+	S->error = err;
 	fhk_yield(S, 0);
 }
 
-static void yield_shape(struct fhk_solver *S, xgroup group){
-	trace(YSHAPE, group);
-	fhk_yield(S, scode(SHAPE) | group);
-}
-
-static void yield_vref(struct fhk_solver *S, xidx idx, xinst inst){
-	trace(YVAR, fhk_debug_sym(S->G, idx), inst);
-	fhk_yield(S, scode(VREF) | (inst << 16) | idx);
-}
-
-static void yield_mapcallK(struct fhk_solver *S, xmap map){
-	trace(YMAPK, mapL_fromext(map, S->G->ng), map);
-	fhk_yield(S, scode(MAPCALLK) | map);
-}
-
-static void yield_mapcallI(struct fhk_solver *S, xmap map, xinst inst){
-	trace(YMAPI, map, inst);
-	fhk_yield(S, scode(MAPCALLI) | (inst << 16) | (map & 0xffff));
-}
-
-static void yield_modcall(struct fhk_solver *S, fhk_modcall *mc){
-	trace(YMOD, fhk_debug_sym(S->G, mc->idx), mc->inst, mc->np, mc->nr);
-	fhk_yield(S, scode(MODCALL) | (intptr_t)mc);
-}
-
-ERRFUNC static void yield_err_nyi(struct fhk_solver *S){
-	fhk_yield(S, ecode(NYI));
+ERRFUNC static void yield_err_nyi(struct fhk_solver *S) {
+	yield_err(S, ecode(NYI));
 	UNREACHABLE();
 }
 
 ERRFUNC static void yield_err_nomapK(struct fhk_solver *S, xmap map){
-	fhk_yield(S, ecode(NOVALUE) | etagA(MAP, map));
+	yield_err(S, ecode(NOVALUE) | etagA(MAP, map));
 	UNREACHABLE();
 }
 
 ERRFUNC static void yield_err_nomapJ(struct fhk_solver *S, xmap map, xinst inst){
-	fhk_yield(S, ecode(NOVALUE) | etagA(MAP, map) | etagB(INST, inst));
+	yield_err(S, ecode(NOVALUE) | etagA(MAP, map) | etagB(INST, inst));
 	UNREACHABLE();
 }
 
 ERRFUNC static void yield_err_novar(struct fhk_solver *S, xidx xi, xinst inst){
-	fhk_yield(S, ecode(NOVALUE) | etagA(NODE, xi) | etagB(INST, inst));
+	yield_err(S, ecode(NOVALUE) | etagA(NODE, xi) | etagB(INST, inst));
 	UNREACHABLE();
 }
 
 ERRFUNC static void yield_err_depth(struct fhk_solver *S){
-	fhk_yield(S, ecode(DEPTH));
+	yield_err(S, ecode(DEPTH));
 	UNREACHABLE();
 }
 
 ERRFUNC static void yield_err_chain(struct fhk_solver *S, xidx xi, xinst inst){
-	fhk_yield(S, ecode(CHAIN) | etagA(NODE, xi) | etagB(INST, inst));
+	yield_err(S, ecode(CHAIN) | etagA(NODE, xi) | etagB(INST, inst));
 	UNREACHABLE();
-}
-
-/* ---- scratch space management ---------------------------------------- */
-
-static void scratch_grow(struct fhk_solver *S, uint32_t minsize){
-	uint32_t size = S->scratch.size;
-
-	// old scratch buffers are forgotten and never reused,
-	// so we grow really aggressively here to minimize the number
-	// of wasted buffers.
-	do {
-		size = (3 * size) + SCRATCH_MINSIZE;
-	} while(size < minsize);
-
-	void *newp = fhk_alloc(S->arena, size, SCRATCH_ALIGN);
-
-	if(S->scratch.mark < S->scratch.used)
-		memcpy(newp, S->scratch.p, S->scratch.used - S->scratch.mark);
-
-	S->scratch.size = size;
-	S->scratch.used = 0;
-	S->scratch.mark = scratch_checkM(S->scratch.mark) ? 0 : SCRATCH_NOMARK;
-	S->scratch.p = newp;
-}
-
-static void *scratch_more(struct fhk_solver *S, uint32_t size){
-	size = ALIGN(size, SCRATCH_ALIGN);
-	if(UNLIKELY(S->scratch.used + size > S->scratch.size))
-		scratch_grow(S, S->scratch.used + size);
-	void *p = S->scratch.p + S->scratch.used;
-	S->scratch.used += size;
-	return p;
-}
-
-static void scratch_mark(struct fhk_solver *S){
-	S->scratch.mark = S->scratch.used;
-}
-
-static void *scratch_atmark(struct fhk_solver *S){
-	assert(scratch_checkM(S->scratch.mark));
-	return S->scratch.p + S->scratch.mark;
-}
-
-static void *scratch_commit(struct fhk_solver *S){
-	void *p = scratch_atmark(S);
-	S->scratch.mark = SCRATCH_NOMARK;
-	return p;
-}
-
-static void scratch_reset(struct fhk_solver *S){
-	S->scratch.used = 0;
-	assert(!scratch_checkM(S->scratch.mark));
 }
 
 /* ---- state management ---------------------------------------- */
 
+/* allocation responsibilities:
+ *   +-------------------------------+--------------------+---------------------+
+ *   |           edge type           |    anymap/k-map    |   i-map instances   |
+ *   +-------------------------------+--------------------+---------------------+
+ *   | computed v->m   back (return) |   yf_state_newV    |  yf_solver_enterV   |
+ *   +-------------------------------+--------------------+---------------------+
+ *   | computed m->v/g back (param)  |   yf_state_newM    |  yf_solver_enterM   |
+ *   +-------------------------------+--------------------+---------------------+
+ *   | given    m->v   back (param)  | yf_state_newvalueM | yf_eval_checkparam* |
+ *   +-------------------------------+--------------------+---------------------+
+ *   | computed m->v   fwd  (return) | yf_state_newvalueM |   yf_eval_modcall   |
+ *   +-------------------------------+--------------------+---------------------+
+ */
+
 // S->mapstate[map] must be allocated before calling this
 static void yf_state_mapcallJ(struct fhk_solver *S, xmap map, xinst inst){
-	yield_mapcallI(S, map, inst);
-	if(UNLIKELY(subset_isU(anymapII(S->mapstate[map], inst))))
+	assert(map_isJ(map));
+	yield_mapcallI(S, map_sext(map), inst);
+	if(UNLIKELY(subset_isU(anymapII(S->map[map], inst))))
 		yield_err_nomapJ(S, map, inst);
 }
 
-static void yf_state_checkmapJ(struct fhk_solver *S, xmap map, xinst inst){
-	fhkX_anymap state = S->mapstate[map];
-	assert(!anymap_isU(state));
-	if(!subset_isU(anymapII(state, inst)))
+static void yf_state_checkmapJ(struct fhk_solver *S, xmap map, xinst inst) {
+	fhkX_anymap am = S->map[map];
+	// caller's responsibility to ensure it's allocated.
+	assert(!anymap_isU(am));
+	if(!subset_isU(anymapII(am, inst)))
 		return;
 	yf_state_mapcallJ(S, map, inst);
 }
 
-static void yf_state_checkanymapJ(struct fhk_solver *S, xmap map, xinst inst){
-	if(LIKELY(!map_isJ(map)))
-		return;
-	yf_state_checkmapJ(S, map, inst);
-}
-
 static void yf_state_mapcallK(struct fhk_solver *S, xmap map){
-	if(LIKELY(map_isL(map, S->G->ng)))
-		yield_mapcallK(S, mapL_toext(map, S->G->ng));
-	else
-		yield_shape(S, map);
-	if(UNLIKELY(anymap_isU(S->mapstate[map])))
+	yield_mapcallK(S, map);
+	if(UNLIKELY(anymap_isU(S->map[map])))
 		yield_err_nomapK(S, map);
 }
 
 AINLINE static void yf_state_checkmapK(struct fhk_solver *S, xmap map){
-	if(LIKELY(!anymap_isU(S->mapstate[map])))
+	if(LIKELY(!anymap_isU(S->map[map])))
 		return;
 	yf_state_mapcallK(S, map);
 }
 
 static void yf_state_newmapJ(struct fhk_solver *S, xmap map){
-	xgroup group = S->G->assoc_mapJ[map];
+	xgroup group = S->G->mapg[map];
 	yf_state_checkmapK(S, group);
-	anymapI(S->mapstate[map]) = fhk_solver_newmapI(S, subsetIE_size(anymapK(S->mapstate[group])));
+	anymapI(S->map[map]) = fhk_mem_newmapI(S, subsetIE_size(anymapK(S->map[group])));
 }
 
 static void yf_state_setanymap(struct fhk_solver *S, xmap map){
+	assert(map_isK(map) || map_isJ(map)); // do not pass ident here
 	if(map_isK(map))
 		yf_state_mapcallK(S, map);
 	else
 		yf_state_newmapJ(S, map);
 }
 
-AINLINE static void yf_state_checkanymap(struct fhk_solver *S, xmap map){
-	assert(map_isE(map));
-	if(LIKELY(!anymap_isU(S->mapstate[map])))
+static void yf_state_checkanymap(struct fhk_solver *S, xmap map){
+	if(LIKELY(!anymap_isU(S->map[map])))
 		return;
-	yf_state_setanymap(S, map);
+	return yf_state_setanymap(S, map);
+}
+
+static void yf_state_checkanymapJ(struct fhk_solver *S, xmap map, xinst inst) {
+	if(!map_isJ(map))
+		return;
+	yf_state_checkmapJ(S, map, inst);
 }
 
 static fhkX_sp *yf_state_newsp(struct fhk_solver *S, fhkX_sp init, xgroup group){
 	yf_state_checkmapK(S, group);
-	xinst size = subsetIE_size(anymapK(S->mapstate[group]));
-	return fhk_solver_newsp(S, size, init);
+	xinst size = subsetIE_size(anymapK(S->map[group]));
+	return fhk_mem_newsp(S, size, init);
 }
 
 // note: this does NOT expand forward edges.
 // forward edges are expanded by yf_state_newvalueM.
 static void yf_state_newM(struct fhk_solver *S, xidx idx){
 	struct fhk_model *m = &S->G->models[idx];
-
-	uint32_t expanded = 1;
-
+	// this must be first since it checks for the group map, which ensures
+	// we have the coresponding identity map.
+	S->stateM[idx] = yf_state_newsp(S, sp_new(m->exp << SP_EXPANDED_BIT, m->cmin), m->group);
 	fhk_check *checks = m->checks;
-	for(int i=m->p_check;i;i++){
-		xmap map = checks[i].map;
-		expanded &= !map_isJ(map);
-		if(map_isE(map))
-			yf_state_checkanymap(S, map);
-	}
-
+	int64_t i;
+	for(i=m->p_check; i; i++)
+		yf_state_checkanymap(S, checks[i].map);
 	fhk_edge *params = m->params;
 	int nc = m->p_cparam;
-	for(int i=0;i<nc;i++){
-		xmap map = params[i].map;
-		expanded &= !map_isJ(map);
-		if(map_isE(map))
-			yf_state_checkanymap(S, map);
-	}
-
-	S->stateM[idx] = yf_state_newsp(S, sp_new(expanded << SP_EXPANDED_BIT, m->cmin), m->group);
+	for(i=0; i<nc; i++)
+		yf_state_checkanymap(S, params[i].map);
 }
 
 AINLINE static void yf_state_checkM(struct fhk_solver *S, xidx idx){
@@ -226,18 +186,17 @@ AINLINE static void yf_state_checkM(struct fhk_solver *S, xidx idx){
 static void yf_state_newV(struct fhk_solver *S, xidx idx){
 	struct fhk_var *x = &S->G->vars[idx];
 	assert(var_isC(x));
-
-	uint32_t expanded = 1;
+	// group must be checked first, see yf_state_newM.
+	yf_state_checkmapK(S, x->group);
 	int64_t i = 0, nm = x->n_mod;
 	fhk_edge *models = x->models;
+	uint32_t state = SP_EXPANDED;
 	do {
 		xmap map = models[i].map;
-		expanded &= !map_isJ(map);
-		if(map_isE(map))
-			yf_state_checkanymap(S, map);
+		state = map_isJ(map) ? 0 : state;
+		yf_state_checkanymap(S, map);
 	} while(++i < nm);
-
-	S->stateV[idx] = yf_state_newsp(S, sp_new(expanded << SP_EXPANDED_BIT, 0), x->group);
+	S->stateV[idx] = fhk_mem_newsp(S, subsetIE_size(anymapK(S->map[x->group])), sp_new(state, 0));
 }
 
 AINLINE static void yf_state_checkV(struct fhk_solver *S, xidx idx){
@@ -249,7 +208,7 @@ AINLINE static void yf_state_checkV(struct fhk_solver *S, xidx idx){
 static void yf_state_newG(struct fhk_solver *S, xidx idx){
 	xgroup group = S->G->vars[idx].group;
 	yf_state_checkmapK(S, group);
-	S->stateG[idx] = fhk_solver_newbitmap(S, subsetIE_size(anymapK(S->mapstate[group])));
+	S->stateG[idx] = fhk_mem_newbitmap(S, subsetIE_size(anymapK(S->map[group])));
 }
 
 AINLINE static void yf_state_checkG(struct fhk_solver *S, xidx idx){
@@ -261,7 +220,7 @@ AINLINE static void yf_state_checkG(struct fhk_solver *S, xidx idx){
 static void yf_state_newC(struct fhk_solver *S, xidx idx){
 	xgroup group = S->G->guards[idx].group;
 	yf_state_checkmapK(S, group);
-	S->stateC[idx] = fhk_solver_newcheckmap(S, subsetIE_size(anymapK(S->mapstate[group])));
+	S->stateC[idx] = fhk_mem_newcheckmap(S, subsetIE_size(anymapK(S->map[group])));
 }
 
 AINLINE static void yf_state_checkC(struct fhk_solver *S, xidx idx){
@@ -276,10 +235,10 @@ static void yf_state_newvalueV(struct fhk_solver *S, xidx idx){
 	size_t size = x->size;
 	xgroup group = x->group;
 	yf_state_checkmapK(S, group);
-	valueV(S->value, idx) = fhk_solver_newvalue(S, size, subsetIE_size(anymapK(S->mapstate[group])));
+	valueV(S->value, idx) = fhk_mem_newvalue(S, size, subsetIE_size(anymapK(S->map[group])));
 }
 
-AINLINE static void yf_state_checkvalueV(struct fhk_solver *S, xidx idx){
+AINLINE static void yf_state_checkvalueV(struct fhk_solver *S, xidx idx) {
 	if(LIKELY(valueV(S->value, idx)))
 		return;
 	yf_state_newvalueV(S, idx);
@@ -289,15 +248,12 @@ AINLINE static void yf_state_checkvalueV(struct fhk_solver *S, xidx idx){
 // given and return edges, since they will definitely be needed for computing the value.
 static void yf_state_newvalueM(struct fhk_solver *S, xidx idx){
 	struct fhk_model *m = &S->G->models[idx];
-
 	fhk_edge *params = m->params;
 	int64_t np = m->p_param;
 	for(int64_t i=m->p_cparam;i<np;i++){
 		yf_state_checkG(S, params[i].idx);
-		if(map_isE(params[i].map))
-			yf_state_checkanymap(S, params[i].map);
+		yf_state_checkanymap(S, params[i].map);
 	}
-
 	fhk_edge *re = m->returns;
 	int i = 0, nr = m->p_return;
 	do {
@@ -306,12 +262,9 @@ static void yf_state_newvalueM(struct fhk_solver *S, xidx idx){
 		yf_state_checkV(S, re->idx);
 		// same for return values.
 		yf_state_checkvalueV(S, re->idx);
-		if(map_isE(re->map))
-			yf_state_checkanymap(S, re->map);
+		yf_state_checkanymap(S, re->map);
 		re++;
 	} while(++i < nr);
-
-	// this may be later patched to a retbuf address, if a retbuf is allocated
 	valueM(S->value, idx) = 1;
 }
 
@@ -323,57 +276,41 @@ AINLINE static void yf_state_checkvalueM(struct fhk_solver *S, xidx idx){
 
 /* ---- maps, subset and iterators ---------------------------------------- */
 
-static fhk_subset yf_map_subset_checkedJ(struct fhk_solver *S, xmap map, xinst inst){
-	assert(map_isE(map));
-
-	fhkX_anymap am = S->mapstate[map];
+static fhk_subset map_subset_unchecked(struct fhk_solver *S, xmap map, xinst inst) {
+	fhkX_anymap am = S->map[map];
 	assert(!anymap_isU(am));
 
-	if(map_isI(map)){
-		fhk_subset ss = anymapII(am, inst);
-		if(UNLIKELY(subset_isU(ss))){
-			yf_state_mapcallJ(S, map, inst);
-			return anymapII(am, inst);
-		}else{
-			return ss;
-		}
-	}else{
-		return anymapK(am);
-	}
-}
-
-static fhk_subset map_subset_unchecked(struct fhk_solver *S, xmap map, xinst inst){
-	assert(map_isE(map));
-
-	fhkX_anymap am = S->mapstate[map];
-	assert(!anymap_isU(am));
-
-	if(map_isI(map)){
+	/* branching version: */
+	if(map_isI(map)) {
 		fhk_subset ss = anymapII(am, inst);
 		assert(!subset_isU(ss));
 		return ss;
-	}else{
+	} else {
+		return anymapK(am);
+	}
+
+	/* branchless version, with cmov but an extra load for k-maps: */
+	// fhk_subset *base = map_isK(map) ? S->map : am;
+	// xinst offset = map_isK(map) ? map : inst;
+	// assert(!subset_isU(base[offset]));
+	// return base[offset];
+}
+
+static fhk_subset yf_map_subset_checkedJ(struct fhk_solver *S, xmap map, xinst inst) {
+	fhkX_anymap am = S->map[map];
+	assert(!anymap_isU(am));
+	if(map_isI(map)) {
+		fhk_subset ss = anymapII(am, inst);
+		if(UNLIKELY(subset_isU(ss))) {
+			yf_state_mapcallJ(S, map, inst);
+			return anymapII(am, inst);
+		} else {
+			return ss;
+		}
+	} else {
 		return anymapK(am);
 	}
 }
-
-// very evil match-type macro to make map code a bit more readable.
-// note: place this in a block, eg: { ... }
-#define MAP_UNPACK_(_subset, S, map, inst, _x) \
-	__label__ ident, empty, interval, complex; \
-	fhk_subset _x; \
-	xmap _map = (map); \
-	xinst _inst = (inst); \
-	if(map_isID(map)){ _x = _inst; goto ident; } \
-	_x = _subset(S, _map, (inst)); \
-	if(subset_isI(_x)) goto interval; \
-	if(subset_isE(_x)) goto empty; \
-	goto complex;
-
-#define MAP_UNPACK_UNCHECKED(...) MAP_UNPACK_(map_subset_unchecked, __VA_ARGS__)
-
-// note: checked unpacks may yield!
-#define MAP_UNPACK_CHECKEDJ(...)  MAP_UNPACK_(yf_map_subset_checkedJ, __VA_ARGS__)
 
 // evil macro
 #define ITER_NEXT(it, pk, continue_, break_) \
@@ -565,7 +502,7 @@ next:
 
 static void yf_eval_varG(struct fhk_solver *S, xidx xi, xinst inst){
 	assert(bitmap_is1(S->stateG[xi], inst));
-	yield_vref(S, xi, inst);
+	yield_node(S, xi, inst);
 	if(UNLIKELY(bitmap_is1(S->stateG[xi], inst)))
 		yield_err_novar(S, xi, inst);
 }
@@ -578,43 +515,37 @@ AINLINE static void yf_eval_checkvarG(struct fhk_solver *S, xidx xi, xinst inst)
 
 static void yf_eval_varV(struct fhk_solver *S, xidx xi, xinst inst);
 
-static void yf_eval_checkmapV(struct fhk_solver *S, xmap map, xidx xi, xinst inst){
-	fhkX_pkref pk;
-	fhkX_iter it;
+static void yf_eval_checkintervalV(struct fhk_solver *S, xidx xi, xinst inst, xinst znum) {
+	do {
+		assert(sp_checkC(S->stateV[xi][inst].state)); // we come from solver.
+		if(!sp_checkV(S->stateV[xi][inst].state))
+			yf_eval_varV(S, xi, inst);
+		inst++;
+	} while(znum--);
+}
 
-	// unchecked: computed parameter maps were expanded when solver entered the model
-	{
-		MAP_UNPACK_UNCHECKED(S, map, inst, ss);
-		if(0) { empty: return; }
-		if(0) { ident:
-			if(!sp_checkV(S->stateV[xi][inst].state))
-				yf_eval_varV(S, xi, inst);
-			return;
+static void yf_eval_checkparamV(struct fhk_solver *S, xmap map, xidx idx, xinst inst) {
+	// unchecked: solver expands computed parameters
+	fhk_subset ss = map_subset_unchecked(S, map, inst);
+	if(LIKELY(subset_isI(ss))) {
+		yf_eval_checkintervalV(S, idx, subsetI_first(ss), subsetIE_znum(ss));
+	} else if(!subset_isE(ss)) {
+		fhkX_pkref pk = subsetC_pk(ss);
+		for(;;) {
+			yf_eval_checkintervalV(S, idx, pkref_first(pk), pkref_znum(pk));
+			if(!pkref_more(pk)) return;
+			pk = pkref_next(pk);
 		}
-		if(0) { interval: it = ss; }
-		if(0) { complex:
-			pk = subsetC_pk(ss);
-			it = pkref_iter_first(pk);
-		}
-	}
-
-	fhkX_sp *sp = S->stateV[xi];
-
-	for(;;){
-		if(!sp_checkV(sp[iter_inst(it)].state))
-			yf_eval_varV(S, xi, iter_inst(it));
-		ITER_NEXT(it, pk, continue, return);
 	}
 }
 
+// check [start, start+znum]  (inclusive)
 static void yf_eval_checkintervalG(struct fhk_solver *S, xidx xi, int start, int znum){
 	// note: stateG accesses are unchecked.
-
 	int end = start + znum;
 	int block = 64*bitmap_idx64(start);
 	uint64_t *M = bitmap_ref64(S->stateG[xi]) + bitmap_idx64(start);
 	uint64_t mask = *M & ~bitmapW_ones64(start-block);
-
 	do {
 		while(mask){
 			int fi = block + bitmapW_ffs64(mask);
@@ -629,47 +560,58 @@ static void yf_eval_checkintervalG(struct fhk_solver *S, xidx xi, int start, int
 	} while(block <= end);
 }
 
-static void yf_eval_checkmapG(struct fhk_solver *S, xmap map, xidx xi, xinst inst){
+static void yf_eval_checkparamG(struct fhk_solver *S, xmap map, xidx idx, xinst inst) {
 	// checked: solver doesn't expand given edges
-	MAP_UNPACK_CHECKEDJ(S, map, inst, ss);
-
-	fhkX_pkref pk;
-
-empty:
-	return;
-
-ident:
-	yf_eval_checkvarG(S, xi, inst);
-	return;
-
-interval:
-	yf_eval_checkintervalG(S, xi, subsetI_first(ss), subsetIE_znum(ss));
-	return;
-
-complex:
-	pk = subsetC_pk(ss);
-	for(;;){
-		yf_eval_checkintervalG(S, xi, pkref_first(pk), pkref_znum(pk));
-		if(!pkref_more(pk))
-			return;
-		pk = pkref_next(pk);
+	fhk_subset ss = yf_map_subset_checkedJ(S, map, inst);
+	if(LIKELY(subset_isI(ss))) {
+		yf_eval_checkintervalG(S, idx, subsetI_first(ss), subsetIE_znum(ss));
+	} else if(!subset_isE(ss)) {
+		fhkX_pkref pk = subsetC_pk(ss);
+		for(;;) {
+			yf_eval_checkintervalG(S, idx, pkref_first(pk), pkref_znum(pk));
+			if(!pkref_more(pk)) return;
+			pk = pkref_next(pk);
+		}
 	}
 }
 
-static void yf_eval_checkparams(struct fhk_solver *S, xidx mi, xinst inst){
-	struct fhk_model *m = &S->G->models[mi];
+static void eval_put_params(struct fhk_solver *S, xidx idx, xinst inst) {
+	struct fhk_graph *G = S->G;
+	struct fhk_model *m = &G->models[idx];
+	fhk_cedge *ce = S->edges;
 	fhk_edge *e = m->params;
-
-	// computed
-	int nc = m->p_cparam;
-	for(int i=0;i<nc;i++,e++)
-		yf_eval_checkmapV(S, e->map, e->idx, inst);
-
-	// given.
-	// note: yf_state_newvalueM must be called before this to expand stateG.
-	int np = m->p_param;
-	for(int i=nc;i<np;i++,e++)
-		yf_eval_checkmapG(S, e->map, e->idx, inst);
+	int ne = m->p_param;
+	for(int i=0; i<ne; i++, e++) {
+		struct fhk_cedge *c = ce + edgeP_order(*e);
+		size_t size = G->vars[e->idx].size;
+		void *vp = valueV(S->value, e->idx);
+		fhk_subset ss = map_subset_unchecked(S, e->map, inst);
+		if(LIKELY(subset_isI(ss))) {
+			c->p = vp + subsetI_first(ss)*size;
+			c->n = subsetIE_size(ss);
+		} else if(subset_isE(ss)) {
+			c->p = NULL;
+			c->n = 0;
+		} else {
+			struct fhk_mem *mem = mrefp(S, S->mem);
+			fhk_mem_align(mem, GUESS_ALIGN(size));
+			c->p = mrefp(mem, mem->ptr);
+			size_t num = 0;
+			fhkX_pkref pk = subsetC_pk(ss);
+			for(;;) {
+				size_t pos = pkref_first(pk);
+				size_t n = pkref_size(pk);
+				num += n;
+				void *p = mrefp(mem, mem->ptr);
+				fhk_mem_bump(mem, size*n);
+				fhk_mem_commit(mem);
+				memcpy(p, vp + size*pos, size*n);
+				if(!pkref_more(pk)) break;
+				pk = pkref_next(pk);
+			}
+			c->n = num;
+		}
+	}
 }
 
 AINLINE static int eval_replace_speculate(struct fhk_solver *S, xidx idx, uint32_t state, float cost){
@@ -684,10 +626,8 @@ AINLINE static int eval_replace_speculate(struct fhk_solver *S, xidx idx, uint32
 
 AINLINE static int eval_try_put_direct(struct fhk_solver *S, xidx idx, fhkX_sp *sp,
 		uint32_t templ, float cost){
-
 	uint32_t state = sp->state;
 	uint32_t cstate = (state & (SP_CHAIN|SP_EXPANDED)) | (SP_VALUE | templ);
-
 	if(UNLIKELY(sp_checkV(state))){
 		if(sp_checkC(state) || !eval_replace_speculate(S, idx, state, cost)){
 			// either a chain with a value exists,
@@ -695,7 +635,6 @@ AINLINE static int eval_try_put_direct(struct fhk_solver *S, xidx idx, fhkX_sp *
 			// we may not overwrite here.
 			return 0;
 		}
-
 		// our speculated value is better, we may overwrite and commit
 		sp->state = cstate;
 	}else{
@@ -711,41 +650,60 @@ AINLINE static int eval_try_put_direct(struct fhk_solver *S, xidx idx, fhkX_sp *
 		// is already selected.
 		sp->state = (int32_t)(state ^ (SP_CHAIN | SP_EXPANDED | templ)) <= 0 ? cstate : state;
 	}
-
 	return 1;
 }
 
-static void eval_scatter_put_header(struct fhk_solver *S, int ei){
-	fhkX_scatter *scatter = scratch_more(S, sizeof(*scatter));
-	*scatter = scatterH_new(ei);
+static void *scatter_skipA(struct fhkX_scatter_state *sct, size_t size) {
+	sct->mp = ALIGN(sct->mp, GUESS_ALIGN(size));
+	void *p = sct->mp;
+	sct->mp += size;
+	return p;
 }
 
-static void eval_scatter_put_range(struct fhk_solver *S, int bpos, int vpos, int num){
-	if(!num)
-		return;
-
-	fhkX_scatter *scatter = scratch_more(S, sizeof(*scatter));
-	*scatter = scatterR_new(num, vpos, bpos);
+static void scatter_buf(struct fhkX_scatter_state *sct, xinst start, xinst num, fhk_mref off) {
+	scatter_prev(sct)->num++;
+	struct fhkX_sbuf *b = sct->mp;
+	sct->mp += sizeof(struct fhkX_sbuf);
+	fhk_mem_commitP(sct->mem, sct->mp);
+	b->size = num*sct->size;
+	b->vp = sct->vp + start*sct->size;
+	b->off = off;
 }
 
-static void eval_scatter_put_end(struct fhk_solver *S){
-	fhkX_scatter *scatter = scratch_more(S, sizeof(*scatter));
-	*scatter = SCATTER_END;
+static void *scatter_data(struct fhkX_scatter_state *sct, xinst num) {
+	sct->mp = ALIGN(sct->mp, GUESS_ALIGN(sct->size));
+	void *p = sct->mp;
+	scatter_prev(sct)->data = pmref(sct->mem, p);
+	sct->mp += num*sct->size;
+	fhk_mem_commitP(sct->mem, sct->mp);
+	return p;
 }
 
-static int eval_scatter_put_split_range(struct fhk_solver *S, xidx idx, int start,
-		int bstart, int num, uint32_t templ, float cost){
+static void eval_start_scatter(struct fhk_solver *S, struct fhkX_scatter_state *sct, xidx idx,
+		uint32_t templ) {
+	sct->mp = ALIGN(sct->mp, alignof(struct fhkX_scatter));
+	struct fhkX_scatter *s = sct->mp;
+	sct->mp += sizeof(*s);
+	fhk_mem_commitP(sct->mem, sct->mp);
+	s->next = 0;
+	s->num = 0;
+	*sct->prev = pmref(sct->mem, s);
+	sct->prev = &s->next;
+	sct->idx = idx;
+	sct->size = S->G->vars[idx].size;
+	sct->vp = pmref(sct->mem, valueV(S->value, idx));
+	sct->templ = templ;
+}
 
-	int inst = start;
-	int bpos = bstart;
+static void eval_put_scatter(struct fhk_solver *S, struct fhkX_scatter_state *sct, xinst start,
+		int znum, xinst pos, float cost) {
 	int write = 0;
-
-	fhkX_sp *sp = S->stateV[idx] + start;
-
-	for(;;){
+	xinst inst = start;
+	fhkX_sp *sp = S->stateV[sct->idx] + start;
+	uint32_t templ = sct->templ;
+	for(;;) {
 		uint32_t state = sp->state;
 		uint32_t cstate = (state & (SP_CHAIN|SP_EXPANDED)) | (SP_VALUE | templ);
-
 		// we must commit iff one of the following is true:
 		//     (1) this model's chain is selected
 		//     (2) no chain is selected and no value is speculated
@@ -773,254 +731,179 @@ static int eval_scatter_put_split_range(struct fhk_solver *S, xidx idx, int star
 		// and if it passes, test the overwrite condition.
 		uint64_t w = (uint64_t)(state^(SP_CHAIN|SP_EXPANDED|templ)) * (uint64_t)(state&~SP_EXPANDED);
 		int _vx = (int32_t)state >= (int32_t)SP_VALUE;
-		if(LIKELY(!w) || (_vx && eval_replace_speculate(S, idx, state, cost))){
+		if(LIKELY(!w) || (_vx && eval_replace_speculate(S, sct->idx, state, cost))) {
 			write++;
 			sp->state = cstate;
-		}else{
-			eval_scatter_put_range(S, bpos, start, write);
-			bpos += write;
+		} else if(write > 0) {
+			scatter_buf(sct, start, inst-start, pos*sct->size);
+			start += write;
+			pos += write;
 			write = 0;
-			start = inst+1;
+		} else {
+			start++;
+			pos++;
 		}
-
-		if(!--num)
-			break;
-
 		sp++;
 		inst++;
+		if(!znum--) {
+			if(write > 0)
+				scatter_buf(sct, start, inst-start, pos*sct->size);
+			return;
+		}
 	}
-
-	eval_scatter_put_range(S, bpos, start, write);
-	return bpos + write;
 }
 
-static void yf_eval_put_returns(struct fhk_solver *S, xidx mi, xinst inst, fhk_modcall *mc,
-		float cost){
-
-	fhk_cedge *ce = mcall_returns(mc);
-	struct fhk_model *m = &S->G->models[mi];
-	fhk_edge *re = m->returns;
-	xedge ei = 0, nr = m->p_return;
+static void eval_put_returns(struct fhk_solver *S, xidx idx, xinst inst,
+		struct fhkX_scatter_state *sct) {
+	struct fhk_graph *G = S->G;
+	struct fhk_mem *mem = mrefp(S, S->mem);
+	sct->mem = mem;
+	sct->mp = mrefp(mem, mem->ptr);
+	sct->next = 0;
+	sct->prev = &sct->next;
 	uint32_t templ = spV_newchain(inst, 0);
-
-	do {
-		xmap map = re->map;
-		xidx idx = re->idx;
-		uint32_t size = S->G->vars[idx].size;
-		uint32_t etempl = templ | edgeR_reverse(*re);
-
-		// checked: solver doesn't expand return edges
-		{
-			MAP_UNPACK_CHECKEDJ(S, map, inst, ss);
-empty:
-			ce->p = NULL;
-			ce->n = 0;
-			goto next;
-
-interval:
-			if(subset_is1(ss))
-				goto ident;
-			{
-				int start = subsetI_first(ss);
-				int num = subsetIE_size(ss);
-				fhkX_sp *sp = S->stateV[idx] + start;
-				ce->n = num;
-
-				for(int off=0;;off++,sp++){
-					if(!eval_try_put_direct(S, idx, sp, etempl, cost)){
-						// can't directly write to this range, fallback to a scatter
-						ce->p = scatter_mark(num*size);
-						eval_scatter_put_header(S, ei);
-						eval_scatter_put_range(S, 0, start+off, off);
-						if(--num)
-							eval_scatter_put_split_range(S, idx, start+off+1, off, num, etempl, cost);
-						goto next;
-					}
-
-					if(!--num)
-						goto direct;
-				}
-			}
-
-complex:
-			{
-				int tot = 0, bpos = 0;
-
-				eval_scatter_put_header(S, ei);
-				fhkX_pkref pk = subsetC_pk(ss);
-				for(;;){
-					int num = pkref_size(pk);
-					int start = pkref_first(pk);
-					tot += num;
-					bpos = eval_scatter_put_split_range(S, idx, start, bpos, num, etempl, cost);
-					if(!pkref_more(pk))
-						break;
-					pk = pkref_next(pk);
-				}
-
-				ce->n = tot;
-				ce->p = scatter_mark(tot*size);
-				goto next;
-			}
-
-ident:
+	float cost = S->stateM[idx][inst].cost;
+	struct fhk_model *m = &G->models[idx];
+	fhk_cedge *ce = S->edges + m->p_param;
+	fhk_edge *e = m->returns;
+	int ne = m->p_return;
+	for(;;) {
+		xidx xi = e->idx;
+		size_t size = G->vars[xi].size;
+		uint32_t etempl = templ | edgeR_reverse(*e);
+		fhk_subset ss = map_subset_unchecked(S, e->map, inst);
+		// 99.99999% of cases we have a unit return set, so here's a fast path for that.
+		// in this case we don't need to consider scatters at all.
+		// either we commit the value or throw it away.
+		if(LIKELY(subset_is1(ss))) {
 			ce->n = 1;
-			if(eval_try_put_direct(S, idx, S->stateV[idx]+ss, etempl, cost)){
-				goto direct;
-			}else{
-				ce->p = scatter_mark(size);
-				goto next;
-			}
-
-direct:
-			ce->p = valueV(S->value, idx) + subsetI_first(ss)*size;
-next:
-			ce++;
-			re++;
-		}
-	} while(++ei < nr);
-}
-
-static void eval_put_scatter_buffers(struct fhk_solver *S, fhk_modcall *mc){
-	fhk_cedge *ce = mcall_returns(mc);
-	int nr = mc->nr;
-
-	do {
-		if(scatter_checkM(ce->p))
-			ce->p = scratch_more(S, scatterM_size(ce->p));
-		ce++;
-	} while(--nr);
-}
-
-static void eval_put_params(struct fhk_solver *S, xidx mi, xinst inst, fhk_modcall *mc){
-	fhk_cedge *pe = mcall_params(mc);
-	struct fhk_model *m = &S->G->models[mi];
-	int np = m->p_param;
-	fhk_edge *e = m->params;
-
-	while(np--){
-		xidx idx = e->idx;
-		fhk_cedge *ce = pe + edgeP_order(*e);
-		void *vp = valueV(S->value, idx);
-		uint32_t size = S->G->vars[idx].size;
-
-		{
-			MAP_UNPACK_UNCHECKED(S, e->map, inst, ss);
-			if(0) { empty:
-				ce->p = NULL;
-				ce->n = 0;
-			}
-			if(0) { ident:
-				ce->p = vp + inst*size;
-				ce->n = 1;
-			}
-			if(0) { interval:
-				ce->p = vp + subsetI_first(ss)*size;
-				ce->n = subsetIE_size(ss);
-			}
-			if(0) { complex:
-				scratch_mark(S);
-				uint32_t total = 0;
-				fhkX_pkref pk = subsetC_pk(ss);
-				for(;;){
-					uint32_t pos = pkref_first(pk);
-					uint32_t num = pkref_size(pk);
-					total += num;
-					void *p = scratch_more(S, num*size);
-					memcpy(p, vp + pos*size, num*size);
-					if(!pkref_more(pk))
-						break;
-					pk = pkref_next(pk);
+			if(LIKELY(eval_try_put_direct(S, xi, S->stateV[xi]+ss, etempl, cost)))
+				ce->p = valueV(S->value, xi) + ss*size;
+			else
+				ce->p = scatter_skipA(sct, size);
+		} else if(subset_isE(ss)) {
+			ce->n = 0;
+			ce->p = NULL;
+		} else if(subset_isI(ss)) {
+			xinst start = subsetI_first(ss);
+			xinst i = start;
+			int num = subsetIE_znum(ss);
+			ce->n = num+1;
+			ce->p = valueV(S->value, xi) + start*size;
+			fhkX_sp *sp = S->stateV[xi] + start;
+			for(;;) {
+				if(UNLIKELY(!eval_try_put_direct(S, xi, &sp[i], etempl, cost))) {
+					// can't write directly, fallback to scatter.
+					eval_start_scatter(S, sct, xi, etempl);
+					scatter_buf(sct, start, i-start, 0);
+					if(num)
+						eval_put_scatter(S, sct, i+1, num-1, i-start+1, cost);
+					ce->p = scatter_data(sct, ce->n);
+					break;
 				}
-				ce->p = scratch_commit(S);
-				ce->n = total;
+				if(!num--)
+					break;
+				i++;
 			}
+		} else {
+			xinst num = 0;
+			eval_start_scatter(S, sct, xi, etempl);
+			fhkX_pkref pk = subsetC_pk(ss);
+			for(;;) {
+				xinst zn = pkref_znum(pk);
+				eval_put_scatter(S, sct, pkref_first(pk), zn, num, cost);
+				num += zn+1;
+				if(!pkref_more(pk)) break;
+				pk = pkref_next(pk);
+			}
+			ce->n = num;
+			ce->p = scatter_data(sct, num);
 		}
-
+		if(!--ne)
+			break;
 		e++;
+		ce++;
 	}
 }
 
-static void eval_write_scatter(struct fhk_solver *S, xidx mi, fhk_modcall *mc, fhkX_scatter *s){
-	fhkX_scatter sw = *s;
-	if(scatter_isE(sw))
-		return;
-
-	struct fhk_model *m = &S->G->models[mi];
-	fhk_edge *returns = m->returns;
-	void *vp, *bp;
-	uint32_t size;
-
-	do {
-		if(scatter_isH(sw)){
-			xedge ei = scatterH_edge(sw);
-			xidx idx = returns[ei].idx;
-			vp = valueV(S->value, idx);
-			size = S->G->vars[idx].size;
-			bp = mcall_returns(mc)[ei].p;
-		}else{
-			uint32_t vpos = scatterR_vpos(sw);
-			uint32_t bpos = scatterR_bpos(sw);
-			uint32_t num = scatterR_num(sw);
-			memcpy(vp + vpos*size, bp + bpos*size, num*size);
+static void eval_write_scatter(struct fhkX_scatter_state *sct) {
+	if(LIKELY(!sct->next)) return;
+	struct fhk_mem *mem = sct->mem;
+	struct fhkX_scatter *s = mrefp(mem, sct->next);
+	for(;;) {
+		int num = s->num;
+		struct fhkX_sbuf *sbuf = s->sbuf;
+		void *data = mrefp(mem, s->data);
+		for(;;) {
+			memcpy(mrefp(mem, sbuf->vp), data+sbuf->off, sbuf->size);
+			if(!--num) break;
+			sbuf++;
 		}
-		sw = *++s;
-	} while(!scatter_isE(sw));
+		if(!s->next) return;
+		s = mrefp(mem, s->next);
+	}
 }
 
-static void yf_eval_modcall(struct fhk_solver *S, xidx mi, xinst inst){
-	fhkX_sp *sp = S->stateM[mi] + inst;
+static void yf_eval_modcall(struct fhk_solver *S, xidx idx, xinst inst){
+	fhkX_sp *sp = S->stateM[idx] + inst;
 	assert(!sp_checkV(sp->state));
-	float cost = sp->cost;
 	sp->state |= SP_VALUE;
-
-	yf_state_checkvalueM(S, mi);
-
-	// make sure every parameter has a value
-	yf_eval_checkparams(S, mi, inst);
-
-	// after this point we can't recurse anymore.
-	// we can now prepare the modcall.
-	scratch_reset(S);
-	struct fhk_model *m = &S->G->models[mi];
-	fhk_modcall *mc = scratch_more(S, sizeof(*mc) + (m->p_param+m->p_return)*sizeof(*mc->edges));
-	mc->np = m->p_param;
-	mc->nr = m->p_return;
-	mc->idx = mi;
-	mc->inst = inst;
-
-	// build return values.
-	// this must be done after parameters, so that we don't recursively use the scratch buffer.
-	scratch_mark(S);
-	yf_eval_put_returns(S, mi, inst, mc, cost);
-	eval_scatter_put_end(S);
-	fhkX_scatter *scatter = scratch_commit(S);
-
-	// allocate scatters for return values.
-	// this must be done only after building the entire scatter table, so that we don't
-	// interleave the scatter table with the actual buffers
-	eval_put_scatter_buffers(S, mc);
-
-	// collect parameters.
-	// this could be done at any point after recursion, it doesn't matter.
-	eval_put_params(S, mi, inst, mc);
-
-	// perform the modcall!
-	yield_modcall(S, mc);
-
-	// write back return value scatters
-	eval_write_scatter(S, mi, mc, scatter);
+	yf_state_checkvalueM(S, idx);
+	struct fhk_graph *G = S->G;
+	struct fhk_model *m = &G->models[idx];
+	fhk_edge *e;
+	int ne;
+	/* 1: expand forward j-maps if any. there's two reasons to do this here rather than
+	 * the return loop below:
+	 * (1) 99.9999% cases there's nothing to expand so we get to skip this for free
+	 *     and can use the branchless map_subset_unchecked.
+	 * (2) we can build the scatter/gather buffers on solver memory without worrying
+	 *     about anything allocating since we won't yield until the final modcall. */
+	if(UNLIKELY(m->fwdj)) {
+		e = m->returns;
+		ne = m->p_return;
+		do {
+			yf_state_checkanymapJ(S, e->map, inst);
+			e++;
+		} while(--ne);
+	}
+	/* 2: make sure all parameters have values.
+	 * this is the last yield point before MODCALL. */
+	e = m->params;
+	ne = m->p_cparam;
+	for(int i=0; i<ne; i++, e++)
+		yf_eval_checkparamV(S, e->map, e->idx, inst);
+	int np = m->p_param;
+	for(int i=ne; i<np; i++, e++)
+		yf_eval_checkparamG(S, e->map, e->idx, inst);
+	/* 3: gather parameter edges. */
+	fhk_mref ptr = ((struct fhk_mem *) mrefp(S, S->mem))->ptr;
+	struct fhk_cedge *ce = fhk_mem_alloc(mrefp(S, S->mem),
+			sizeof(fhk_cedge) * (m->p_param+m->p_return), alignof(fhk_cedge));
+	S->edges = ce;
+	eval_put_params(S, idx, inst);
+	/* 4: gather return edges and allocate scatter buffers. */
+	struct fhkX_scatter_state sct;
+	eval_put_returns(S, idx, inst, &sct);
+	/* 5: yield modcall. technically this could call another solver attached to the
+	 * same fhk_mem, so we have to check if mem->ptr is bumped during the call. */
+	struct fhk_mem *mem = mrefp(S, S->mem);
+	mem->ptr = pmref(mem, sct.mp);
+	yield_node(S, idx, inst);
+	/* 6: write back scatter buffers if we made any. */
+	eval_write_scatter(&sct);
+	/* 7: pretend we didn't allocate anything. */
+	if(LIKELY(mem->ptr == pmref(mem, sct.mp)))
+		mem->ptr = ptr;
 }
 
 static void yf_eval_varV(struct fhk_solver *S, xidx xi, xinst inst){
 	fhkX_sp *sp = S->stateV[xi] + inst;
 	assert(sp_checkC(sp->state) && !sp_checkV(sp->state));
-
 	struct fhk_var *x = &S->G->vars[xi];
 	xedge ei = spV_edge(sp->state);
 	xinst m_inst = spV_inst(sp->state);
 	yf_eval_modcall(S, x->models[ei].idx, m_inst);
-
 	assert(sp_checkV(sp->state));
 }
 
@@ -1029,30 +912,23 @@ static void yf_eval_varV(struct fhk_solver *S, xidx xi, xinst inst){
 static int yf_solver_enterV(struct fhk_solver *S, xidx xi, xinst inst, struct fhkX_work *W){
 	struct fhk_var *x = &S->G->vars[xi];
 	assert(var_isC(x));
-
 	int nm = x->n_mod;
 	fhk_edge *models = x->models;
-
 	fhkX_sp *sp = S->stateV[xi] + inst;
 	assert(!sp_done(*sp));
-
 	W->sp = sp;
 #if FHK_TRACEON(solver)
 	W->idx = xi;
 	W->inst = inst;
 #endif
-
 	if(UNLIKELY(sp_checkM(*sp)))
 		yield_err_nyi(S); // cycle
-
 	sp->cost = SP_MARK;
-
 	if(!sp_checkE(sp->state)){
 		sp->state |= SP_EXPANDED;
-
 		// model sp's will be checked in the next loop.
 		// k-maps were checked while allocating the sp, so all that's left to expand here
-		// are the j-maps.
+		// are the i-maps.
 		// because the sp allocator didn't set SP_EXPANDED, it means that there must be
 		// some instance maps to expand.
 		int en = nm;
@@ -1062,25 +938,22 @@ static int yf_solver_enterV(struct fhk_solver *S, xidx xi, xinst inst, struct fh
 			e++;
 		} while(--en);
 	}
-
-	struct fhkX_cselector *s = (struct fhkX_cselector *) slotref(W);
+	struct fhkX_cselector *s = W->sel;
 	int ei = 0, cnum = 0;
 	fhk_edge *e = models;
 	do {
 		fhkX_iter it;
 		xidx idx = e->idx;
-
 		// unchecked: see expand loop above
-		{
-			MAP_UNPACK_UNCHECKED(S, e->map, inst, ss);
-			if(0) { empty: goto next; }
-			if(0) { ident: interval: it = ss; }
-			if(0) { complex:
-				(s-1)->pk = subsetC_pk(ss);
-				it = pkref_iter_first((s-1)->pk);
-			}
+		fhk_subset ss = map_subset_unchecked(S, e->map, inst);
+		if(LIKELY(subset_isI(ss))) {
+			it = ss;
+		} else if(subset_isE(ss)) {
+			goto next;
+		} else {
+			(s-1)->pk = subsetC_pk(ss);
+			it = pkref_iter_first((s-1)->pk);
 		}
-
 		yf_state_checkM(S, idx);
 		s--;
 		cnum++;
@@ -1088,31 +961,23 @@ static int yf_solver_enterV(struct fhk_solver *S, xidx xi, xinst inst, struct fh
 		s->sp = S->stateM[idx] + iter_inst(it);
 		s->info.idx = idx;
 		s->info.ei = ei;
-
 next:
 		e++;
 	} while(++ei < nm);
-
 	return W->cnum = cnum;
 }
 
 static void yf_solver_enterM(struct fhk_solver *S, xidx idx, xinst inst){
 	fhkX_sp *sp = S->stateM[idx] + inst;
-
-	// sp->state must be zero before entering solver for the first time, which expands it.
 	if(sp->state){
 		assert(sp_checkE(sp->state));
 		return;
 	}
-
 	sp->state = SP_EXPANDED;
-
 	struct fhk_model *m = &S->G->models[idx];
-
 	fhk_check *ce = m->checks;
 	for(int i=m->p_check;i;i++,ce++)
 		yf_state_checkanymapJ(S, ce->map, inst);
-
 	int nc = m->p_cparam;
 	fhk_edge *pe = m->params;
 	for(int i=0;i<nc;i++,pe++)
@@ -1182,8 +1047,11 @@ static void yf_solver_chainV(struct fhk_solver *S, xidx root(X), xinst root(I)){
 	/* always valid */
 	// beta inverse, (accumulated) cost inverse
 	float BI; float CI;
-	// work state
-	struct fhkX_work *W = (struct fhkX_work *) (S->stack - slots(struct fhkX_work));
+	// work state.
+	// W will always point to the start of the current work space,
+	// so we will init it below S->work, so that the solver adjust it back to the start
+	// before it pushes the first selectors.
+	struct fhkX_work *W = mrefp(S, S->work) - sizeof(struct fhkX_work);
 	// active candidate
 	struct fhk_model *M = NULL;
 
@@ -1209,25 +1077,19 @@ solve:
 		xidx idx = reg(X);
 		xinst inst = reg(I);
 		float beta = reg(B);
-
 		assert(beta >= S->stateV[idx][inst].cost);
-
+		// make space for `n_mod` candidates, even though we may not need them all.
 		int nm = S->G->vars[idx].n_mod;
-		int slot = slotref(W) - S->stack;
-		int newslot = slot + slots(struct fhkX_work) + nm*slots(struct fhkX_cselector);
-		if(UNLIKELY(newslot + slots(struct fhkX_work) > FHK_MAX_STACK))
+		struct fhkX_work *w = ((void *) (W+1)) + nm*sizeof(struct fhkX_cselector);
+		if(UNLIKELY(pmref(S, w+1) - S->work) > FHK_WORK_SIZE)
 			yield_err_depth(S);
-
-		W = (struct fhkX_work *) (S->stack + newslot);
-		W->prev = slot;
+		w->prev = pmref(S, W);
+		W = w;
 		W->B = beta;
-
-		trace(ENTERV, slotnum(S, W), fhk_debug_sym(S->G, idx), inst, beta);
-
+		trace(ENTERV, pmref(S,W)-S->work, fhk_debug_sym(S->G, idx), inst, beta);
 		int snum = yf_solver_enterV(S, idx, inst, W);
 		if(LIKELY(snum > 0))
 			goto candidate;
-
 		reg(C) = INFINITY;
 		goto failed;
 	}
@@ -1236,12 +1098,11 @@ solve:
 bound:
 	{
 		trace(BOUND,
-				slotnum(S, W),
+				pmref(S,W)-S->work,
 				fhk_debug_sym(S->G, W->idx), W->inst,
 				fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
 				CI, BI
 		);
-
 		fhkX_sp *sp = S->stateM[W->cinfo.idx] + W->cinst;
 		sp->cost = costf(M, CI);
 		goto candidate;
@@ -1252,27 +1113,23 @@ bound:
 chosen:
 	assert(sp_checkC(W->sp->state));
 	assert(W->sp->cost <= W->B);
-
 	// read directly from sp here, since W->cinfo might not be written,
 	// if we jumped here straight out of the candidate selector.
 	// (this only affects debugging, because the next thing we do will be to pop
 	// the work stack).
 	trace(CHOSEN,
-			slotnum(S, W),
+			pmref(S,W)-S->work,
 			fhk_debug_sym(S->G, W->idx), W->inst,
 			fhk_debug_sym(S->G, S->G->vars[W->idx].models[spV_edge(W->sp->state)].idx),
 			spV_inst(W->sp->state),
 			reg(C), W->B, spV_edge(W->sp->state)
 	);
-
-	if(UNLIKELY(W->prev < 0))
+	if(UNLIKELY(W->prev < S->work))
 		return;
-
-	W = (struct fhkX_work *) (S->stack + W->prev);
+	W = mrefp(S, W->prev);
 	M = &S->G->models[W->cinfo.idx];
 	CI = W->CI;
 	BI = W->BI;
-
 	// ♪ where the solver at? ♪
 	if(LIKELY(where_isP(W->where)))
 		goto param_solved;
@@ -1283,18 +1140,13 @@ chosen:
  * give up and return failure. */
 failed:
 	W->sp->cost = reg(C);
-
 	// we shouldn't have entered here if the bound was already known
 	assert(W->sp->cost > W->B);
-
-	trace(FAILED, slotnum(S, W), fhk_debug_sym(S->G, W->idx), W->inst, reg(C), W->B);
-
-	if(UNLIKELY(W->prev < 0))
+	trace(FAILED, pmref(S,W)-S->work, fhk_debug_sym(S->G, W->idx), W->inst, reg(C), W->B);
+	if(UNLIKELY(W->prev < S->work))
 		yield_err_chain(S, root(X), root(I)); // noreturn
-
-	W = (struct fhkX_work *) (S->stack + W->prev);
+	W = mrefp(S, W->prev);
 	M = &S->G->models[W->cinfo.idx];
-
 	if(LIKELY(where_isP(W->where))){
 		CI = W->CI + reg(C);
 		goto bound;
@@ -1306,54 +1158,45 @@ failed:
 
 /* choose a candidate and try to solve the chain recursively */
 candidate:
-
 	// ---------------- candidate selection ----------------
 	{
 		float cost = INFINITY; // low bound
 		float beta = W->B;     // high bound for selection
 		int32_t inst = 0;      // candidate instance
-		struct fhkX_cselector *s = (struct fhkX_cselector *) slotref(W);
+		struct fhkX_cselector *s = W->sel;
 		struct fhkX_cselector *cand = NULL;
 		int cnum = W->cnum;
-
 		do {
 			s--;
 			fhkX_sp *sp = s->sp;
 			fhkX_iter it = s->it;
 			int64_t npk = 0;
-
 			for(;;){
 				float scost = sp->cost;
 				cand = scost < cost ? s : cand;
 				inst = scost < cost ? iter_inst(it) : inst;
 				beta = min(beta, max(cost, scost));
 				cost = min(cost, scost);
-
 				// the happy path here is that exactly one instance of the model returns
 				// our variable, so we check first if there's anything remaining.
 				if(LIKELY(!iter0_moreA(it)))
 					break;
-
 				it = iter_step(it);
 				if(iter_moreI(it)){
 					sp++;
 					continue;
 				}
-
 				it = pkref_iter_next(pkref_nth(s->pk, ++npk));
 				sp = S->stateM[s->info.idx] + iter_inst(it);
 			}
 		} while(--cnum);
-
 		// no candidate
 		if(UNLIKELY(cost > beta)){
 			reg(C) = cost;
 			goto failed;
 		}
-
 		xidx idx = cand->info.idx;
 		fhkX_sp *sp = S->stateM[idx] + inst;
-
 		// this model already has a chain?
 		if(UNLIKELY(sp_checkC(sp->state))){
 			// because of speculation we must check for an edge case here:
@@ -1384,28 +1227,23 @@ candidate:
 				//     (2) the candidate model has a value and it's the speculated chain
 				xsp->state = SP_CHAIN | SP_EXPANDED | value | chain;
 			}
-
 			reg(C) = xsp->cost = cost;
 			goto chosen;
 		}
-
 		M = &S->G->models[idx];
 		CI = 0;
 		BI = costf_inv(M, beta); // + TODO: tolerance
 		assert(BI >= 0);
-
 		W->cinfo = cand->info;
 		W->cinst = inst;
 		W->BI = BI;
-
 		trace(ENTERM,
-				slotnum(S, W),
+				pmref(S,W)-S->work,
 				fhk_debug_sym(S->G, W->idx), W->inst,
 				fhk_debug_sym(S->G, cand->info.idx), inst,
 				cost, costf_inv(M, cost),
 				beta, BI
 		);
-
 		yf_solver_enterM(S, idx, inst);
 	}
 
@@ -1413,29 +1251,24 @@ candidate:
 	if(M->p_check != 0){
 		fhk_check *edge = M->checks + M->p_check;
 		W->where = WHERE_CHECK;
-
 		do {
 			fhkX_iter it;
 			xidx idx = edge->idx;
-
-			{
-				MAP_UNPACK_UNCHECKED(S, edge->map, W->cinst, ss);
-				if(0) { empty: continue; }
-				if(0) { ident: interval: it = ss; }
-				if(0) { complex:
-					W->pk = subsetC_pk(ss);
-					it = pkref_iter_first(W->pk);
-				}
+			fhk_subset ss = map_subset_unchecked(S, edge->map, W->cinst);
+			if(LIKELY(subset_isI(ss))) {
+				it = ss;
+			} else if(subset_isE(ss)) {
+				continue;
+			} else {
+				W->pk = subsetC_pk(ss);
+				it = pkref_iter_first(W->pk);
 			}
-
 			// this goto-style state machine could be written as nested loops,
 			// but, imo, this way is easier to read. fight me.
 			int start, block;
 			uint64_t *P, *E;
 			uint64_t mask;
-
 			yf_state_checkC(S, idx);
-
 /* recompute all state from index and iterator.
  * we will jump here after either starting a new interval, or returning from
  * the recursive solver. this is the "outer" loop. */
@@ -1446,11 +1279,9 @@ check_firstblock:
 			E = bitmap_ref64(checkmap_refE(S->stateC[idx])) + 2*bitmap_idx64(start);
 			mask = ~((*P & *E) | bitmapW_ones64(start-block));
 			goto check_testmask;
-
 /* "inner" loop inside range */
 check_testblock:
 			mask = ~(*P & *E);
-
 /* check pass, evaluating the variable if needed */
 check_testmask:
 			// 0: passed and evaluated
@@ -1458,10 +1289,8 @@ check_testmask:
 			if(mask){
 				int fail = bitmapW_ffs64(mask);
 				int fi = block + fail;
-
 				// the start is masked out, so this holds:
 				assert(fi >= start);
-
 				// fast-forward to `fi`.
 				// there's 3 possible outcomes here:
 				//     (1) `fi` is out of range. we jump to next range (if any).
@@ -1471,22 +1300,18 @@ check_testmask:
 				// thus, inside this block, the invariant `start = iter_inst(it)` will _not_ hold,
 				// instead the invariant is `fi = iter_inst(it)`.
 				it = iter_stepN(it, fi-start);
-
 				// case (1) ?
 				if(!iter_moreI(it))
 					goto check_nextrange;
-
 				// case (2) ?
 				if(LIKELY(bitmapW_test64(*E, fail)))
 					goto check_penalty;
-
 				// check not evaluated.
 				// we will now have to do the hard work to find out if it's (2) or (3).
 				// before evaluating the check itself, we need to make sure the guarded
 				// variable has a value.
 				struct fhk_guard *g = &S->G->guards[edge->idx];
 				int scanto;
-
 				if(check_isC(edge->flags)){
 					// case A: computed variable (the complicated case)
 					// we now need to recurse into the solver for the checked variable
@@ -1494,9 +1319,7 @@ check_testmask:
 						yf_state_newV(S, g->xi);
 						goto check_chain;
 					}
-
 					fhkX_sp *sp = S->stateV[g->xi] + fi;
-
 					// not proven to either have a chain or be unsolvable.
 					// note: there's no need to worry about it recursing back into this check:
 					// if it does, then it will also recurse back to the checked variable
@@ -1510,7 +1333,6 @@ check_chain:
 						reg(I) = fi;
 						reg(B) = FHK_MAX_COST;
 						goto rsolve;
-
 /* solver returned valid chain, evaluate check */
 check_solved:
 						edge = W->edge;
@@ -1520,7 +1342,6 @@ check_solved:
 						fi = iter_inst(it);
 						sp = S->stateV[g->xi] + fi;
 						goto check_eval;
-
 /* solver returned no chain, mark it and jump to penalty */
 check_failed:
 						edge = W->edge;
@@ -1529,7 +1350,6 @@ check_failed:
 						E = bitmap_ref64(checkmap_refE(S->stateC[edge->idx])) + 2*bitmap_idx64(fi);
 						goto check_nochain;
 					}
-
 					// unsolvable.
 					// only need to toggle the eval bit, pass map is zero initialized
 					if(!sp_checkC(sp->state)){
@@ -1537,83 +1357,65 @@ check_nochain:
 						*E |= 1LL << fail;
 						goto check_penalty;
 					}
-
 check_eval:
 					if(!sp_checkV(sp->state))
 						yf_eval_varV(S, g->xi, fi);
-
 					scanto = check_scan_batchC(S->stateC[idx], S->stateV[g->xi], fi,
-							subsetIE_znum(anymapK(S->mapstate[g->group])));
+							subsetIE_znum(anymapK(S->map[g->group])));
 				}else{
 					// case B: given variable (simple): no need to recurse here
 					yf_state_checkG(S, g->xi);
 					yf_eval_checkvarG(S, g->xi, fi);
 					scanto = check_scan_batchG(S->stateC[idx], S->stateG[g->xi], fi,
-							subsetIE_znum(anymapK(S->mapstate[g->group])));
+							subsetIE_znum(anymapK(S->map[g->group])));
 				}
-
 				yf_check_eval_batch(g, S->stateC[idx], valueV(S->value, g->xi), fi, scanto);
-
 				if(!checkmap_checkP(S->stateC[idx], fi))
 					goto check_penalty;
-
 				// check passed, we are in case (3).
 				// we have now overwritten all state computed in `check_firstblock`,
 				// so the choices are:
 				//     (3a) if there's more in this range, jump to `check_firstblock` to restart.
 				//     (3b) otherwise, check for next range as normal: entering the new range
 				//          recomputes state.
-
 				it = iter_step(it);
-
 				// (3a)
 				if(iter_moreI(it))
 					goto check_firstblock;
-
 				// (3b)
 				goto check_nextrange;
 			}
-
 			// fast path: the whole block passed,
 			// continue to next block.
-
 			block += 64;
 			if(block <= start+iter_remain(it)){
 				P++;
 				E++;
 				goto check_testblock;
 			}
-
 			// invariant: `start = iter_inst(it)`
 			assert(!iter_moreI(iter_stepN(it, block-start)));
-
 /* advance range */
 check_nextrange:
 			if(!iter_moreC(it))
 				continue; // -> next edge
-
 			W->pk = pkref_next(W->pk);
 			it = pkref_iter_next(W->pk);
 			goto check_firstblock;
-
 /* check failed */
 check_penalty:
 			CI += edge->penalty;
-
 			trace(PENALTY,
-					slotnum(S, W),
+					pmref(S,W)-S->work,
 					fhk_debug_sym(S->G, W->idx), W->inst,
 					fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
 					fhk_debug_sym(S->G, edge->idx), edge->map,
 					edge->penalty,
 					CI, BI
 			);
-
 			if(CI > BI)
 				goto bound;
-
 			// -> next edge
-
 		} while(++edge != M->checks);
 	}
 
@@ -1621,45 +1423,37 @@ check_penalty:
 	if(LIKELY(M->p_cparam != 0)){
 		fhk_edge *edge = &M->params[M->p_cparam - 1];
 		W->where = WHERE_PARAM;
-
 		do {
 			fhkX_iter it;
 			W->edge = edge;
-
-			{
-				MAP_UNPACK_UNCHECKED(S, edge->map, W->cinst, ss);
-				if(0) { empty: continue; }
-				if(0) { ident: interval: it = ss; }
-				if(0) { complex:
-					W->pk = subsetC_pk(ss);
-					it = pkref_iter_first(W->pk);
-				}
+			fhk_subset ss = map_subset_unchecked(S, edge->map, W->cinst);
+			if(LIKELY(subset_isI(ss))) {
+				it = ss;
+			} else if(subset_isE(ss)) {
+				continue;
+			} else {
+				W->pk = subsetC_pk(ss);
+				it = pkref_iter_first(W->pk);
 			}
-
 			float ecost = 0;
 			yf_state_checkV(S, edge->idx);
 			fhkX_sp *spbase = S->stateV[edge->idx];
-
 			for(;;){
 				fhkX_sp *sp = spbase + iter_inst(it);
-
 				// sp->cost is always a valid low bound, no matter what the state,
 				// and this won't skip cycles because sp->cost is negative
 				if(CI + sp->cost > BI){
 					assert(sp->cost > ecost);
 					CI += sp->cost;
-
 					trace(PARAMB,
-							slotnum(S, W),
+							pmref(S,W)-S->work,
 							fhk_debug_sym(S->G, W->idx), W->inst,
 							fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
 							fhk_debug_sym(S->G, edge->idx), edge->map,
 							sp->cost
 					);
-
 					goto bound;
 				}
-
 				if(LIKELY(sp_checkC(sp->state))){
 					// fast path: chain solved, cost is true cost
 					ecost = max(ecost, sp->cost);
@@ -1671,7 +1465,6 @@ check_penalty:
 					reg(I) = iter_inst(it);
 					reg(B) = BI - CI;
 					goto rsolve;
-
 /* chain solved under bound */
 param_solved:
 					edge = W->edge;
@@ -1680,22 +1473,18 @@ param_solved:
 					spbase = S->stateV[edge->idx];
 					assert(CI+ecost <= BI);
 				}
-
 				ITER_NEXT(it, W->pk, continue, break);
 			}
-
 			CI += ecost;
 			assert(CI <= BI);
-
 			trace(PARAM,
-					slotnum(S, W),
+					pmref(S,W)-S->work,
 					fhk_debug_sym(S->G, W->idx), W->inst,
 					fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
 					fhk_debug_sym(S->G, edge->idx), edge->map,
 					ecost,
 					CI, BI
 			);
-
 		} while(edge-- != M->params);
 	}
 
@@ -1703,29 +1492,23 @@ param_solved:
 	 * otherwise, a CI <= BI check should have failed somewhere along the way.  */
 	{
 		assert(CI <= BI);
-
 		reg(C) = costf(M, CI);
-
 		fhkX_sp *msp = S->stateM[W->cinfo.idx] + W->cinst;
 		msp->cost = reg(C);
 		msp->state = SP_CHAIN;
-
 		fhkX_sp *xsp = W->sp;
-
 		// if there was a speculated value, this clears it.
 		// that's ok because we just solved the model's chain,
 		// it couldn't have been executed before, so the speculated
 		// value was also wrong.
 		xsp->state = SP_CHAIN | SP_EXPANDED | spV_newchain(W->cinst, W->cinfo.ei);
 		xsp->cost = reg(C);
-
 		trace(CHAIN,
-				slotnum(S, W),
+				pmref(S,W)-S->work,
 				fhk_debug_sym(S->G, W->idx), W->inst,
 				fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
 				CI, BI
 		);
-
 		goto chosen;
 	}
 }
@@ -1735,24 +1518,22 @@ param_solved:
 /* ---- main loop ---------------------------------------- */
 
 static struct fhkX_bucket *root_find_bucket(struct fhk_solver *S){
-	struct fhkX_bucket **prev = &S->root;
-
-	while(*prev){
-		struct fhkX_bucket *cur = *prev;
-		if(cur->used > 0){
-			*prev = cur->next;
-			return cur;
+	fhk_mref *prev = &S->bucket;
+	while(*prev) {
+		struct fhkX_bucket *bucket = mrefp(S, *prev);
+		if(bucket->num > 0) {
+			*prev = bucket->next;
+			return bucket;
 		}
-		prev = &cur->next;
+		prev = &bucket->next;
 	}
-
 	return NULL;
 }
 
 static void root_bucket_recycle(struct fhk_solver *S, struct fhkX_bucket *bucket){
-	bucket->used = 0;
-	bucket->next = S->root;
-	S->root = bucket;
+	bucket->num = 0;
+	bucket->next = S->bucket;
+	S->bucket = pmref(S, bucket);
 }
 
 // this is a very naive quicksort, could be a lot faster.
@@ -1798,17 +1579,16 @@ static void root_list_sort(fhkX_root *roots, int start, int end){
 }
 
 static void root_bucket_sort(struct fhkX_bucket *bucket){
-	assert(bucket->used > 0);
-	root_list_sort(bucket->roots, 0, bucket->used - 1);
+	assert(bucket->num > 0);
+	root_list_sort(bucket->roots, 0, bucket->num - 1);
 }
 
 static void root_bucket_solved(struct fhk_solver *S, struct fhkX_bucket *bucket){
 	if(!bucket_checkC(bucket->flags))
 		return;
-
-	int num = bucket->used;
+	int num = bucket->num;
 	fhkX_root *r = bucket->roots;
-	void **p = bucket->p;
+	void **p = bucket->ptr;
 	do {
 		fhkX_root root = *r++;
 		xidx idx = root_idx(root);
@@ -1822,7 +1602,7 @@ static void root_bucket_solved(struct fhk_solver *S, struct fhkX_bucket *bucket)
 }
 
 static void yf_root_bucketG(struct fhk_solver *S, struct fhkX_bucket *bucket){
-	int num = bucket->used;
+	int num = bucket->num;
 	fhkX_root *r = bucket->roots;
 	do {
 		fhkX_root root = *r++;
@@ -1834,7 +1614,7 @@ static void yf_root_bucketG(struct fhk_solver *S, struct fhkX_bucket *bucket){
 }
 
 static void yf_root_bucketV(struct fhk_solver *S, struct fhkX_bucket *bucket){
-	int num = bucket->used;
+	int num = bucket->num;
 	fhkX_root *r = bucket->roots;
 	do {
 		fhkX_root root = *r++;
@@ -1851,8 +1631,7 @@ static void yf_root_bucketV(struct fhk_solver *S, struct fhkX_bucket *bucket){
 			inst++;
 		} while(znum--);
 	} while(--num);
-
-	num = bucket->used;
+	num = bucket->num;
 	r = bucket->roots;
 	do {
 		fhkX_root root = *r++;
@@ -1876,14 +1655,11 @@ void fhk_yf_solver_main(struct fhk_solver *S){
 			yield_ok(S);
 			continue;
 		}
-
 		root_bucket_sort(bucket);
-
 		if(UNLIKELY(bucket_checkG(bucket->flags)))
 			yf_root_bucketG(S, bucket);
 		else
 			yf_root_bucketV(S, bucket);
-
 		root_bucket_recycle(S, bucket);
 	}
 }

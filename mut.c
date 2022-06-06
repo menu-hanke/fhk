@@ -1,4 +1,5 @@
 #include "def.h"
+#include "mut.h"
 
 #include <stdint.h>
 
@@ -9,9 +10,9 @@ const uint8_t fhkX_mtag_size[] = {
 };
 
 void fhk_mut_unflag(struct fhk_mut_graph *M){
-	fhkX_mref ref = MGRAPH_FIRSTOBJ;
+	fhk_mref ref = MGRAPH_FIRSTOBJ;
 	while(ref < M->committed){
-		fhkX_mtag *tag = mref_ptr(M, ref);
+		fhkX_mtag *tag = mrefp(M, ref);
 		ref += mtag_size(*tag);
 		*tag &= ~MTAG_AB;
 	}
