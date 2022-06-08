@@ -99,9 +99,9 @@ typedef union { uint64_t u64; uint32_t u32[2]; } fhkX_bmword;
 typedef fhkX_bmword *fhkX_bitmap;
 #define bitmap_ref32(bm)  ((uint32_t *) (bm))
 #define bitmap_ref64(bm)  ((uint64_t *) (bm))
-#define bitmap_idx32(i)   ((i)/32)
+#define bitmap_idx32(i)   ((i)>>5)
 #define bitmap_shift32(i) ((i)%32)
-#define bitmap_idx64(i)   ((i)/64)
+#define bitmap_idx64(i)   ((i)>>6)
 #define bitmap_shift64(i) ((i)%64)
 #define bitmap_is1(bm,i)  (!!((bitmap_ref32(bm)[bitmap_idx32(i)])&(1<<bitmap_shift32(i))))
 #define bitmap_is0(bm,i)  (!bitmap_is1(bm,i))
