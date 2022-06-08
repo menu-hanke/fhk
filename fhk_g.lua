@@ -59,6 +59,16 @@ infix_mt = {
 	end
 }
 
+local function checktab(x)
+	return type(x) == "table" and x or {x}
+end
+
+local function tabf(f)
+	return function(x)
+		return f(checktab(x))
+	end
+end
+
 local function infixmod(f)
 	return function(...)
 		return infix(f(...))
@@ -68,8 +78,8 @@ end
 local as      = infixmod(mmmod_set "cts")
 local choose  = infixmod(mmmod_set "map")
 local penalty = infixmod(mmmod_set "penalty")
-local is      = infixmod(mmmod_check "&")
-local is_not  = infixmod(mmmod_check "!&")
+local is      = infixmod(tabf(mmmod_check "&"))
+local is_not  = infixmod(tabf(mmmod_check "!&"))
 local gt      = infixmod(mmmod_check ">")
 local ge      = infixmod(mmmod_check ">=")
 local lt      = infixmod(mmmod_check "<")
