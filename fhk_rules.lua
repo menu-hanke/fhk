@@ -21,7 +21,7 @@ local function newstate(rules, defaults)
 		graph  = driver.graph(),
 		rules  = rules,
 		k      = (defaults and defaults.k) or 1,
-		c      = (defaults and defaults.c) or 1.1,
+		c      = (defaults and defaults.c) or 1.5,
 		groups = {},  --> [group name] => {obj=driver group, shape=function()?}
 		vars   = {},  --> [var name] => {obj=driver var, jfunc=function(fb)?, computed=bool}
 		models = {},  --> [model name] => {obj=driver model, lang=string, args=?, skip=bool}
