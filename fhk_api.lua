@@ -5,6 +5,7 @@ local lib = require "fhk_lib"
 local C = require "fhk_clib"
 local buffer = require "string.buffer"
 local ffi = require "ffi"
+local gc = ffi.gc
 
 ---- roots & solvers ----------------------------------------
 
@@ -134,7 +135,7 @@ local function solver_template(solver, chunkname)
 	if anchored then
 		src:put([[
 				local R = cast(rctp, C.fhk_mem_alloc(mem, sizeof(rct), alignof(rct)))
-				R.__fhk_mem = mem
+				R['fhk$anchor'](R, mem)
 		]])
 	else
 		src:put([[
@@ -297,6 +298,10 @@ local function rct_gc(result)
 	end
 end
 
+local function rct_anchor(result, mem)
+	gc(result, rct_gc).__fhk_mem = mem
+end
+
 local function rctype(solver)
 	-- TODO: sort by size so the struct doesn't have holes
 	local meta = { __index = {} }
@@ -324,7 +329,7 @@ local function rctype(solver)
 	end
 	if isanchored(solver) then
 		buf:put("fhk_mem *__fhk_mem;\n")
-		meta.__gc = rct_gc
+		meta.__index["fhk$anchor"] = rct_anchor
 	end
 	buf:put("}")
 	local rct = ffi.typeof(tostring(buf), unpack(ctv))
