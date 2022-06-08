@@ -405,7 +405,8 @@ end
 
 ffi.metatype("fhk_mem", {
 	__index = {
-		destroy = C.fhk_destroy_mem
+		destroy = C.fhk_destroy_mem,
+		reset = C.fhk_reset_mem
 	},
 	__call = C.fhk_mem_alloc
 })
