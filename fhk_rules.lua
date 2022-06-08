@@ -141,23 +141,32 @@ local function querymap2(state, x)
 		local setjf = collect()
 		local setff = collect()
 		state.rules("map", {name=x, setinverse=setif, setjfunc=setjf, setflags=setff})
-		local inverse = setif.value or error(string.format("missing inverse: %s", x))
-		if state.maps[inverse] then
-			error(string.format("nonsymmetic inverse %s <-> %s", x, inverse))
+		local inverse = setif.value
+		if inverse then
+			if state.maps[inverse] then
+				error(string.format("nonsymmetic inverse %s <-> %s", x, inverse))
+			end
+			local setii = collect()
+			local setji = collect()
+			local setfi = collect()
+			state.rules("map", {name=inverse, setinverse=setii, setjfunc=setji, setflags=setfi})
+			if setii.value ~= x then
+				error(string.format("nonsymmetic inverse: %s <-> %s <-> %s", x, inverse, setii.value))
+			end
+			local ok, fwd = pcall(driver.addmap, state.graph, setff.value, x)
+			checkp(ok, fwd, "map: %s", x)
+			local ok, inv = pcall(driver.addmap, state.graph, setfi.value, inverse)
+			checkp(ok, inv, "map: %s", inverse)
+			state.maps[x] = {obj=fwd, map2=driver.umap2(fwd, inv), jfunc=setjf.value}
+			state.maps[inverse] = {obj=inv, map2=driver.umap2(inv, fwd), jfunc=setji.value}
+		else
+			-- we will error if this gets layouted in the graph.
+			-- however if it's missing that's ok.
+			-- since it shouldn't get layouted the flags/jfunc don't matter either.
+			local ok, map = pcall(driver.addmap, state.graph, "k", x)
+			checkp(ok, map, "map: %s", x)
+			state.maps[x] = {obj=map, map2=driver.umap2(map, map), incomplete=true}
 		end
-		local setii = collect()
-		local setji = collect()
-		local setfi = collect()
-		state.rules("map", {name=inverse, setinverse=setii, setjfunc=setji, setflags=setfi})
-		if setii.value ~= x then
-			error(string.format("nonsymmetic inverse: %s <-> %s <-> %s", x, inverse, setii.value))
-		end
-		local ok, fwd = pcall(driver.addmap, state.graph, setff.value, x)
-		checkp(ok, fwd, "map: %s", x)
-		local ok, inv = pcall(driver.addmap, state.graph, setfi.value, inverse)
-		checkp(ok, inv, "map: %s", inverse)
-		state.maps[x] = {obj=fwd, map2=driver.umap2(fwd, inv), jfunc=setjf.value}
-		state.maps[inverse] = {obj=inv, map2=driver.umap2(inv, fwd), jfunc=setji.value}
 	end
 	return state.maps[x].map2
 end
@@ -391,6 +400,9 @@ local function buildgraph(state)
 	end
 	for name,m in pairs(state.maps) do
 		if m.obj.idx then
+			if m.incomplete then
+				error(string.format("map with incomplete definition: %s", name))
+			end
 			if m.jfunc then
 				emithook(state, "emit.pre", name, m.obj, fb)
 				m.jfunc(fb, m.obj)

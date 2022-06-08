@@ -456,22 +456,29 @@ test_missing_shape = function()
 	assert(fails(function() decl:ready() end, "group missing shape"))
 end
 
-test_missing_map = function()
+test_missing_map_unused_ok = function()
 	local decl = fhk.new(fhk.group("a", fhk.shape(1)))
-	assert(
-		fails(
-			function()
-				decl:graph(
-					fhk.g.model(
-						"a#mod",
-						"->", "x" *fhk.g.choose "missing" *fhk.g.as "double",
-						function() end
-					)
-				)
-			end,
-			"missing inverse"
+	decl:graph(
+		fhk.g.model(
+			"a#mod",
+			"->", "x" *fhk.g.choose "missing" *fhk.g.as "double",
+			function() end
 		)
 	)
+	decl:ready()
+end
+
+test_missing_map_used_fail = function()
+	local decl = fhk.new(fhk.group("a", fhk.shape(1)))
+	decl:graph(
+		fhk.g.model(
+			"a#mod",
+			"->", "x" *fhk.g.choose "missing" *fhk.g.as "double",
+			function() end
+		)
+	)
+	decl("a#x")
+	assert(fails(function() decl:ready() end), "map with incomplete definition")
 end
 
 test_no_chain = function()
