@@ -6,13 +6,12 @@ local cast = ffi.cast
 
 -- keep in sync with fhk.pyx!
 ffi.cdef [[
-	void fhk_py_gc(intptr_t);
-	int fhk_py_shape(intptr_t, intptr_t);
-	double fhk_py_vref_scalar_fp(intptr_t, void *, int);
-	int64_t fhk_py_vref_scalar_int(intptr_t, void *, int);
-	void fhk_py_vref_vector(fhk_solver *, int, intptr_t, void *, int, int32_t);
-	fhk_subset fhk_py_getmapK(intptr_t, void *);
-	fhk_subset fhk_py_getmapI(intptr_t, void *, int);
+	void fhk_py_gc(void *);
+	int fhk_py_shape(void *, intptr_t);
+	double fhk_py_vref_scalar_fp(void *, intptr_t);
+	int64_t fhk_py_vref_scalar_int(void *, intptr_t);
+	void fhk_py_vref_iter(void *, int, intptr_t);
+	fhk_subset fhk_py_mapcall(void *, intptr_t);
 
 	void *PyMem_RawMalloc(size_t);
 ]]
@@ -44,13 +43,24 @@ local function call(f, ...)
 	return xpcall(f, debug.traceback, ...)
 end
 
+-- newtab(k1, v1, k2, v2, ..., kN, vN)
+-- this could be done with the C api as well but this is simpler.
+local function newtab(...)
+	local tab = {}
+	local args = {...}
+	for i=1, #args, 2 do
+		tab[args[i]] = args[i+1]
+	end
+	return tab
+end
+
 ---- rules & jfuncs ----------------------------------------
 
 local function pyshapef(pf)
 	return load([[
 		local C, pf = ...
 		return function(X)
-			return (C.fhk_py_shape(pf, X.ptr))
+			return (C.fhk_py_shape(X, pf.ptr))
 		end
 	]])(C, pf)
 end
@@ -84,17 +94,12 @@ local pyfmt = cttab {
 	double   = "d"
 }
 
-local function vrefpyvector(fb, var, pf, copy)
+local function vrefpyiter(fb, var, pf)
 	local fmt = pyfmt[tonumber(var.ctype)]
 		or error(string.format("ctype not supported by python struct module: %s", var.ctype))
-	local flags = fmt:byte()
-	if copy then flags = flags + 0x80000000 end
 	fb.upv.pf = pf
-	fb.src:putf(
-		"C.fhk_py_vref_vector(S, %d, pf.ptr, X, S.inst, %d)\n",
-		var.idx, bit.tobit(flags)
-	)
-	fb.name = string.format("=fhk:vrefpyvec<%s>@0x%x", var.name, pf.ptr)
+	fb.src:putf("C.fhk_py_vref_iter(X, %d, pf.ptr)\n", bit.tobit(fmt:byte()))
+	fb.name = string.format("=fhk:vrefpyiter<%s>@0x%x", var.name, pf.ptr)
 end
 
 local ctkind = cttab {
@@ -111,7 +116,7 @@ local function vrefpyscalar(fb, var, pf)
 	fb.upv.cast = ffi.cast
 	fb.upv.ctp = ffi.typeof("$*", var.ctype)
 	fb.src:putf(
-		"cast(ctp, C.fhk_setvalueD(S, %d, S.inst))[0] = %s(pf.ptr, X, S.inst)\n",
+		"cast(ctp, C.fhk_setvalueD(S, %d, S.inst))[0] = %s(X, pf.ptr)\n",
 		var.idx,
 		what == "fp" and "C.fhk_py_vref_scalar_fp" or "C.fhk_py_vref_scalar_int"
 	)
@@ -121,25 +126,24 @@ end
 local function mapcallpy(fb, map, pf)
 	fb.upv.pf = pf
 	if map.flags:match("i") then
-		fb.src:putf("C.fhk_setmapI(S, %d, S.inst, C.fhk_py_getmapI(pf.ptr, X, S.inst))\n", map.idx)
+		fb.src:putf("C.fhk_setmapI(S, %d, S.inst, C.fhk_py_mapcall(X, pf.ptr))\n", map.idx)
 	else
-		fb.src:putf("C.fhk_setmapK(S, %d, C.fhk_py_getmapK(pf.ptr, X))\n", map.idx)
+		fb.src:putf("C.fhk_setmapK(S, %d, C.fhk_py_mapcall(X, pf.ptr))\n", map.idx)
 	end
 	fb.name = string.format("=fhk:mapcallpy(%s)<%s>@0x%x", map.flags, map.name, pf.ptr)
 end
 
-local function pyvirt(name, pf, sig)
-	local copy, ctype, vec = sig:match("(!?)([%w_]*)(%]?)")
+local function pyvirtual(name, pf, cts, what, copy)
 	return rules.tagged("var", rules.named(name, function(_, event)
 		event.setjfunc(function(fb, var)
-			if vec ~= "" then
-				vrefpyvector(fb, var, pf, copy == "!")
-			else
+			if what == "iter" then
+				vrefpyiter(fb, var, pf)
+			elseif what == "scalar" then
 				vrefpyscalar(fb, var, pf)
 			end
 		end)
-		if ctype ~= "" then
-			event.setcts(ctype)
+		if cts then
+			event.setcts(cts)
 		end
 	end))
 end
@@ -152,6 +156,10 @@ local function pymap(name, inverse, flags, pf)
 			mapcallpy(fb, map, pf)
 		end)
 	end))
+end
+
+local function edgerule(rule, map, cts, rank)
+	return rules.edgerule(rule, {map=map, cts=cts, rank=rank})
 end
 
 ---- roots & solvers ----------------------------------------
@@ -185,13 +193,15 @@ end
 --------------------------------------------------------------------------------
 
 return {
-	rules   = rules,
-	addref  = addref,
-	call    = call,
-	shape   = shape,
-	pyvirt  = pyvirt,
-	pymap   = pymap,
-	setroot = setroot,
-	getroot = getroot,
-	ready   = ready
+	rules     = rules,
+	addref    = addref,
+	call      = call,
+	newtab    = newtab,
+	shape     = shape,
+	pyvirtual = pyvirtual,
+	pymap     = pymap,
+	edgerule  = edgerule,
+	setroot   = setroot,
+	getroot   = getroot,
+	ready     = ready
 }

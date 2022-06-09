@@ -1,7 +1,9 @@
 # cython: language_level=3
 cimport cython
-from libc.stdint cimport uint8_t, int16_t, int32_t, int64_t
+from libc.stdint cimport int8_t, uint8_t, int16_t, int32_t, int64_t
+from cpython.buffer cimport PyBUF_READ, PyBUF_WRITE
 from cpython.mem cimport PyMem_RawFree
+from cpython.memoryview cimport PyMemoryView_FromMemory
 from cpython.ref cimport Py_DECREF
 from collections import namedtuple
 from array import array
@@ -19,6 +21,7 @@ cdef extern from "<lua.h>":
     int lua_toboolean(lua_State *L, int idx)
     const char *lua_tolstring(lua_State *L, int idx, size_t *len)
     void *lua_topointer(lua_State *L, int idx)
+    void lua_pushnil(lua_State *L)
     void lua_pushnumber(lua_State *L, lua_Number n)
     void lua_pushinteger(lua_State *L, lua_Integer n)
     void lua_pushlstring(lua_State *L, const char *s, size_t l)
@@ -136,30 +139,55 @@ cdef extern from *:
     }
 
     /* access macros, since cython isn't very good at structs. */
-    #define fhk_py_var_group(G,i) (G)->vars[(i)].group
-    #define fhk_py_var_size(G,i)  (G)->vars[(i)].size
-    #define fhk_py_G(S)           (S)->G
     #define fhk_py_space(S,i)     anymapK((S)->map[(i)])
     """
 
     ctypedef struct fhk_mem
-    ctypedef struct fhk_graph
-    ctypedef struct fhk_solver
     ctypedef int64_t fhk_subset
     ctypedef int16_t fhkP_idx
+    ctypedef int8_t *fhkX_pkref
+    ctypedef struct fhkX_anymap
+
+    cdef struct fhk_var:
+        int group
+
+    ctypedef struct fhk_graph:
+        fhk_var *vars
+
+    ctypedef struct fhk_solver:
+        int idx
+        int inst
+        void *value
+        fhk_graph *G
+        fhkX_anymap *map
 
     fhk_subset SUBSET_EMPTY
     fhk_subset subsetI_newZ(int zs, int first)
 
     fhk_mem *fhk_create_mem()
     void fhk_destroy_mem(fhk_mem *mem)
+    void fhk_reset_mem(fhk_mem *mem)
     fhk_solver *fhk_create_solver(fhk_graph *G, fhk_mem *mem)
     void fhk_setshape(fhk_solver *S, int group, int shape)
     void *fhk_setrootD(fhk_solver *S, int idx, fhk_subset ss)
     void fhk_setvalueC(fhk_solver *S, int idx, fhk_subset ss, void *p)
+    void *fhk_setvalueD(fhk_solver *S, int idx, fhk_subset ss)
 
+    int subset_isI(fhk_subset ss)
+    int subset_isE(fhk_subset ss)
     int subset_isU(fhk_subset ss)
+    int subset_is1(fhk_subset ss)
+    int subsetI_first(fhk_subset ss)
     int subsetIE_size(fhk_subset ss)
+    fhkX_pkref subsetC_pk(fhk_subset ss)
+
+    fhkX_pkref pkref_next(fhkX_pkref pk)
+    int pkref_first(fhkX_pkref pk)
+    int pkref_size(fhkX_pkref pk)
+    int pkref_more(fhkX_pkref pk)
+
+    fhk_subset anymapK(fhkX_anymap am)
+    void *valueV(void *vp, int idx)
 
     const char *FHK_PY_CALL
 
@@ -172,11 +200,6 @@ cdef extern from *:
     int fhk_py_lua_ecall(lua_State *L, int nargs);
     int fhk_py_lua_callsx(lua_State *L, int ref, fhk_solver *S, void *X)
     int fhk_py_lua_ready(lua_State *L, int ref, fhk_graph **G, int *init, int *jump)
-
-    int fhk_py_var_group(fhk_graph *G, int i)
-    int fhk_py_var_size(fhk_graph *G, int i)
-    fhk_graph *fhk_py_G(fhk_solver *S)
-    fhk_subset fhk_py_space(fhk_solver *S, int i)
 
 #---- subsets ----------------------------------------
 
@@ -193,52 +216,30 @@ def interval(start, num):
 def space(num):
     return interval(0, num)
 
-#---- callbacks ----------------------------------------
-# keep in sync with fhk_py.lua!
+def isunit(ss):
+    return bool(subset_is1(ss))
 
-cdef public void fhk_py_gc(void *p):
-    Py_DECREF(<object> p)
+def subsetstr(ss):
+    raise NotImplementedError("TODO")
 
-cdef public void fhk_py_call1(void *p, void *a):
-    (<object> p) (<object> a)
-
-cdef public double fhk_py_vref_scalar_fp(void *p, void *X, int inst):
-    return (<object> p) (<object> X, inst)
-
-cdef public int64_t fhk_py_vref_scalar_int(void *p, void *X, int inst):
-    return (<object> p) (<object> X, inst)
-
-cdef public void fhk_py_vref_vector(
-    fhk_solver *S,
-    int idx,
-    void *p,
-    void *X,
-    int inst,
-    int32_t flags
-):
-    vec, ss_ = (<object> p)(<object> X, inst)
-    cdef fhk_subset ss = tosubset(ss_)
-    cdef str typecode = chr(flags & 0xff)
-    # TODO: this is a slow but easy way to do it.
-    # probably the fastest solution is to move the unpacking to Lua,
-    # so that we can easily specialize on the ctype.
-    # (ie. code gen per-ctype a scatter function that calls fhk_setvalueD then scatters
-    #  the python iterable. this needs python api on the lua side and is a lot of work though...)
-    # TODO 2: if vec is an array or a (contiguous) numpy array with the correct typecode,
-    # we could fhk_setvalue it here directly.
-    tmp = array(typecode, vec)
-    if len(tmp) != subsetIE_size(ss): # TODO: complex subsets
-        # we can't raise here, but solver will throw since we didn't give it a value
-        return
-    # python docs are trying to tell me to use the buffer protocol api but this is a lot easier :^)
-    ptr, _ = tmp.buffer_info()
-    fhk_setvalueC(S, idx, ss, <void*><size_t>ptr)
-
-cdef public fhk_subset fhk_py_getmapK(void *p, void *X):
-    return tosubset((<object> p) (<object> X))
-
-cdef public fhk_subset fhk_py_getmapI(void *p, void *X, int inst):
-    return tosubset((<object> p) (<object> X, inst))
+def seq_iterss(mem, ss):
+    cdef s = tosubset(ss)
+    cdef int first
+    cdef int size
+    cdef fhkX_pkref pk
+    if subset_isI(s):
+        first = subsetI_first(ss)
+        size = subsetIE_size(ss)
+        yield from mem[first:first+size]
+    elif not subset_isE(ss):
+        pk = subsetC_pk(ss)
+        while True:
+            first = pkref_first(pk)
+            size = pkref_size(pk)
+            yield from mem[first:first+size]
+            if not pkref_more(pk):
+                break
+            pk = pkref_next(pk)
 
 class FhkError(Exception):
     pass
@@ -247,21 +248,17 @@ class FhkError(Exception):
 
 cdef class GCLua:
     cdef lua_State *L
-    cdef GCPin _fhk_py
+    cdef readonly GCPin fhk_py
 
     def __cinit__(self):
         self.L = fhk_py_setup_lua()
         if self.L is NULL:
             raise FhkError("failed to create Lua state")
         # fhk_py module is on top of stack
-        self._fhk_py = pin(self)
+        self.fhk_py = pin(self)
 
     def __dealloc__(self):
         fhk_py_close_lua(self.L)
-
-    @property
-    def fhk_py(self):
-        return self._fhk_py
 
 cdef GCPin pin(GCLua lua):
     return GCPin(lua, fhk_py_lua_ref(lua.L))
@@ -278,6 +275,8 @@ cdef void push(GCLua lua, x):
         lua_pushinteger(lua.L, x)
     elif isinstance(x, float):
         lua_pushnumber(lua.L, x)
+    elif x is None:
+        lua_pushnil(lua.L)
     elif hasattr(x, "__lua__"):
         push(lua, x.__lua__(lua))
     else:
@@ -313,7 +312,6 @@ cdef object pop(GCLua lua):
     lua_pop(L, 1)
     return x
 
-@cython.freelist(16)
 cdef class GCPin:
     cdef GCLua _lua
     cdef int _ref
@@ -368,15 +366,6 @@ cdef class GCPin:
 
 #---- solver ----------------------------------------
 
-cdef class GCMem:
-    cdef fhk_mem *mem
-
-    def __cinit__(self):
-        self.mem = fhk_create_mem()
-
-    def __dealloc__(self):
-        fhk_destroy_mem(self.mem)
-
 cdef class GCDriver:
     cdef fhk_graph *G
     cdef GCLua lua
@@ -386,23 +375,14 @@ cdef class GCDriver:
     def __dealloc__(self):
         PyMem_RawFree(self.G)
 
-cdef class GCSolver:
-    cdef fhk_solver *S
-    # these fields are only for holding a reference to prevent gc.
-    # we are in trouble if the mem or graph gets gced while the solver is running.
-    cdef GCMem _mem
-    cdef GCDriver _driver
-
 cdef class CRoot:
     cdef str name
-    cdef str fmt
-    cdef object vector
+    cdef object conv
     cdef fhkP_idx idx
 
-    def __init__(self, name, fmt, vector, idx):
+    def __init__(self, name, conv, idx):
         self.name = name
-        self.fmt = fmt
-        self.vector = vector
+        self.conv = conv
         self.idx = idx
 
 def newlua():
@@ -421,25 +401,47 @@ def ready(GCPin state):
     driver.jump = jump
     return driver
 
-def init(GCDriver driver, GCMem gcm, X):
-    cdef fhk_graph *G = driver.G
-    cdef fhk_solver *S = fhk_create_solver(G, gcm.mem)
-    if not fhk_py_lua_callsx(driver.lua.L, driver.init, S, <void*> X):
-        raise FhkError(pop(driver.lua))
-    cdef GCSolver solver = GCSolver()
-    solver.S = S
-    solver._mem = gcm
-    solver._driver = driver
-    return solver
+cdef class Mem:
+    cdef fhk_mem *ptr
 
-@cython.boundscheck(False)
-@cython.wraparound(False)
+    def __cinit__(self):
+        self.ptr = fhk_create_mem()
+
+    def __dealloc__(self):
+        fhk_destroy_mem(self.ptr)
+
+    def reset(self):
+        fhk_reset_mem(self.ptr)
+
+cdef class SolverState:
+    cdef fhk_solver *S
+    cdef public object X
+    # these fields are only for holding a reference to prevent gc.
+    # we are in trouble if the mem or graph gets gced while the solver is running.
+    cdef Mem _mem
+    cdef GCDriver _driver
+
+    @property
+    def inst(self):
+        return self.S.inst
+
+def init(GCDriver driver, Mem gcm, X):
+    cdef fhk_graph *G = driver.G
+    cdef fhk_solver *S = fhk_create_solver(G, gcm.ptr)
+    cdef SolverState state = SolverState()
+    state.S = S
+    state.X = X
+    state._mem = gcm
+    state._driver = driver
+    if not fhk_py_lua_callsx(driver.lua.L, driver.init, S, <void*>state):
+        raise FhkError(pop(driver.lua))
+    return state
+
 def solve(
     GCDriver driver,
-    GCSolver solver,
+    SolverState state,
     list roots,
     dict subsets,
-    object X,
     object result
 ):
     cdef CRoot root
@@ -447,40 +449,68 @@ def solve(
     cdef int size
     cdef int i
     cdef fhk_subset ss
-    cdef int16_t num[32]
-    cdef void *vp[32]
-    cdef int n = len(roots)
-    if n > 32:
-        raise FhkError(f"too many roots: {len(roots)}")
-    cdef fhk_solver *S = solver.S
-    cdef fhk_graph *G = fhk_py_G(S)
-    for i in range(n):
+    cdef fhk_solver *S = state.S
+    for i in range(len(roots)):
         root = roots[i]
         sub = subsets.get(root.name)
         if sub is None:
-            ss = fhk_py_space(S, fhk_py_var_group(G, root.idx))
+            ss = anymapK(S.map[S.G.vars[root.idx].group])
             if subset_isU(ss):
                 raise FhkError(f"missing space map ({root.name})")
-            size = subsetIE_size(ss)
-            if root.vector is None:
-                if size != 1:
-                    raise FhkError(f"scalar result subset not singleton: {ss}")
-            else:
-                num[i] = size
         else:
-            # set ss, num[j] here.
-            raise NotImplementedError("TODO (subset api)")
-        vp[i] = fhk_setrootD(S, root.idx, ss)
-    if fhk_py_lua_callsx(driver.lua.L, driver.jump, S, <void*>X) < 0:
+            ss = tosubset(sub)
+        fhk_setrootD(S, root.idx, ss)
+        mv = <object> PyMemoryView_FromMemory(<char*>valueV(S.value, root.idx), 1<<32, PyBUF_READ)
+        root.conv.set(mv, ss)
+    if fhk_py_lua_callsx(driver.lua.L, driver.jump, S, <void*>state) < 0:
         raise FhkError(pop(driver.lua))
     for i in range(len(roots)):
         root = roots[i]
-        buf = <const char *> vp[i]
-        size = fhk_py_var_size(G, root.idx)
-        if root.vector:
-            v = array(root.fmt, buf[:num[i]*size])
-            if root.vector != array:
-                v = root.vector(v)
-        else:
-            v = unpack(root.fmt, buf[:size])[0]
-        setattr(result, root.name, v)
+        setattr(result, root.name, root.conv.get())
+
+#---- callbacks ----------------------------------------
+# keep in sync with fhk_py.lua!
+
+cdef public void fhk_py_gc(void *p):
+    Py_DECREF(<object> p)
+
+cdef public int fhk_py_shape(void *pstate, void *p):
+    return (<object> p) (<SolverState> pstate)
+
+cdef public double fhk_py_vref_scalar_fp(void *pstate, void *p):
+    return (<object> p) (<SolverState> pstate)
+
+cdef public int64_t fhk_py_vref_scalar_int(void *pstate, void *p):
+    return (<object> p) (<SolverState> pstate)
+
+cdef void memoryview_put_iter(object mv, object it, int start, int num):
+    for i in range(start, start+num):
+        # TODO: exception handling goes here
+        mv[i] = next(it)
+
+# TODO: fhk_py_vref_direct for numpy/array.array
+cdef public void fhk_py_vref_iter(void *pstate, int fmt, void *p):
+    cdef SolverState state = <SolverState> pstate
+    cdef fhk_solver *S = state.S
+    cdef fhkX_pkref pk
+    it, ss_ = (<object> p) (state)
+    cdef fhk_subset ss = tosubset(ss_)
+    cdef void *vp = fhk_setvalueD(S, S.idx, ss)
+    if vp == NULL:
+        return
+    it = iter(it)
+    mv = <object> PyMemoryView_FromMemory(<char*>valueV(S.value, S.idx), 1<<32, PyBUF_WRITE)
+    mvf = mv.cast(chr(fmt))
+    if subset_isI(ss):
+        memoryview_put_iter(mvf, it, subsetI_first(ss), subsetIE_size(ss))
+    else:
+        # vp != NULL implies !subset_isE(ss)
+        pk = subsetC_pk(ss)
+        while True:
+            memoryview_put_iter(mvf, it, pkref_first(pk), pkref_size(pk))
+            if not pkref_more(pk):
+                break
+            pk = pkref_next(pk)
+
+cdef public fhk_subset fhk_py_mapcall(void *pstate, void *p):
+    return tosubset((<object> p) (<SolverState> pstate))
