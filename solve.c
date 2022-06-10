@@ -1086,6 +1086,7 @@ solve:
 		w->prev = pmref(S, W);
 		W = w;
 		W->B = beta;
+		W->ctol = 0;
 		trace(ENTERV, pmref(S,W)-S->work, fhk_debug_sym(S->G, idx), inst, beta);
 		int snum = yf_solver_enterV(S, idx, inst, W);
 		if(LIKELY(snum > 0))
@@ -1112,7 +1113,7 @@ bound:
  * pop state and return to where we left off */
 chosen:
 	assert(sp_checkC(W->sp->state));
-	assert(W->sp->cost <= W->B);
+	assert(W->sp->cost <= W->B || W->ctol > 0);
 	// read directly from sp here, since W->cinfo might not be written,
 	// if we jumped here straight out of the candidate selector.
 	// (this only affects debugging, because the next thing we do will be to pop
@@ -1231,9 +1232,25 @@ candidate:
 			goto chosen;
 		}
 		M = &S->G->models[idx];
-		CI = 0;
 		BI = costf_inv(M, beta); // + TODO: tolerance
 		assert(BI >= 0);
+		// are we looping?
+		// this means CI > BI but costf(CI) < costf(beta) because of fp rounding error.
+		if(UNLIKELY(idx == W->cinfo.idx && inst == W->cinst)) {
+			assert(CI > BI);
+			assert(costf(M, CI) <= beta);
+			// epsilon: 0.0009765625 = 1/1024 (arbitrarily chosen).
+			W->ctol = W->ctol == 0 ? 0.0009765625 : (W->ctol*2);
+			trace(STALL,
+					pmref(S,W)-S->work,
+					fhk_debug_sym(S->G, W->idx), W->inst,
+					fhk_debug_sym(S->G, idx), inst,
+					CI,
+					BI, W->ctol
+			);
+			BI += W->ctol;
+		}
+		CI = 0;
 		W->cinfo = cand->info;
 		W->cinst = inst;
 		W->BI = BI;
@@ -1471,7 +1488,22 @@ param_solved:
 					it = W->it;
 					ecost = max(W->ecost, reg(C));
 					spbase = S->stateV[edge->idx];
-					assert(CI+ecost <= BI);
+					if(UNLIKELY(CI+reg(C) > BI)) {
+						// parameter was selected over bound because of tolerance.
+						// we could just continue here and end up with something reasonable,
+						// but we'll restart just so that each tolerance is handled separately,
+						// instead of letting them compound.
+						// this should almost never happen anyway, so it's not a huge penalty.
+						CI += reg(C);
+						trace(PARAMX,
+								pmref(S,W)-S->work,
+								fhk_debug_sym(S->G, W->idx), W->inst,
+								fhk_debug_sym(S->G, W->cinfo.idx), W->cinst,
+								fhk_debug_sym(S->G, edge->idx), edge->map,
+								reg(C)
+						);
+						goto bound;
+					}
 				}
 				ITER_NEXT(it, W->pk, continue, break);
 			}

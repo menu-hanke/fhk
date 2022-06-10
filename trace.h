@@ -49,12 +49,14 @@
 
 #define TRACE_ENTERV   "solver", trace_fhk, "(%4ld) ENTER     %s:%ld: beta: %g"
 #define TRACE_ENTERM   "solver", trace_fhk, "(%4ld) ENTER/m   %s:%d [%s:%d]: min: %g (%g)   beta: %g (%g)"
+#define TRACE_STALL    "solver", trace_fhk, "(%4ld) STALL     %s:%d [%s:%d]: inverse: %g   beta inverse: %g + %g"
 #define TRACE_BOUND    "solver", trace_fhk, "(%4ld) BOUND     %s:%d [%s:%d]: inverse: (%g) > (%g)"
 #define TRACE_CHOSEN   "solver", trace_fhk, "(%4ld) CHOOSE    %s:%d [%s:%d]: cost: %g / %g   <#%u>"
 #define TRACE_FAILED   "solver", trace_fhk, "(%4ld) FAIL      %s:%d: cost: %g > %g"
 #define TRACE_PENALTY  "solver", trace_fhk, "(%4ld) ++++      %s:%d [%s:%d]: penalty  %s~%x [+%g] [%g/%g]"
 #define TRACE_PARAM    "solver", trace_fhk, "(%4ld) ++++      %s:%d [%s:%d]: param    %s~%x [+%g] [%g/%g]"
 #define TRACE_PARAMB   "solver", trace_fhk, "(%4ld) ++++ (!)  %s:%d [%s:%d]: param    %s~%x > %g"
+#define TRACE_PARAMX   "solver", trace_fhk, "(%4ld) ++++ (?)  %s:%d [%s:%d]: param    %s~%x = %g"
 #define TRACE_CHAIN    "solver", trace_fhk, "(%4ld) CHAIN     %s:%d [%s:%d]: inverse: %g / %g"
 
 #endif

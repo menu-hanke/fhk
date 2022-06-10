@@ -302,6 +302,16 @@ test_solver_merge_guard = _(function()
 	solution { y={1}, z={2} }
 end)
 
+test_solver_tolerance = _(function()
+	model { "->x", 1, k=1/18 }
+	model { "x->y %1", 1, k=0, c=1.1 }
+	model { "x->y %2", 1, k=0, c=1.1 }
+	-- doesn't matter which model we pick.
+	-- what we are testing here is that the solver won't get stuck in an infinite loop
+	-- when rounding error causes CI > BI but costf(CI) < beta.
+	solution { y={1} }
+end)
+
 ---- evaluator tests ----------------------------------------
 
 test_solver_return_overlap = _(function()

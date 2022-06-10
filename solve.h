@@ -147,6 +147,7 @@ struct fhkX_work {
 	fhkX_pkref pk;       // active iterator pk
 	fhkX_candinfo cinfo; // candidate info
 	fhkP_inst cinst;     // this candidate instance
+	float ctol;          // tolerance (ie. select if CI <= BI+tol)
 	float CI;            // saved CI
 	float BI;            // saved BI
 	float B;             // high bound (beta)
