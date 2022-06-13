@@ -1170,6 +1170,8 @@ return {
 	mapcallkf    = mapcallkf,
 	mapcallif    = mapcallif,
 	mapcallf     = mapcallf,
+	sigrank      = sigrank,
+	sigct        = sigct,
 	modcalllua   = modcalllua,
 	modcallffi   = modcallffi,
 	modcallconst = modcallconst,

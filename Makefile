@@ -88,6 +88,7 @@ PYX_O       = _ctypes.pyx.o
 ifeq (y,$(LINKLUA))
 LUACORE_O   = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o fhk_g.lua.o \
 			  fhk_lib.lua.o fhk_rules.lua.o
+LUALANG_O   = fhk_lang_Python.lua.o
 LUALIB_O    = fhk_api.lua.o ffi-reflect/reflect.lua.o
 LUAPY_O     = fhk_py.lua.o
 BCLOADER_O  = loader.o
@@ -128,14 +129,14 @@ help:
 	@echo "    fhk$(TARGET_SO) - C+Lua shared library"
 	@echo "    libfhkpy.a - Python static library"
 
-libfhklua.a: $(CORE_O) $(LUACORE_O) $(LUALIB_O)
-libfhkpy.a:  $(CORE_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_O)
+libfhklua.a: $(CORE_O) $(LUALANG_O) $(LUACORE_O) $(LUALIB_O)
+libfhkpy.a:  $(CORE_O) $(LUALANG_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_O)
 
 %.a:
 	$(AR) rcs $@ $^
 
 fhk$(TARGET_SO): CFLAGS += -fPIC
-fhk$(TARGET_SO): $(CORE_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
+fhk$(TARGET_SO): $(CORE_O) $(LUALANG_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
 	$(CC) -shared $^ $(BCL_LDFLAGS) -o $@
 
 #--------------------------------------------------------------------------------

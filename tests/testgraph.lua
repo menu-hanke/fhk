@@ -231,7 +231,7 @@ local function compile(test)
 		driver.jfunc(test.graph, v.obj, fb)
 		driver.reset(fb)
 	end
-	local luamod = driver.loadlang(test.graph, "Lua")
+	local luamod = driver.loadlang("Lua")
 	for name,m in pairs(test.models) do
 		if m.value then
 			luamod(fb, m.obj, tofunc(m.value))
