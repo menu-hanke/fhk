@@ -1038,13 +1038,22 @@ function loaders.Const(fb, model, value)
 	modcallconst(fb, {model=model, value=value})
 end
 
-local function loadlang(graph, lang)
-	-- TODO:
-	-- * look for lua modules named "fhk.lang.${lang}"
-	-- * look for C(bcloader) libraries names "libfhklang-${lang}"
-	-- * cache the lookup results in graph.
-	-- * use `loaders` as last resort.
-	return loaders[lang]
+local function loadlang(lang)
+	local loader = loaders[lang]
+	local err
+	if not loader then
+		local ok, x = pcall(require, "fhk_lang_"..lang)
+		if ok then
+			if x.load then
+				loader = x.load
+			else
+				err = "lang module didn't export a `load' function."
+			end
+		else
+			err = x
+		end
+	end
+	return loader, err
 end
 
 ---- setshape ----------------------------------------

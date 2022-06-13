@@ -417,16 +417,17 @@ local function buildgraph(state)
 	for name,m in pairs(state.models) do
 		if m.obj.idx then
 			-- note: if needed we can also consult rules for the implementation here.
-			local impljfunc = driver.loadlang(state.graph, m.lang)
+			local impljfunc, err = driver.loadlang(m.lang)
 			if impljfunc then
 				emithook(state, "emit.pre", name, m.obj, fb)
 				impljfunc(fb, m.obj, unpack(m.args))
 				emithook(state, "emit.post", name, m.obj, fb)
 			else
 				driver.trap(fb, {
-					mes = string.format("no implementation for language: %s (of model: %s)",
+					mes = string.format("no implementation for language: %s (of model: %s):\n%s",
 						m.lang,
-						name
+						name,
+						err
 					)
 				})
 			end
