@@ -96,7 +96,7 @@ LUACORE_O   = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o fh
 			  fhk_lib.lua.o fhk_rules.lua.o
 LUALANG_O   = fhk_lang_Python.lua.o
 LUALIB_O    = fhk_api.lua.o ffi-reflect/reflect.lua.o
-LUAPY_O     = fhk_py.lua.o
+LUAPY_O     = fhk_pyx.lua.o
 BCLOADER_O  = loader.o
 endif
 

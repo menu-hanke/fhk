@@ -26,6 +26,7 @@ PyObject *PyDict_GetItemString(PyObject *, const char *);
 PyObject *PyTuple_New(Py_ssize_t);
 PyObject *PyTuple_GetItem(PyObject *, Py_ssize_t);
 int PyTuple_SetItem(PyObject *, Py_ssize_t, PyObject *);
+PyObject *PyLong_FromLong(long);
 PyObject *PyLong_FromSsize_t(Py_ssize_t);
 PyObject *PyLong_FromSize_t(size_t);
 long PyLong_AsLong(PyObject *);
@@ -36,6 +37,7 @@ PyObject *PyImport_Import(PyObject *);
 int Py_IsNone(const PyObject *);
 PyObject *PyObject_GetAttrString(PyObject *, const char *);
 PyObject *PyObject_Call(PyObject *, PyObject *, PyObject *);
+PyObject *PyObject_CallNoArgs(PyObject *);
 PyObject *PyObject_CallMethodObjArgs(PyObject *, PyObject *, ...);
 PyObject *Py_CompileString(const char *, const char *, int);
 PyObject *PyEval_EvalCode(PyObject *, PyObject *, PyObject *);
@@ -176,10 +178,10 @@ local function infersig(pf, model)
 		ffi.cast("int", #model.returns)
 	))
 	local info = gcocheck(C.PyObject_Call(pysig, args, nil))
-	local pt = gcocheck(C.PyTuple_GetItem(info, 0))
-	local pv = gcocheck(C.PyTuple_GetItem(info, 1))
-	local rt = gcocheck(C.PyTuple_GetItem(info, 2))
-	local rv = gcocheck(C.PyTuple_GetItem(info, 3))
+	local pt = ocheck(C.PyTuple_GetItem(info, 0))
+	local pv = ocheck(C.PyTuple_GetItem(info, 1))
+	local rt = ocheck(C.PyTuple_GetItem(info, 2))
+	local rv = ocheck(C.PyTuple_GetItem(info, 3))
 	return pt, pv, rt, rv
 end
 
@@ -207,12 +209,14 @@ end
 
 local ctconvf = {}
 for k,v in pairs {
-	bool    = "PyBool_FromLong",
-	float   = "PyFloat_FromDouble", double   = "PyFloat_FromDouble",
-	int8_t  = "PyLong_FromSsize_t", uint8_t  = "PyLong_FromSize_t",
-	int16_t = "PyLong_FromSsize_t", uint16_t = "PyLong_FromSize_t",
-	int32_t = "PyLong_FromSsize_t", uint32_t = "PyLong_FromSize_t",
-	int64_t = "PyLong_FromSsize_t", uint64_t = "PyLong_FromSize_t",
+	bool     = "PyBool_FromLong",
+	float    = "PyFloat_FromDouble", double   = "PyFloat_FromDouble",
+	int8_t   = "PyLong_FromLong",    uint8_t  = "PyLong_FromLong",
+	int16_t  = "PyLong_FromLong",    uint16_t = "PyLong_FromLong",
+	int32_t  = "PyLong_FromLong",
+	uint32_t = ffi.sizeof("long") > 4 and "PyLong_FromLong" or "PyLong_FromSize_t",
+	int64_t  = ffi.sizeof("long") > 4 and "PyLong_FromLong" or "PyLong_FromSsize_t",
+	uint64_t = "PyLong_FromSize_t",
 } do
 	ctconvf[tonumber(ffi.typeof(k))] = v
 end
@@ -240,7 +244,7 @@ end
 local py_cast = gcocheck(C.PyUnicode_DecodeFSDefault("cast"))
 local function memoryview(p, size, fmt)
 	local mv = ocheck(C.PyMemoryView_FromMemory(p, size, PyBUF_READ))
-	local mc = ocheck(C.PyObject_CallMethodObjArgs(mv, py_cast, fmt))
+	local mc = ocheck(C.PyObject_CallMethodObjArgs(mv, py_cast, fmt, nil))
 	C.Py_DecRef(mv)
 	return mc
 end
@@ -262,7 +266,6 @@ end
 -- model    hardcoded model
 -- f        python function (PyObject *)
 local function modcallpy(fb, op)
-	fb.upv.args = tuple(#op.model.params)
 	fb.upv.ocheck = ocheck
 	fb.upv.echeck3 = echeck3
 	fb.upv.cast = ffi.cast
@@ -270,43 +273,48 @@ local function modcallpy(fb, op)
 	local uC = upvalC(fb)
 	local sigp, sigr = driver.sigrank(op.model)
 	local pt, pv, _, rv = infersig(op.f, op.model)
-	for i,p in ipairs(op.model.params) do
-		local v = gcocheck(C.PyTuple_GetItem(pv, i-1))
-		local ctid = tonumber(p.var.ctype)
-		fb.src:put("do\n")
-		if C.Py_IsNone(v) == 0 or sigp[i] == "v" then
-			fb.upv.memoryview = memoryview
-			local fmt = driver.upval(fb, pyfmt[ctid] or ctcallerr(p.var.ctype))
-			fb.src:putf(
-				"local x = memoryview(S.edges[%d].p, S.edges[%d].n*%d, %s)\n",
-				i-1, i-1, ffi.sizeof(p.var.ctype), fmt
-			)
-			if C.Py_IsNone(v) == 0 and v ~= builtins.memoryview then
-				local vec = driver.upval(fb, v)
-				fb.upv.call1 = call1
-				-- no need to decref: call1 eats the reference.
-				fb.src:putf("x = ocheck(call1(%s, x))\n", vec)
+	if #op.model.params > 0 then
+		fb.upv.args = tuple(#op.model.params)
+		for i,p in ipairs(op.model.params) do
+			local v = ocheck(C.PyTuple_GetItem(pv, i-1))
+			local ctid = tonumber(p.var.ctype)
+			fb.src:put("do\n")
+			if C.Py_IsNone(v) == 0 or sigp[i] == "v" then
+				fb.upv.memoryview = memoryview
+				local fmt = driver.upval(fb, pyfmt[ctid] or ctcallerr(p.var.ctype))
+				fb.src:putf(
+					"local x = memoryview(S.edges[%d].p, S.edges[%d].n*%d, %s)\n",
+					i-1, i-1, ffi.sizeof(p.var.ctype), fmt
+				)
+				if C.Py_IsNone(v) == 0 and v ~= builtins.memoryview then
+					local vec = driver.upval(fb, v)
+					fb.upv.call1 = call1
+					-- no need to decref: call1 eats the reference.
+					fb.src:putf("x = ocheck(call1(%s, x))\n", vec)
+				end
+			else
+				local ctp = driver.upval(fb, ffi.typeof("$*", p.var.ctype))
+				fb.src:putf(
+					"local x = ocheck(%s.%s(cast(%s, S.edges[%d].p)[0]))\n",
+					uC, ctconvf[ctid] or ctcallerr(p.var.ctype), ctp, i-1
+				)
+				local t = ocheck(C.PyTuple_GetItem(pt, i-1))
+				local kind = ctkind[ctid] or ctcallerr(p.var.ctype)
+				if t ~= builtins[kind] and C.Py_IsNone(t) == 0 then
+					local tconv = driver.upval(fb, t)
+					fb.upv.call1 = call1
+					-- no need to decref: call1 eats the reference
+					fb.src:putf("x = ocheck(call1(%s, x))\n", tconv)
+				end
 			end
-		else
-			local ctp = driver.upval(fb, ffi.typeof("$*", p.var.ctype))
-			fb.src:putf(
-				"local x = ocheck(%s.%s(cast(%s, S.edges[%d].p)[0]))\n",
-				uC, ctconvf[ctid] or ctcallerr(p.var.ctype), ctp, i-1
-			)
-			local t = gcocheck(C.PyTuple_GetItem(pt, i-1))
-			local kind = ctkind[ctid] or ctcallerr(p.var.ctype)
-			if t ~= builtins[kind] and C.Py_IsNone(t) == 0 then
-				local tconv = driver.upval(fb, t)
-				fb.upv.call1 = call1
-				-- no need to decref: call1 eats the reference
-				fb.src:putf("x = ocheck(call1(%s, x))\n", tconv)
-			end
+			-- PyTuple_SetItem steals our ref, no need for decref here.
+			fb.src:putf("%s.PyTuple_SetItem(args, %d, x)\n", uC, i-1)
+			fb.src:put("end\n")
 		end
-		-- PyTuple_SetItem steals our ref, no need for decref here.
-		fb.src:putf("%s.PyTuple_SetItem(args, %d, x)\n", uC, i-1)
-		fb.src:put("end\n")
+		fb.src:putf("local r = ocheck(%s.PyObject_Call(f, args, nil))\n", uC)
+	else
+		fb.src:putf("local r = ocheck(%s.PyObject_CallNoArgs(f))\n", uC)
 	end
-	fb.src:putf("local r = ocheck(%s.PyObject_Call(f, args, nil))\n", uC)
 	if #op.model.returns == 1 then
 		fb.src:put("local y = r\n")
 	end
@@ -321,7 +329,7 @@ local function modcallpy(fb, op)
 			]], uC, i-1)
 			fb.src:putf("", uC, i-1)
 		end
-		local v = gcocheck(C.PyTuple_GetItem(rv, i-1))
+		local v = ocheck(C.PyTuple_GetItem(rv, i-1))
 		local isvec = C.Py_IsNone(v) == 0 or sigr[i] == "v"
 		local ctid = tonumber(r.var.ctype)
 		local kind = ctkind[ctid] or ctcallerr(r.var.ctype)
@@ -334,7 +342,7 @@ local function modcallpy(fb, op)
 			robj = "robj"
 			fb.src:putf([[
 				for i=0, tonumber(S.edges[%d].n)-1 do
-					local oi = %s.PyLong_FromSsize_t(i)
+					local oi = %s.PyLong_FromLong(i)
 					if oi == nil then echeck3(r) end
 					local robj = %s.PyObject_GetItem(y, oi)
 					%s.Py_DecRef(oi)
@@ -376,5 +384,17 @@ end
 
 return {
 	load       = py_load,
-	_finalizer = finalizer
+	_finalizer = finalizer,
+	-- for fhk_py
+	raise      = raise,
+	echeck3    = echeck3,
+	ocheck     = ocheck,
+	gcocheck   = gcocheck,
+	tuple      = tuple,
+	memoryview = memoryview,
+	builtins   = builtins,
+	ctkind     = ctkind,
+	ctconvf    = ctconvf,
+	pyfmt      = pyfmt,
+	call1      = call1
 }

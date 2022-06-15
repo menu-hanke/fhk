@@ -1,185 +1,166 @@
 import dataclasses
 import enum
-import functools
 import inspect
-import itertools
-from typing import Any, Callable, Dict, Generic, Iterable, List, Optional, Protocol, Sized, Tuple, Type, TypeVar, Union, get_args, get_origin, overload
-from fhk._ctypes import CRoot, GCLua, GCPin, GCDriver, Mem, SolverState, newlua, init, isunit, ready, seq_iterss, solve, space, subsetstr
-from fhk.obj import Conv, Subset, issubsettype
+from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin, overload
+from fhk._ctypes import LuaState, Mem, Pin
+from fhk.obj import Subset, issubsettype
 
-__all__ = (
-    "root",
-    "View",
-    "Graph"
-)
+__all__ = ("Graph", "View", "root")
 
 T = TypeVar("T", bound=Type)                                 # type
 C = TypeVar("C", bound=Callable)                             # callable
 CS = TypeVar("CS", bound=Callable[...,Subset])               # callable -> subset
-S = TypeVar("S", bound=Sized)                                # sized
 SS = TypeVar("SS", bound=Union[int,Callable[...,int]])       # shape
 
-#---- c/lua interop ----------------------------------------
+#---- api types ----------------------------------------
+# keep in sync with fhk_py.lua!
 
-class ToLua(Protocol):
-    def __lua__(self, lua: GCLua) -> GCPin:
-        ...
+@dataclasses.dataclass
+class XComposite:
+    rules: List[Any]
+    what: str = "composite"
 
-class Push:
-    __slots__ = "__lua__"
-    def __init__(self, f: Callable[[GCLua], GCPin]):
-        self.__lua__ = staticmethod(f)
+@dataclasses.dataclass
+class XGroup:
+    name: str
+    rule: Any
+    what: str = "group"
 
-LuaCallable = Union[ToLua, GCPin]
+@dataclasses.dataclass
+class XNamed:
+    name: str
+    rule: Any
+    what: str = "named"
 
-#---- python -> ctype ----------------------------------------
+@dataclasses.dataclass
+class XGivenFunc:
+    func: Callable
+    subset: bool
+    params: str
+    desc: str
+    type: Optional[Type]
+    ctype: Optional[str]
+    vector: Optional[Type]
+    what: str = "given(func)"
 
-PY_PRIMITIVES = { float: "double", int: "int" }
+@dataclasses.dataclass
+class XMapFunc:
+    func: Callable
+    params: str
+    desc: str
+    inverse: str
+    flags: str
+    what: str = "map(func)"
 
-def py2cts(t: Type) -> Optional[str]:
+@dataclasses.dataclass
+class XShapeFunc:
+    func: Callable
+    params: str
+    what: str = "shape(func)"
+
+@dataclasses.dataclass
+class XShapeNum:
+    shape: int
+    what: str = "shape(num)"
+
+@dataclasses.dataclass
+class XLabel:
+    labels: Dict[str, int]
+    what: str = "label"
+
+@dataclasses.dataclass
+class XEdgeRule:
+    rule: str
+    map: Optional[str]
+    cts: Optional[str]
+    rank: Optional[str]
+    what: str = "edgerule"
+
+XRule = Union [
+    XComposite,
+    XGroup,
+    XNamed,
+    XGivenFunc,
+    XMapFunc,
+    XShapeFunc,
+    XShapeNum,
+    XLabel,
+    XEdgeRule
+]
+
+@dataclasses.dataclass
+class XRoot:
+    attr: str
+    var: str
+    ctype: Optional[str]
+    constructor: Optional[Callable]
+    vector: Optional[Callable]
+
+def describe(x: Any) -> str:
+    if hasattr(x, "__code__"):
+        x = x.__code__
+    if hasattr(x, "co_name"):
+        return f"{x.co_name} ({x.co_filename}:{x.co_firstlineno})"
+    else:
+        return str(x)
+
+def jparm(f: Callable) -> str:
+    out = ""
+    for p in inspect.signature(f).parameters.values():
+        if p.annotation == int:
+            out += "i"
+        elif "x" not in out:
+            out += "x"
+    return out
+
+def ctoverride(t: Type) -> Optional[str]:
     if issubclass(t, enum.IntEnum):
         # TODO: should pick a larger type depending on values?
         return "uint8_t"
-    return PY_PRIMITIVES.get(t)
+    # primitives are handled in lua
 
-#---- python <- ctype ----------------------------------------
-
-ident = lambda x: x
-
-class ConvScalar:
-    __slots__ = "constructor", "typecode", "mem"
-
-    def __init__(self, constructor: Callable = ident):
-        self.constructor = constructor
-
-    def init(self, typecode: str):
-        self.typecode = typecode
-
-    def set(self, mem: memoryview, ss: int):
-        if not isunit(ss):
-            raise ValueError(f"scalar root request non-unit subset: {subsetstr(ss)}")
-        self.mem = mem[ss:]
-
-    def get(self):
-        return self.constructor(self.mem.cast(self.typecode)[0])
-
-class ConvIter:
-    __slots__ = "vector", "constructor", "typecode", "mem", "ss"
-
-    def __init__(self, vector: Callable, constructor: Callable = ident):
-        self.vector = vector
-        self.constructor = constructor
-
-    def init(self, typecode: str):
-        self.typecode = typecode
-
-    def set(self, mem: memoryview, ss: int):
-        self.mem = mem
-        self.ss = ss
-
-    def get(self):
-        return self.vector(map(self.constructor, seq_iterss(self.mem.cast(self.typecode), self.ss)))
-
-#---- python callbacks ----------------------------------------
-
-# s -> state
-# i -> instance
-# x -> X
-def param_def(f: Callable, allow: str = "six") -> str:
-    params = inspect.signature(f).parameters
-    out = ""
-    for p in params.values():
-        if p.annotation == int:
-            c = "i"
-        elif p.annotation == SolverState:
-            c = "s"
-        elif "x" in out:
-            raise TypeError(f"unexpected parameter: {p}")
-        else:
-            c = "x"
-        if c not in allow:
-            raise TypeError(f"param not valid here: {p}")
-        out += c
-    return out
-
-def extract_param(state: SolverState, p: str) -> Any:
-    if p == "s":
-        return state
-    elif p == "i":
-        return state.inst
-    elif p == "x":
-        return state.X
-
-def fn_wrap_params(f: Callable, allow: str = "six") -> Callable:
-    pd = param_def(f, allow)
-    if pd == "s":
-        return f
-    @functools.wraps(f)
-    def w(state):
-        return f(*(extract_param(state, p) for p in pd))
-    return w
-
-def vref_wrap_subset(f: Callable[..., S]) -> Callable[..., Tuple[S, int]]:
-    @functools.wraps(f)
-    def w(*args):
-        it = f(*args)
-        return it, space(len(it))
-    return w
-
-def virtual(name: str, f: Callable, cts: Optional[str] = None, copy: bool = True) -> Push:
-    sig = inspect.signature(f)
-    rt = sig.return_annotation
+def gfunc(f: Callable, ctype: Optional[str] = None) -> XGivenFunc:
+    rt = inspect.signature(f).return_annotation
+    subset = False
+    vector = None
     if rt is not inspect.Signature.empty:
         orig = get_origin(rt)
-        args = get_args(rt)
-        # -> Tuple[..., Subset]
-        if orig in (tuple, Tuple) and len(args) == 2 and issubsettype(args[1]):
-            orig = get_origin(args[0])
-            args = get_args(args[0])
-        # -> Iterable[...] or Iterable
-        elif orig and issubclass(orig, Iterable):
-            f = vref_wrap_subset(f)
-        if orig and issubclass(orig, Iterable):
-            what = "iter"
-            if (not cts) and len(args) == 1:
-                cts = py2cts(args[0])
-        else:
-            what = "scalar"
-            if not cts:
-                cts = py2cts(rt)
-    else:
-        # could error here as well. whatever.
-        # it's gonna blow up at runtime anyway if we assumed wrong.
-        what = "scalar"
-    f = fn_wrap_params(f)
-    return Push(lambda lua: lua.fhk_py.pyvirtual(name, f, cts, what, copy)[0])
+        if orig and issubclass(orig, Tuple):
+            args = get_args(orig)
+            if len(args) != 2:
+                raise TypeError(f"return tuple size mismatch: {len(args)}")
+            if not issubsettype(args[1]):
+                raise TypeError("second return value must be a subset type")
+            subset = True
+            rt = args[0]
+            orig = get_origin(rt)
+        if orig is not None:
+            if not issubclass(orig, Sequence):
+                raise TypeError(f"unrepresentable return type: {rt}")
+            vector = orig
+            args = get_args(rt)
+            rt = args[0] if len(args) > 0 else None
+        if ctype is None and rt is not None:
+            ctype = ctoverride(rt)
+    return XGivenFunc(
+        func = f,
+        subset = subset,
+        params = jparm(f),
+        desc = describe(f),
+        type = rt,
+        ctype = ctype,
+        vector = vector
+    )
 
-def anymap(name: str, inverse: str, f: Callable, scalar: bool = False) -> Push:
-    flags = f"{'i' if 'i' in param_def(f) else 'k'}{'s' if scalar else 'v'}"
-    f = fn_wrap_params(f, allow="six" if "i" in flags else "sx")
-    return Push(lambda lua: lua.fhk_py.pymap(name, inverse, flags, f)[0])
-
-def group(name: str, *rules: Any) -> Push:
-    return Push(lambda lua: lua.fhk_py.rules.group(name, *rules)[0])
-
-def label(kv: Dict[str, int]) -> Push:
-    return Push(lambda lua: lua.fhk_py.rules.label(lua.fhk_py.newtab(*itertools.chain(*kv.items()))[0])[0])
-
-def shape(s: Any) -> Push:
-    if callable(s):
-        s = fn_wrap_params(s, allow="sx")
-    return Push(lambda lua: lua.fhk_py.shape(s)[0])
-
-def edgerule(
-    rule: str,
-    map: Optional[str] = None,
-    ctype: Optional[str] = None,
-    scalar: Optional[bool] = None
-) -> Push:
-    rank = "s" if scalar is True else ("v" if scalar is False else None)
-    return Push(lambda lua: lua.fhk_py.edgerule(rule, map, ctype, rank)[0])
-
-#---- view & rules ----------------------------------------
+def mapfunc(f: Callable, inverse: str, scalar: bool) -> XMapFunc:
+    params = jparm(f)
+    return XMapFunc(
+        func = f,
+        params = params,
+        desc = describe(f),
+        inverse = inverse,
+        flags = f"{'i' if 'i' in params else 'k'}{'s' if scalar else 'v'}"
+    )
 
 @dataclasses.dataclass
 class MapDef:
@@ -190,19 +171,16 @@ class MapDef:
 
     def inverse(self, name: str, scalar: bool = False) -> Callable[[CS], CS]:
         def deco(f):
-            self.view.append(anymap(self.name, name, self.f, self.scalar))
-            self.view.append(anymap(name, self.name, f, scalar))
+            self.view.append(XNamed(self.name, mapfunc(self.f, name, self.scalar)))
+            self.view.append(XNamed(name, mapfunc(f, self.name, scalar)))
             return f
         return deco
 
-class View(list[LuaCallable]):
-
-    def __lua__(self, lua: GCLua) -> GCPin:
-        return lua.fhk_py.rules.composite(*self)[0]
+class View(list):
 
     def group(self, name: str) -> "View":
         v = View()
-        self.append(group(name, v))
+        self.append(XGroup(name=name, rule=XComposite(v)))
         return v
 
     @overload
@@ -210,27 +188,26 @@ class View(list[LuaCallable]):
     @overload
     def shape(self, x: SS) -> SS: ...
 
-    def shape(self, x):  # type: ignore
+    def shape(self, x): # type: ignore
         if isinstance(x, str):
-            def deco(f):
-                self.append(group(x, shape(f)))
-                return f
-            return deco
+            return self.group(x).shape
+        elif isinstance(x, int):
+            self.append(XShapeNum(x))
         else:
-            self.append(shape(x))
-            return x
+            self.append(XShapeFunc(func=x, params=jparm(x)))
+        return x
 
     @overload
-    def given(self, x: str, ctype: Optional[str] = None, copy: bool = True) -> Callable[[C], C]: ...
+    def given(self, x: str, ctype: Optional[str] = None) -> Callable[[C], C]: ...
     @overload
     def given(self, x: T) -> T: ...
 
-    def given(self, x, ctype=None, copy=True):     # type: ignore
+    def given(self, x, ctype=None): # type: ignore
         if isinstance(x, type):
             raise NotImplementedError("TODO")
         else:
             def deco(f):
-                self.append(virtual(x, f, ctype, copy))
+                self.append(XNamed(x, gfunc(f, ctype)))
                 return f
             return deco
 
@@ -239,16 +216,14 @@ class View(list[LuaCallable]):
     @overload
     def map(self, name: str, inverse: str, scalar: bool = False) -> Callable[[CS], CS]: ...
 
-    def map(self, name, inverse=None, scalar=False): # type: ignore
+    def map(self, name, inverse=None, scalar=False):  # type: ignore
         if inverse is None:
-            def deco(f): # type: ignore
+            def deco(f):  # type: ignore
                 return MapDef(self, name, scalar, f)
-            return deco
         else:
-            def deco(f): # type: ignore
-                self.append(anymap(name, inverse, f, scalar))
-                return f
-            return deco
+            def deco(f):  # type: ignore
+                self.append(XNamed(name, mapfunc(f, inverse, scalar)))
+        return deco
 
     def edgerule(
         self,
@@ -257,37 +232,51 @@ class View(list[LuaCallable]):
         ctype: Optional[str] = None,
         scalar: Optional[bool] = None
     ) -> "View":
-        self.append(edgerule(rule, map, ctype, scalar))
+        self.append(XEdgeRule(
+            rule = rule,
+            map = map,
+            cts = ctype,
+            rank='s' if scalar is True else ('v' if scalar is False else None)
+        ))
         return self
 
     def label(self, *args: Dict[str, int], **kwargs: int) -> "View":
         for x in args:
             kwargs.update(x)
-        self.append(label(kwargs))
+        self.append(XLabel(kwargs))
         return self
 
-#---- graph & solver ----------------------------------------
+Rule = Union[View, XRule]
+
+def torule(rules: List[Rule]) -> XRule:
+    if len(rules) == 1 and not isinstance(rules[0], list):
+        return rules[0]
+    return XComposite([torule(r) if isinstance(r, list) else r for r in rules])
+
+@dataclasses.dataclass(slots=True)
+class Solver:
+    _S: Pin
+    _mem: Mem # <- this reference is here just to prevent gc
 
 class SolverFn(Generic[T]):
-    _driver: GCDriver
+    _lua: LuaState
+    _init: Pin
+    _fn: Pin
     _result: Type
-    _roots: List[CRoot]
 
     def __call__(
         self,
         state: Any = None,
-        solver: Optional[SolverState] = None,
+        solver: Optional[Solver] = None,
         mem: Optional[Mem] = None,
         subset: Dict[str, Subset] = {}
     ) -> T:
         if solver is None:
             if mem is None:
                 mem = Mem()
-            solver = init(self._driver, mem, state)
-        else:
-            solver.X = state
+            solver = Solver(self._lua.callinit(self._init, mem, state), mem)
         result = self._result()
-        solve(self._driver, solver, self._roots, subset, result)
+        self._lua.callsolver(self._fn, solver._S, state, result, subset)
         return result
 
 @dataclasses.dataclass
@@ -302,79 +291,62 @@ class Root:
 def root(name: str, ctype: Optional[str] = None) -> Any:
     return Root(name=name, ctype=ctype)
 
-@dataclasses.dataclass
-class GenRoot:
-    name: str
-    conv: Conv
-    ref: GCPin
-
-@dataclasses.dataclass
-class GenSolver:
-    fn: SolverFn
-    roots: List[GenRoot]
-
-def defsolver(lua: GCPin, state: GCPin, result: Type) -> GenSolver:
+def toroots(result: Type) -> List[XRoot]:
     roots = []
+    # access __annotations__ here to make sure __dict__ contains it before we start iterating.
+    getattr(result, "__annotations__")
     for k,v in result.__dict__.items():
         if not isinstance(v, Root):
             continue
-        cts = v.ctype
+        constructor, vector = None, None
         if k in result.__annotations__:
             ann = result.__annotations__[k]
             orig = get_origin(ann)
             if orig:
                 args = get_args(ann)
-                conv = ConvIter(orig, len(args) >= 1 and args[0] or ident)
-                ann = orig
-            else:
-                conv = ConvScalar(ann)
-            if not cts:
-                cts = py2cts(ann)
-        else:
-            conv = ConvIter(list)
-        ref, = lua.setroot(state, v.name, cts)
-        roots.append(GenRoot(k, conv, ref))
-    fn = SolverFn()
-    fn._result = result
-    return GenSolver(fn, roots)
+                if len(args) == 1:
+                    vector = orig
+                    ann = args[0]
+            constructor = ann
+        roots.append(XRoot(attr=k, var=v.name, ctype=v.ctype, constructor=constructor, vector=vector))
+    return roots
 
 class Graph:
-    _lua: GCPin
-    _solvers: List[GenSolver]
+    _lua: LuaState
+    _ref: int
+    _solvers: List[Tuple[SolverFn, int]]
 
-    def __init__(self, *args: Union[LuaCallable, str], _lua: Optional[GCPin] = None):
-        if _lua is None:
-            _lua = newlua()
-        self._lua = _lua
+    def __init__(self, *args: Union[Rule, str], lua: Optional[LuaState] = None):
         self._solvers = []
-        views, graphs = [], []
-        for x in args:
-            (graphs if isinstance(x, str) else views).append(x)
-        self._state, = _lua.rules.newstate(View(*views))
-        self.include(*graphs)
+        if lua is None:
+            lua = LuaState()
+        self._lua = lua
+        self._ref = self._lua.new(torule([a for a in args if not isinstance(a, str)]))
+        self.include(*(a for a in args if isinstance(a, str)))
 
     def solver(self, result: T) -> SolverFn[T]:
-        s = defsolver(self._lua, self._state, result)
-        self._solvers.append(s)
-        return s.fn
+        fn = SolverFn()
+        fn._lua = self._lua
+        fn._result = result
+        self._solvers.append((fn, self._lua.solver(self._ref, toroots(result))))
+        return fn
 
     def include(self, *files: str):
-        self._lua.rules.read(self._state, *files)
+        for f in files:
+            self._lua.read(self._ref, f)
 
-    def __enter__(self) -> "Graph":
+    def ready(self):
+        init = self._lua.ready(self._ref)
+        for s, idx in self._solvers:
+            fn = self._lua.pinsolver(self._ref, idx)
+            s._init = init
+            s._fn = fn
+        self._lua.unref(self._ref)
+        # prevent any further (accidental) calls.
+        setattr(self, "_lua", None)
+
+    def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.ready()
-
-    def ready(self):
-        d = ready(self._state)
-        for s in self._solvers:
-            fn = s.fn
-            fn._driver = d
-            roots = []
-            for r in s.roots:
-                idx, fmt = self._lua.getroot(r.ref)
-                r.conv.init(fmt)
-                roots.append(CRoot(name=r.name, conv=r.conv, idx=idx))
-            fn._roots = roots

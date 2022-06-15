@@ -565,12 +565,12 @@ local function emit_upvdef(buf, upv)
 	return uvals
 end
 
-local function ffunc(graph, fb)
+local function ffunc(graph, fb, sig)
 	local buf = graph.buf:reset()
 	buf:put("local C")
 	local uvals = emit_upvdef(buf, fb.upv)
 	buf:put("= ...\n")
-	buf:put("return function(S, X)\n")
+	buf:putf("return function(%s)\n", sig or "S, X")
 	buf:put(fb.src)
 	buf:put("end\n")
 	return load(buf, fb.name)(C, unpack(uvals))

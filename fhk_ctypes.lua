@@ -209,7 +209,7 @@ end
 
 -- -1 for empty set
 local function interval_znum(ss)
-	return rshift(i64(ss), 43)
+	return tonumber(rshift(i64(ss), 43))
 end
 
 -- 0 for emptyset
@@ -246,6 +246,33 @@ local function subsetstr(ss)
 		return string.format("{%s}", table.concat(intervals, ", "))
 	else
 		return interval_tostring(interval_first(ss), interval_znum(ss))
+	end
+end
+
+local function next_complex(state, i)
+	i = i+1
+	if i > state.last then
+		if pkend(state.pk) then return end
+		i = pkfirst(state.pk)
+		state.last = i+pkznum(state.pk)
+		state.pk = pknext(state.pk)
+	end
+	return i
+end
+
+local function next_interv(last, i)
+	i = i+1
+	if i <= last then return i end
+end
+
+local function iter(ss)
+	if iscomplex(ss) then
+		local pk = subset_pk(ss)
+		local first = pkfirst(pk)
+		return next_complex, {pk=pknext(pk), last=first+pkznum(pk)}, first-1
+	else
+		local first = interval_first(ss)
+		return next_interv, first+interval_znum(ss), first-1
 	end
 end
 
@@ -484,6 +511,7 @@ return {
 	tosubset  = tosubset,
 	sizeof    = sizeof,
 	subsetstr = subsetstr,
+	iter      = iter,
 	guard     = guard,
 	handles   = handles,
 	handle2   = handle2,
