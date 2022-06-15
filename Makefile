@@ -28,6 +28,9 @@ LINKLUA       ?= y
 # enable debugging? y/[n]
 DEBUG         ?= n
 
+# enable tracing?
+TRACE         ?=
+
 # debugging
 ASAN          ?= -fsanitize=address
 UBSAN         ?= -fsanitize=undefined -fno-sanitize=shift,signed-integer-overflow
@@ -51,6 +54,9 @@ else
 CCOPT         ?= -O2 -ffast-math
 CCDEBUG       ?=
 CCDEF         ?= -DNDEBUG
+endif
+ifneq (,$(TRACE))
+CCDEF         += -DFHK_TRACE=$(TRACE)
 endif
 
 # linker options
@@ -119,7 +125,7 @@ endif
 CCGITHASH   = $(shell HASH=$$(git rev-parse --short HEAD) && echo -DFHK_GITHASH=$$HASH)
 
 # final flags
-CFLAGS      = $(CCOPT) $(CCDEF) $(FHK_CCDEF) $(CCDEBUG) $(CCWARN) $(CCINCLUDE) $(CCLTO) $(XCFLAGS)
+FHKCFLAGS   = $(CCOPT) $(CCDEF) $(CCDEBUG) $(CCWARN) $(CCINCLUDE) $(CCLTO) $(CFLAGS)
 
 #--------------------------------------------------------------------------------
 
@@ -135,17 +141,17 @@ libfhkpy.a:  $(CORE_O) $(LUALANG_O) $(PYX_O) $(LUACORE_O) $(LUAPY_O) $(BCLOADER_
 %.a:
 	$(AR) rcs $@ $^
 
-fhk$(TARGET_SO): CFLAGS += -fPIC
+fhk$(TARGET_SO): FHKCFLAGS += -fPIC
 fhk$(TARGET_SO): $(CORE_O) $(LUALANG_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
 	$(CC) -shared $^ $(BCL_LDFLAGS) -o $@
 
 #--------------------------------------------------------------------------------
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(FHKCFLAGS) -c $< -o $@
 
 %.o: %.S
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(FHKCFLAGS) -c $< -o $@
 
 %.lua.o: %.lua
 	$(LUAJIT) -b -n $(subst _,.,$(notdir $*)) $< $@
@@ -158,7 +164,7 @@ fhk$(TARGET_SO): $(CORE_O) $(LUALANG_O) $(LUACORE_O) $(LUALIB_O) $(BCLOADER_O)
 
 loader.c:
 	$(BCLOADER) -o $(TARGET) -n fhk -c fhk_api -L > $@
-loader.o: CFLAGS += $(LUAJIT_I)
+loader.o: FHKCFLAGS += $(LUAJIT_I)
 
 fhk_cdef.lua: LUAHDEF = -DFHK_CORO=$(CORO) $(CCGITHASH)
 _ctypes.pyx.o: CCINCLUDE += $(LUAJIT_I) $(PYTHON_I)
