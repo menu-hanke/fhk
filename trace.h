@@ -66,8 +66,8 @@
 
 #define TRACE_SETMAPK  "cmd",    trace_fhk, "<- SETMAPK       %ld :: 0x%lx"
 #define TRACE_SETMAPI  "cmd",    trace_fhk, "<- SETMAPI       [%d]:%d :: 0x%lx"
-#define TRACE_SETROOT  "cmd",    trace_fhk, "<- SETROOT       (0x%x) %d:%d..+%d"
-#define TRACE_SETROOTP "cmd",    trace_fhk, "<- SETROOT       (0x%x) %d:%d..+%d  -->  %p"
+#define TRACE_SETROOT  "cmd",    trace_fhk, "<- SETROOT       %s:%d..+%d (0x%x)"
+#define TRACE_SETROOTP "cmd",    trace_fhk, "<- SETROOT       %s:%d..+%d (0x%x)  -->  %p"
 #define TRACE_SETVALR  "cmd",    trace_fhk, "<- SETVALUE      (ref) %s  -->  %p :: %s"
 #define TRACE_SETVALI  "cmd",    trace_fhk, "<- SETVALUE      %s:%d..+%d :: %s"
 #define TRACE_SETVALD  "cmd",    trace_fhk, "<- SETVALUE      (direct) %s:%d..+%d"

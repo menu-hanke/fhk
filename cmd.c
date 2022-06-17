@@ -113,14 +113,14 @@ void fhk_setroot(struct fhk_solver *S, int idx, fhk_subset ss) {
 	struct fhkX_bucket *bucket = root_find_bucket(S, flags, S->bucket);
 	if(LIKELY(subset_isI(ss))) {
 		bucket->roots[bucket->num++] = root_newidx(idx) | root_newsubsetI(ss);
-		// TODO trace
+		trace(SETROOT, fhk_debug_sym(S->G, idx), subsetI_first(ss), (int)subsetIE_znum(ss), flags);
 	} else {
 		fhkX_pkref pk = subsetC_pk(ss);
 		for(;;) {
 			if(UNLIKELY(bucket->num == MAX_ROOT))
 				bucket = root_find_bucket(S, flags, pmref(S, bucket));
 			bucket->roots[bucket->num++] = root_newidx(idx) | root_newpk(pk);
-			// TODO trace
+			trace(SETROOT, fhk_debug_sym(S->G, idx), pkref_first(pk), pkref_znum(pk), flags);
 			if(!pkref_more(pk)) return;
 			pk = pkref_next(pk);
 		}
@@ -134,7 +134,7 @@ static void root_setC_pk(struct fhk_solver *S, int idx, fhkX_pkref pk, void *p,
 			bucket = root_find_bucket(S, bucket->flags, pmref(S, bucket));
 		bucket->roots[bucket->num] = root_newidx(idx) | root_newpk(pk) | bucket->num;
 		bucket->ptr[bucket->num++] = p;
-		// TODO trace
+		trace(SETROOTP, fhk_debug_sym(S->G, idx), pkref_first(pk), pkref_znum(pk), bucket->flags, p);
 		if(!pkref_more(pk)) return;
 		p += size*pkref_size(pk);
 		pk = pkref_next(pk);
@@ -148,6 +148,7 @@ void fhk_setrootC(struct fhk_solver *S, int idx, fhk_subset ss, void *p) {
 	if(LIKELY(subset_isI(ss))) {
 		bucket->roots[bucket->num] = root_newidx(idx) | root_newsubsetI(ss) | bucket->num;
 		bucket->ptr[bucket->num++] = p;
+		trace(SETROOTP, fhk_debug_sym(S->G, idx), subsetI_first(ss), (int)subsetIE_znum(ss), flags, p);
 	} else {
 		root_setC_pk(S, idx, subsetC_pk(ss), p, bucket, S->G->vars[idx].size);
 	}
@@ -175,7 +176,7 @@ void *fhk_setrootD(struct fhk_solver *S, int idx, fhk_subset ss) {
 		}
 		struct fhkX_bucket *bucket = root_find_bucket(S, given, S->bucket);
 		bucket->roots[bucket->num++] = root_newidx(idx) | root_newsubsetI(ss);
-		// TODO trace
+		trace(SETROOT, fhk_debug_sym(S->G, idx), subsetI_first(ss), (int)subsetIE_znum(ss), given);
 		return vp + size*subsetI_first(ss);
 	} else {
 		fhkX_pkref spk = subsetC_pk(ss);
