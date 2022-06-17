@@ -11,7 +11,7 @@ local ocheck, gcocheck, raise = Py.ocheck, Py.gcocheck, Py.raise
 
 -- cython helpers, see _ctypes.pyx
 ffi.cdef [[
-fhk_subset fhk_pyx_tosubset(PyObject *);
+fhk_subset fhk_pyx_tosubset(fhk_solver *, PyObject *);
 ]]
 
 -- keep cdefs not used by the model caller here.
@@ -44,6 +44,12 @@ local function gfuncctype(o)
 	if C.PyObject_IsSubclass(ptype, Py.builtins.bool) == 1 then return "bool" end
 	if C.PyObject_IsSubclass(ptype, Py.builtins.int) == 1 then return "int" end
 	if C.PyObject_IsSubclass(ptype, Py.builtins.float) == 1 then return "double" end
+end
+
+local function tosubset(S, o)
+	local ss = C.fhk_pyx_tosubset(S, o)
+	if ss == ctypes.undefset then raise() end
+	return ss
 end
 
 local function putjcall(fb, o)
@@ -86,9 +92,10 @@ local function vrefpy(fb, op)
 		if subset then
 			obj = "x"
 			fb.upv.iter = ctypes.iter
+			fb.upv.tosubset = tosubset
 			fb.src:putf([[
 				local x = ocheck(C.PyTuple_GetItem(r, 0))
-				local ss = C.fhk_pyx_tosubset(ocheck(C.PyTuple_GetItem(r, 1)))
+				local ss = tosubset(S, ocheck(C.PyTuple_GetItem(r, 1)))
 				C.fhk_setvalueD(S, %d, ss)
 				local vp = cast(%s, S.value.v[%d])
 				local j = 0
@@ -142,9 +149,10 @@ local function vrefpy(fb, op)
 end
 
 local function mapcallpy(fb, op)
+	fb.upv.tosubset = tosubset
 	putjcall(fb, op.o)
 	fb.src:put([[
-		local ss = C.fhk_pyx_tosubset(r)
+		local ss = tosubset(S, r)
 		C.Py_DecRef(r)
 	]])
 	if op.map.flags:match("i") then
@@ -306,7 +314,7 @@ local function getsubset(S, group, name, o)
 				raise()
 			end
 		else
-			return C.fhk_pyx_tosubset(ss)
+			return tosubset(S, ss)
 		end
 	end
 	return S.map[group].kmap

@@ -1,4 +1,5 @@
 # cython: language_level=3
+from libc.stdint cimport uint64_t
 
 #---- lua state ----------------------------------------
 
@@ -6,6 +7,7 @@ cdef extern from *:
     """
     #include "def.h"
     #include "fhk.h"
+    #include "mem.h"
     #include "solve.h"
 
     #include <lua.h>
@@ -120,11 +122,16 @@ cdef extern from *:
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
     }
     """
-    ctypedef long fhk_subset
-    ctypedef struct fhk_mem
+    ctypedef struct fhk_mem:
+        int ptr
+    ctypedef struct fhk_solver:
+        int mem
     fhk_mem *fhk_create_mem()
-    void fhk_destroy_mem(fhk_mem *mem)
-    void fhk_reset_mem(fhk_mem *mem)
+    void fhk_destroy_mem(fhk_mem *)
+    void fhk_reset_mem(fhk_mem *)
+    void fhk_mem_commitP(fhk_mem *, long)
+    void *mrefp(void *, int)
+    int pmref(void *, void *)
     int LUA_NOREF
     ctypedef struct lua_State
     lua_State *fhk_pyx_initlua()
@@ -227,14 +234,46 @@ cdef class Mem:
 #---- subset functions ----------------------------------------
 
 cdef extern from *:
+    ctypedef long fhk_subset
+    ctypedef long fhkX_pkref
     fhk_subset SUBSET_EMPTY
     fhk_subset subsetI_newZ(int, int)
+    fhk_subset subsetC_new(fhkX_pkref)
+    uint64_t pkpack(int, int)
+    fhkX_pkref pkref_next(fhkX_pkref)
 
-cdef public fhk_subset fhk_pyx_tosubset(void *op):
+cdef public fhk_subset fhk_pyx_tosubset(fhk_solver *S, void *op) except -2:
     o = <object> op
     if isinstance(o, int):
         return o
-    raise NotImplementedError("TODO: convert subset")
+    cdef list idx = sorted(o)
+    if not idx:
+        return SUBSET_EMPTY
+    cdef int i = 1
+    cdef int j
+    cdef int n = len(idx)
+    cdef int head = o[0]
+    cdef int tail = head
+    cdef fhk_mem *mem = <fhk_mem *> mrefp(S, S.mem)
+    cdef fhkX_pkref pk = <fhkX_pkref> mrefp(mem, mem.ptr)
+    cdef fhkX_pkref pkt = pk
+    while i < n:
+        j = idx[i]
+        i += 1
+        if j > tail+1:
+            fhk_mem_commitP(mem, pkt+8)
+            (<uint64_t *> pkt)[0] = pkpack(tail-head, head)
+            pkt = pkref_next(pkt)
+            head = j
+        tail = j
+    if pkt == pk:
+        return subsetI_newZ(tail-head, head)
+    else:
+        fhk_mem_commitP(mem, pkt+8)
+        # this also packs the trailing zeros.
+        (<uint64_t *> pkt)[0] = pkpack(tail-head, head)
+        mem.ptr = pmref(mem, <void *>(pkt+8))
+        return subsetC_new(pk)
 
 def interval(start, num):
     if num == 0:

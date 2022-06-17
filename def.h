@@ -79,15 +79,16 @@
  * a list of ranges must be terminated with 3 0-bytes.
  */
 typedef int8_t *fhkX_pkref;
-#define PKWORD_OVERLAP  5
-#define PKWORD_FULL     8
-#define PKWORD_ALIGN    1
-#define pkref_next(pk)  ((pk) + 5)
-#define pkref_nth(pk,n) ((pk) + 5*(n))
-#define pkref_first(pk) (pkref_load32(pk) & 0xfffff)
-#define pkref_znum(pk)  ((pkref_load32((pk)+2) >> 4) & 0xfffff)
-#define pkref_size(pk)  (1 + pkref_znum(pk))
-#define pkref_more(pk)  ((pkref_load32((pk)+5)) & 0xffffff)
+#define PKWORD_OVERLAP   5
+#define PKWORD_FULL      8
+#define PKWORD_ALIGN     1
+#define pkref_next(pk)   ((pk) + 5)
+#define pkref_nth(pk,n)  ((pk) + 5*(n))
+#define pkref_first(pk)  (pkref_load32(pk) & 0xfffff)
+#define pkref_znum(pk)   ((pkref_load32((pk)+2) >> 4) & 0xfffff)
+#define pkref_size(pk)   (1 + pkref_znum(pk))
+#define pkref_more(pk)   ((pkref_load32((pk)+5)) & 0xffffff)
+#define pkpack(zs,first) (((uint64_t)(zs) << 20) | (first))
 
 AINLINE static uint64_t pkref_load64(fhkX_pkref pk){
 	uint64_t pk64;

@@ -55,6 +55,23 @@ def test_read_back_subset():
     r = solver(subset={"x": fhk.interval(0, 3)})
     assert r.x == [1,2,3]
 
+def test_complex_subset():
+    view = fhk.View()
+    view.group("a").shape(10)
+
+    @view.given("a#x")
+    def _a_x(idx: int) -> float:
+        return idx
+
+    class Result:
+        x: List[float] = fhk.root("a#x")
+
+    with fhk.Graph(view) as g:
+        solver = g.solver(Result)
+
+    r = solver(subset={"x": [0, 2,3,4,5,6, 8,9]})
+    assert(r.x == [0, 2,3,4,5,6, 8,9])
+
 def test_given_params():
     view = fhk.View()
     view.group("a").shape(1)
