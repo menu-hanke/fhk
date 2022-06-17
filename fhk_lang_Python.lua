@@ -371,13 +371,21 @@ local function modcallpy(fb, op)
 	fb.src:putf("%s.Py_DecRef(r)\n", uC)
 end
 
-local function py_load(fb, model, module, func)
+local function pyimportf(module, name)
 	if not module then error("nil python module") end
-	if not func then error("nil python func") end
+	if not name then error("nil python name") end
 	local pymodname = gcocheck(C.PyUnicode_DecodeFSDefault(module))
 	local pymod = gcocheck(C.PyImport_Import(pymodname))
-	local pyfunc = gcocheck(C.PyObject_GetAttrString(pymod, func))
-	modcallpy(fb, {model=model, f=pyfunc})
+	return gcocheck(C.PyObject_GetAttrString(pymod, name))
+end
+
+-- Python(module, name)
+-- Python(PyObject *)
+local function py_load(fb, model, a, b)
+	if type(a) == "string" then
+		a = pyimportf(a, b)
+	end
+	return modcallpy(fb, {model=model, f=a})
 end
 
 --------------------------------------------------------------------------------

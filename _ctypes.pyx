@@ -16,6 +16,7 @@ cdef extern from *:
     #define RKEY_SOLVER    "!@fhk_pyx_solver"
     #define RKEY_READY     "!@fhk_pyx_ready"
     #define RKEY_READ      "!@fhk_pyx_read"
+    #define RKEY_MODEL     "!@fhk_pyx_model"
 
     static void copyregfield(lua_State *L, const char *field, const char *rkey) {
         // registry[rkey] = top[field]
@@ -34,6 +35,7 @@ cdef extern from *:
         copyregfield(L, "solver", RKEY_SOLVER);
         copyregfield(L, "ready",  RKEY_READY);
         copyregfield(L, "read",   RKEY_READ);
+        copyregfield(L, "model",  RKEY_MODEL);
         lua_pop(L, 1);
         return L;
     }
@@ -68,6 +70,15 @@ cdef extern from *:
         lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
         lua_pushlightuserdata(L, fname);
         return lua_pcall(L, 2, 0, 0);
+    }
+
+    static int fhk_pyx_model(lua_State *L, int ref, void *name, void *decl, void *f) {
+        lua_getfield(L, LUA_REGISTRYINDEX, RKEY_MODEL);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+        lua_pushlightuserdata(L, name);
+        lua_pushlightuserdata(L, decl);
+        lua_pushlightuserdata(L, f);
+        return lua_pcall(L, 4, 0, 0);
     }
 
     static int fhk_pyx_ready(lua_State *L, int ref) {
@@ -122,6 +133,7 @@ cdef extern from *:
     int fhk_pyx_new(lua_State *, void *)
     int fhk_pyx_solver(lua_State *, int, void *)
     int fhk_pyx_read(lua_State *, int, void *)
+    int fhk_pyx_model(lua_State *, int, void *, void *, void *)
     int fhk_pyx_ready(lua_State *, int)
     int fhk_pyx_refsolver(lua_State *, int, int)
     int fhk_pyx_callinit(lua_State *, int, fhk_mem *, void *)
@@ -153,6 +165,9 @@ cdef class LuaState:
 
     def read(self, state, fname):
         self._checkpcall(fhk_pyx_read(self.L, state, <void*>fname))
+
+    def model(self, state, name, decl, f):
+        self._checkpcall(fhk_pyx_model(self.L, state, <void*>name, <void*>decl, <void*>f))
 
     def ready(self, state):
         return Pin(self, self._checkref(fhk_pyx_ready(self.L, state)))

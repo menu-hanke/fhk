@@ -1,7 +1,7 @@
 import dataclasses
 import enum
 import inspect
-from typing import Any, Callable, Dict, Generic, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin, overload
+from typing import Any, Callable, Dict, Generic, Iterable, Iterator, List, Optional, Sequence, Tuple, Type, TypeVar, Union, get_args, get_origin, overload
 from fhk._ctypes import LuaState, Mem, Pin
 from fhk.obj import Subset, issubsettype
 
@@ -126,7 +126,7 @@ def gfunc(f: Callable, ctype: Optional[str] = None) -> XGivenFunc:
     if rt is not inspect.Signature.empty:
         orig = get_origin(rt)
         if orig and issubclass(orig, Tuple):
-            args = get_args(orig)
+            args = get_args(rt)
             if len(args) != 2:
                 raise TypeError(f"return tuple size mismatch: {len(args)}")
             if not issubsettype(args[1]):
@@ -177,6 +177,12 @@ class MapDef:
         return deco
 
 class View(list):
+
+    _defers: List[Callable[["Graph"],None]]
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._defers = []
 
     def group(self, name: str) -> "View":
         v = View()
@@ -246,12 +252,25 @@ class View(list):
         self.append(XLabel(kwargs))
         return self
 
+    def model(self, name: str, decl: str) -> Callable[[C], C]:
+        def deco(f):
+            self._defers.append(lambda g: g.model(name,decl)(f))
+            return f
+        return deco
+
 Rule = Union[View, XRule]
 
 def torule(rules: List[Rule]) -> XRule:
     if len(rules) == 1 and not isinstance(rules[0], list):
         return rules[0]
     return XComposite([torule(r) if isinstance(r, list) else r for r in rules])
+
+def todefers(rules: Iterable) -> Iterator[Callable[["Graph"], None]]:
+    for r in rules:
+        if isinstance(r, View):
+            yield from r._defers
+        if isinstance(r, list):
+            yield from todefers(r)
 
 @dataclasses.dataclass(slots=True)
 class Solver:
@@ -323,6 +342,8 @@ class Graph:
         self._lua = lua
         self._ref = self._lua.new(torule([a for a in args if not isinstance(a, str)]))
         self.include(*(a for a in args if isinstance(a, str)))
+        for f in todefers(args):
+            f(self)
 
     def solver(self, result: T) -> SolverFn[T]:
         fn = SolverFn()
@@ -334,6 +355,12 @@ class Graph:
     def include(self, *files: str):
         for f in files:
             self._lua.read(self._ref, f)
+
+    def model(self, name: str, decl: str) -> Callable[[C], C]:
+        def deco(f):
+            self._lua.model(self._ref, name, decl, f)
+            return f
+        return deco
 
     def ready(self):
         init = self._lua.ready(self._ref)

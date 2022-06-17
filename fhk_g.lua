@@ -187,9 +187,9 @@ end
 local function envreadf(env)
 	return function(f)
 		if type(f) == "function" then
-			setfenv(f, env)()
+			return setfenv(f, env)()
 		elseif type(f) == "string" then
-			envread(env, f)
+			return envread(env, f)
 		else
 			error(string.format("unexpected parameter to read: %s", f))
 		end

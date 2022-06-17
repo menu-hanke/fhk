@@ -2,6 +2,7 @@ local buffer = require "string.buffer"
 local ffi = require "ffi"
 local ctypes = require "fhk_ctypes"
 local driver = require "fhk_driver"
+local glib = require "fhk_g"
 local lib = require "fhk_lib"
 local rules = require "fhk_rules"
 local C = require "fhk_clib"
@@ -421,6 +422,21 @@ local function pyx_read(fhk, o)
 	return rules.read(fhk.state, tostr(o))
 end
 
+local function errvisit()
+	error("can't define a new model here")
+end
+
+local function pyx_model(fhk, name, decl, f)
+	name = tostr(name)
+	decl = tostr(decl)
+	local def, err = load(string.format("return {%s}", decl))
+	if not def then error(err) end
+	f = ffi.cast("PyObject *", f)
+	C.Py_IncRef(f)
+	f = gcocheck(f)
+	return rules.read(fhk.state, glib.model(name, glib.env(errvisit).read(def), glib.impl.Python(f)))
+end
+
 --------------------------------------------------------------------------------
 
 return {
@@ -428,4 +444,5 @@ return {
 	solver = pyx_solver,
 	ready  = pyx_ready,
 	read   = pyx_read,
+	model  = pyx_model
 }
