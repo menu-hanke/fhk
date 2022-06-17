@@ -1087,6 +1087,7 @@ solve:
 		W = w;
 		W->B = beta;
 		W->ctol = 0;
+		W->cinfo.idx = 1; // model indices are negative.
 		trace(ENTERV, pmref(S,W)-S->work, fhk_debug_sym(S->G, idx), inst, beta);
 		int snum = yf_solver_enterV(S, idx, inst, W);
 		if(LIKELY(snum > 0))
