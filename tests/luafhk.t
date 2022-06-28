@@ -35,7 +35,7 @@ test_struct_view_bound = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"x", "y", "->", {"z", "w"} *fhk.g.as "double",
+			"x y", "->", "z w" *fhk.g.as "double",
 			function(x, y) return x, y end
 		)
 	)
@@ -56,7 +56,7 @@ test_struct_view_unbound = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"x", "y", "->", {"z", "w"} *fhk.g.as "double",
+			"x y", "->", "z w" *fhk.g.as "double",
 			function(x, y) return x, y end
 		)
 	)
@@ -107,7 +107,7 @@ end
 test_usermap = function()
 	local decl = fhk.new(
 		fhk.group("a",
-			fhk.virtual("x", function(inst) return inst end),
+			fhk.virtual("x", function(inst) return inst end, "double"),
 			fhk.shape(4)
 		),
 		fhk.map(
@@ -119,7 +119,7 @@ test_usermap = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"x" *fhk.g.as "double" *fhk.g.choose "umap",
+			"x ~umap",
 			"->",
 			"y" *fhk.g.as "double",
 			function(x) return x end
@@ -150,7 +150,7 @@ test_reuse_solver = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"->", {"x", "y"} *fhk.g.as "double",
+			"->", "x y" *fhk.g.as "double",
 			function()
 				assert(not called)
 				called = true
@@ -398,9 +398,9 @@ test_hook = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"x" *fhk.g.choose "map",
+			"x ~map",
 			"->",
-			"y" *fhk.g.choose "map" *fhk.g.as "double",
+			"y ~map" *fhk.g.as "double",
 			function(x) return x end
 		)
 	)
@@ -461,7 +461,7 @@ test_missing_map_unused_ok = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"->", "x" *fhk.g.choose "missing" *fhk.g.as "double",
+			"->", "x~missing" *fhk.g.as "double",
 			function() end
 		)
 	)
@@ -473,7 +473,7 @@ test_missing_map_used_fail = function()
 	decl:graph(
 		fhk.g.model(
 			"a#mod",
-			"->", "x" *fhk.g.choose "missing" *fhk.g.as "double",
+			"->", "x~missing" *fhk.g.as "double",
 			function() end
 		)
 	)

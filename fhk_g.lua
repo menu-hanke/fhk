@@ -92,15 +92,26 @@ end
 
 local function _canonicalize(ctx, x)
 	if type(x) == "string" then
-		if not x:match("#") then
-			if not ctx.owner then error(string.format("ambiguous variable name: %s", x)) end
-			x = lib.groupof(ctx.owner) .. "#" .. x
+		local m = x:gsub("~", " ~ "):gmatch("[^%s]+")
+		local name = m()
+		while name do
+			if not name:match("#") then
+				if not ctx.owner then error(string.format("ambiguous variable name: %s", name)) end
+				name = lib.groupof(ctx.owner) .. "#" .. name
+			end
+			local t = m()
+			local edge = { name=name }
+			if t == "~" then
+				edge.map = m() or error(string.format("syntax error: missing map: %s", x))
+				name = m()
+			else
+				name = t
+			end
+			for i=0, ctx.top do
+				ctx.stack[i](edge)
+			end
+			table.insert(ctx.out, edge)
 		end
-		local out = { name=x }
-		for i=0, ctx.top do
-			ctx.stack[i](out)
-		end
-		table.insert(ctx.out, out)
 	elseif type(x) == "function" then
 		-- note: unmodified
 		table.insert(ctx.out, impl.LuaJIT(x).value)
