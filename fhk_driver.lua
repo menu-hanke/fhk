@@ -1033,12 +1033,17 @@ end
 local loaders = {}
 
 -- Lua(function [, signature])
--- Lua(module, name [, signature])
-local function loadlua(a,b,c)
+-- Lua(module, name, [name, ...])
+local function loadlua(a,...)
 	if type(a) == "string" then
-		return require(a)[b], c
+		local x = require(a)
+		for _,k in ipairs({...}) do
+			if not x then break end
+			x = x[k]
+		end
+		return x
 	else
-		return a, b
+		return a, ...
 	end
 end
 
