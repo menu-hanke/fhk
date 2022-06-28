@@ -92,7 +92,9 @@ sys.path.append(os.getcwd())
 
 local C = ffi.C
 if not pcall(function() return C.Py_InitializeEx end) then
-	C = ffi.load("python3")
+	-- libpython3 must be loaded with RTLD_GLOBAL.
+	-- see: https://docs.python.org/3/whatsnew/3.8.html#changes-in-the-c-api
+	C = ffi.load("python3", true)
 	if not C then
 		error("couldn't find python shared library")
 	end
