@@ -478,7 +478,7 @@ test_missing_map_used_fail = function()
 		)
 	)
 	decl("a#x")
-	assert(fails(function() decl:ready() end), "map with incomplete definition")
+	assert(fails(function() decl:ready() end, "map with incomplete definition"))
 end
 
 test_no_chain = function()
