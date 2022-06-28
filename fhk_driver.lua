@@ -971,6 +971,24 @@ local function modcallffi(fb, op)
 	fb.name = string.format("=fhk:modcallffi<%s>@%s", op.model.name, funcname(op.f))
 end
 
+-- modcall lua expression (template)
+--     model        hardcoded model
+--     expr         template
+local function modcallexpr(fb, op)
+	fb.upv.cast = ffi.cast
+	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
+	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
+	local comma = ""
+	for i=1, #op.model.returns do
+		fb.src:putf("call.return%d[0]", i)
+		fb.src:put(comma)
+		comma = ","
+	end
+	fb.src:put(" = ", (op.expr:gsub("%$(%d+)", function(i) return string.format("call.param%d[0]", i) end)))
+	fb.src:put("\n")
+	fb.name = string.format("=fhk:modcallexpr<%s>", op.expr)
+end
+
 -- modcall const value
 --     model        hardcoded model
 --     value        constant table, one for each return edge
@@ -1032,6 +1050,10 @@ end
 function loaders.LuaJIT(fb, model, ...)
 	local func, sig = loadlua(...)
 	modcallffi(fb, {model=model, f=func, signature=sig})
+end
+
+function loaders.Expr(fb, model, expr)
+	modcallexpr(fb, {model=model, expr=expr})
 end
 
 function loaders.Const(fb, model, value)
@@ -1174,6 +1196,7 @@ return {
 	sigct        = sigct,
 	modcalllua   = modcalllua,
 	modcallffi   = modcallffi,
+	modcallexpr  = modcallexpr,
 	modcallconst = modcallconst,
 	loadlang     = loadlang,
 	setshape     = setshape,

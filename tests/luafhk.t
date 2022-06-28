@@ -274,6 +274,35 @@ test_derive = function()
 	assert(res.a_y == 2)
 end
 
+test_modcall_expr = function()
+	local decl = fhk.new(
+		fhk.group("a",
+			fhk.virtual("x", 1, "double"),
+			fhk.virtual("y", 2, "double"),
+			fhk.shape(1)
+		)
+	)
+	decl:graph(
+		fhk.g.model(
+			"a#expr",
+			"x y", "->", "z" *fhk.g.as "double",
+			fhk.g.impl.Expr "$1 / $2"
+		)
+	)
+	local solver = decl { "a#z", value=fhk.scalar() }
+	decl:ready()
+	local res = solver()
+	assert(res.a_z == 1/2)
+end
+
+test_modcall_expr_syntax_error = function()
+	local decl = fhk.new(fhk.group("a", fhk.shape(1)))
+	decl:graph(fhk.g.model("a#expr", "->", "x" *fhk.g.as "double", fhk.g.impl.Expr "syntax error"))
+	decl { "a#x", value=fhk.scalar() }
+	-- TODO: this needs an error message
+	assert(fails(function() decl:ready() end))
+end
+
 test_modcall_const = function()
 	local decl = fhk.new(
 		fhk.group("a", fhk.shape(1)),
