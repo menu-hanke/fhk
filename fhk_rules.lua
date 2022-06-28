@@ -240,7 +240,7 @@ local function ret(state, name, edge)
 	if ex.var.jfunc then
 		-- model is trying to return a given variable.
 		-- we don't want it in the final graph, ensure it will be skipped in layout phase.
-		cost(model, math.huge, 1)
+		cost(state, name, math.huge, 1)
 		model.skip = true
 		return
 	end

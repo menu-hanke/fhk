@@ -274,6 +274,15 @@ test_derive = function()
 	assert(res.a_y == 2)
 end
 
+test_skip_given_model = function()
+	local decl = fhk.new(fhk.group("a", fhk.virtual("x", 1, "double"), fhk.shape(1)))
+	decl:graph(fhk.g.model("a#mod", "->", "x", fhk.g.impl.Const(2)))
+	local solver = decl { "a#x", value=fhk.scalar() }
+	decl:ready()
+	local res = solver()
+	assert(res.a_x == 1)
+end
+
 test_modcall_expr = function()
 	local decl = fhk.new(
 		fhk.group("a",
