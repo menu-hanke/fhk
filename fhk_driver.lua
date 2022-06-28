@@ -127,6 +127,11 @@ local function checkv(graph, x, e)
 	end
 end
 
+local function checknil(x, fmt, ...)
+	if x ~= nil then return x end
+	error(string.format(fmt, ...))
+end
+
 ---- building ----------------------------------------
 
 local function namehandle(tag, handle)
@@ -639,7 +644,7 @@ end
 local function vrefs(fb, op)
 	local idx = defidx(op.var and op.var.idx)
 	local inst = definst(op.inst)
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (vrefs: %s)", xname(op.var)))
 	if (not op.offset) or op.offset == 0 then
 		fb.src:putf("C.fhk_setvalue(S, %s, %s, %s(%s, X))\n", idx, inst, f, inst)
 	else
@@ -663,7 +668,7 @@ end
 local function vrefd(fb, op)
 	local idx = defidx(op.var and op.var.idx)
 	local inst = definst(op.inst)
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (vrefd: %s)", xname(op.var)))
 	fb.src:putf("local ptr, ss = %s(%s, X)\n", f, inst)
 	if (not op.offset) or op.offset == 0 then
 		fb.src:putf("C.fhk_setvalue(S, %s, ss, ptr)\n", idx)
@@ -704,7 +709,7 @@ end
 local function vrefv(fb, op)
 	local idx = defidx(op.var and op.var.idx)
 	local inst = definst(op.inst)
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (vrefv: %s)", xname(op.var)))
 	local ctp = upval(fb, ffi.typeof("$*", op.var and op.var.ctype or op.ctype))
 	fb.upv.cast = ffi.cast
 	fb.src:putf(
@@ -723,7 +728,7 @@ end
 -- MAPCALLK idx -> f(X)
 local function mapcallkf(fb, op)
 	local idx = defidx(op.map and op.map.idx)
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (mapcall: %s)", xname(op.map)))
 	fb.src:putf("C.fhk_setmapK(S, %s, %s(X))\n", idx, f)
 	fb.name = string.format("=fhk:mapcallkf<%s>@%s", xname(op.map), funcname(op.f))
 end
@@ -737,7 +742,7 @@ end
 local function mapcallif(fb, op)
 	local idx = defidx(op.map and op.map.idx)
 	local inst = definst(op.inst)
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (mapcall: %s)", xname(op.map)))
 	fb.src:putf("C.fhk_setmapI(S, %s, %s, %s(%s, X))\n", idx, inst, f, inst)
 	fb.name = string.format("=fhk:mapcallif<%s>@%s", xname(op.map), funcname(op.f))
 end
@@ -928,7 +933,7 @@ local function modcalllua(fb, op)
 			params[i] = string.format("convctab%d(call.param%d)", ctid, i)
 		end
 	end
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (modcalllua: %s)", op.model.name))
 	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
 	fb.upv.cast = ffi.cast
 	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
@@ -960,7 +965,7 @@ local function modcallffi(fb, op)
 			table.insert(params, string.format("call.return%d", i))
 		end
 	end
-	local f = upval(fb, op.f)
+	local f = upval(fb, checknil(op.f, "function is nil (modcallffi: %s)", op.model.name))
 	local ct = upval(fb, ffi.typeof("$*", sigct(op.model)))
 	fb.upv.cast = ffi.cast
 	fb.src:putf("local call = cast(%s, S.edges)\n", ct)
