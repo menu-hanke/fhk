@@ -14,6 +14,7 @@ int Py_IsInitialized();
 void Py_InitializeEx(int);
 void Py_Finalize();
 void Py_DecRef(PyObject *);
+void Py_IncRef(PyObject *);
 PyObject *PyErr_Occurred();
 void PyErr_Fetch(PyObject **, PyObject **, PyObject **);
 PyObject *PyObject_Str(PyObject *);
@@ -52,36 +53,60 @@ local Py_file_input = 257
 -- that should go here as a *python* function.
 local py_src = [[
 from collections.abc import Iterable, Sequence
+from functools import wraps
 from inspect import Signature, signature
-from typing import Tuple, get_origin, get_args
-def _gettype(ann):
-	if ann is not Signature.empty:
-		orig = get_origin(ann)
-		if orig is None:
-			return ann, None
-		args = get_args(ann)
-		if len(args) == 1:
-			return args[0], orig
+from typing import Tuple, Union, get_origin, get_args
+def _optional(t):
+	@wraps(t)
+	def w(x):
+		try:
+			return t(x)
+		except:
+			return None
+	return w
+def _getparam(ann):
+	if ann is Signature.empty:
+		return None, None
+	if ann == memoryview:
+		return None, memoryview
+	orig = get_origin(ann)
+	if orig is None:
+		return ann, None
+	args = get_args(ann)
+	if orig == Union:
+		if len(args) == 2:
+			none = 0 if args[0] == type(None) else (1 if args[1] == type(None) else None)
+			if none is not None:
+				t, v = _getparam(args[none^1])
+				if t is not None:
+					t = _optional(t)
+				return t, v
+		return None, None
+	if orig in (Iterable, Sequence):
+		orig = memoryview
+	if len(args) == 1:
+		return args[0], orig
 	return None, None
-def _normalize_paramvec(ann):
-	if ann in (Iterable, Sequence):
-		return memoryview
-	return ann
+def _isvec(ann):
+	if ann is Signature.empty:
+		return None
+	orig = get_origin(ann)
+	if orig is not None and len(get_args(ann)) == 1:
+		return orig
 def sig(f, np, nr):
-	pt, pv, rt, rv = [None]*np, [None]*np, [None]*nr, [None]*nr
+	pt, pv, rv = [None]*np, [None]*np, [None]*nr
 	s = signature(f)
 	for i,p in zip(range(np), s.parameters.values()):
-		pt[i], pv[i] = _gettype(p.annotation)
-		pv[i] = _normalize_paramvec(pv[i])
+		pt[i], pv[i] = _getparam(p.annotation)
 	ra = s.return_annotation
 	if ra is not Signature.empty:
 		if nr > 1:
-			if get_origin(ra) in (tuple, Tuple):
+			if issubclass(get_origin(ra), Tuple):
 				for i,t in zip(range(nr), get_args(ra)):
-					rt[i], rv[i] = _gettype(t)
+					rv[i] = _isvec(t)
 		else:
-			rt[0], rv[0] = _gettype(ra)
-	return tuple(pt), tuple(pv), tuple(rt), tuple(rv)
+			rv[0] = _isvec(ra)
+	return tuple(pt), tuple(pv), tuple(rv)
 ]]
 
 -- init code to run when we are the ones setting up the python interpreter.
@@ -104,6 +129,14 @@ local function gco(o)
 	if o ~= nil then
 		return ffi.gc(o, C.Py_DecRef)
 	end
+end
+
+local function gcoref(o)
+	o = gco(o)
+	if o then
+		C.Py_IncRef(o)
+	end
+	return o
 end
 
 local function raise(err)
@@ -138,6 +171,10 @@ end
 
 local function gcocheck(o, err)
 	return ocheck(gco(o), err)
+end
+
+local function gcocheckref(o, err)
+	return ocheck(gcoref(o), err)
 end
 
 -- intern list of argument tuples.
@@ -182,9 +219,8 @@ local function infersig(pf, model)
 	local info = gcocheck(C.PyObject_Call(pysig, args, nil))
 	local pt = ocheck(C.PyTuple_GetItem(info, 0))
 	local pv = ocheck(C.PyTuple_GetItem(info, 1))
-	local rt = ocheck(C.PyTuple_GetItem(info, 2))
-	local rv = ocheck(C.PyTuple_GetItem(info, 3))
-	return pt, pv, rt, rv
+	local rv = ocheck(C.PyTuple_GetItem(info, 2))
+	return pt, pv, rv
 end
 
 local builtins = (function()
@@ -274,7 +310,7 @@ local function modcallpy(fb, op)
 	fb.upv.f = op.f
 	local uC = upvalC(fb)
 	local sigp, sigr = driver.sigrank(op.model)
-	local pt, pv, _, rv = infersig(op.f, op.model)
+	local pt, pv, rv = infersig(op.f, op.model)
 	if #op.model.params > 0 then
 		fb.upv.args = tuple(#op.model.params)
 		for i,p in ipairs(op.model.params) do
@@ -289,7 +325,7 @@ local function modcallpy(fb, op)
 					i-1, i-1, ffi.sizeof(p.var.ctype), fmt
 				)
 				if C.Py_IsNone(v) == 0 and v ~= builtins.memoryview then
-					local vec = driver.upval(fb, v)
+					local vec = driver.upval(fb, gcocheckref(v))
 					fb.upv.call1 = call1
 					-- no need to decref: call1 eats the reference.
 					fb.src:putf("x = ocheck(call1(%s, x))\n", vec)
@@ -303,7 +339,7 @@ local function modcallpy(fb, op)
 				local t = ocheck(C.PyTuple_GetItem(pt, i-1))
 				local kind = ctkind[ctid] or ctcallerr(p.var.ctype)
 				if t ~= builtins[kind] and C.Py_IsNone(t) == 0 then
-					local tconv = driver.upval(fb, t)
+					local tconv = driver.upval(fb, gcocheckref(t))
 					fb.upv.call1 = call1
 					-- no need to decref: call1 eats the reference
 					fb.src:putf("x = ocheck(call1(%s, x))\n", tconv)
@@ -393,18 +429,19 @@ end
 --------------------------------------------------------------------------------
 
 return {
-	load       = py_load,
-	_finalizer = finalizer,
-	-- for fhk_py
-	raise      = raise,
-	echeck3    = echeck3,
-	ocheck     = ocheck,
-	gcocheck   = gcocheck,
-	tuple      = tuple,
-	memoryview = memoryview,
-	builtins   = builtins,
-	ctkind     = ctkind,
-	ctconvf    = ctconvf,
-	pyfmt      = pyfmt,
-	call1      = call1
+	load        = py_load,
+	_finalizer  = finalizer,
+	-- for fhk_pyx
+	raise       = raise,
+	echeck3     = echeck3,
+	ocheck      = ocheck,
+	gcocheck    = gcocheck,
+	gcocheckref = gcocheckref,
+	tuple       = tuple,
+	memoryview  = memoryview,
+	builtins    = builtins,
+	ctkind      = ctkind,
+	ctconvf     = ctconvf,
+	pyfmt       = pyfmt,
+	call1       = call1
 }

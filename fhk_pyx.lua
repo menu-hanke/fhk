@@ -7,7 +7,7 @@ local lib = require "fhk_lib"
 local rules = require "fhk_rules"
 local C = require "fhk_clib"
 local Py = require "fhk_lang_Python"
-local ocheck, gcocheck, raise = Py.ocheck, Py.gcocheck, Py.raise
+local ocheck, gcocheck, gcocheckref, raise = Py.ocheck, Py.gcocheck, Py.gcocheckref, Py.raise
 
 -- cython helpers, see _ctypes.pyx
 ffi.cdef [[
@@ -19,7 +19,6 @@ fhk_subset fhk_pyx_tosubset(fhk_solver *, PyObject *);
 -- for all builds using the lua driver.
 ffi.cdef [[
 PyObject *PyDict_Items(PyObject *);
-void Py_IncRef(PyObject *);
 int PyObject_IsSubclass(PyObject *, PyObject *);
 int PyObject_IsTrue(PyObject *);
 int PyObject_SetAttr(PyObject *, PyObject *, PyObject *);
@@ -439,9 +438,7 @@ local function pyx_model(fhk, name, decl, f)
 	decl = tostr(decl)
 	local def, err = load(string.format("return {%s}", decl))
 	if not def then error(err) end
-	f = ffi.cast("PyObject *", f)
-	C.Py_IncRef(f)
-	f = gcocheck(f)
+	f = gcocheckref(ffi.cast("PyObject *", f))
 	return rules.read(fhk.state, glib.model(name, glib.env(errvisit).read(def), glib.impl.Python(f)))
 end
 

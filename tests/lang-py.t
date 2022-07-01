@@ -106,6 +106,29 @@ test_call_py_multireturn_tuple = function()
 	assert(result.b_z[0] == 1+2+3 and result.a_y[0] == 1 and result.a_y[1] == 2 and result.a_y[2] == 3)
 end
 
+test_call_py_optional = function()
+	local xs = ffi.new("int[2]", {-1, 2})
+	local decl = fhk.new(
+		fhk.group("a",
+			fhk.named("x", fhk.array(xs, fhk.c.space1(2))),
+			fhk.shape(2)
+		)
+	)
+	decl:graph(
+		fhk.g.model(
+			"a#m",
+			"x",
+			"->",
+			"y" *fhk.g.as "int",
+			fhk.g.impl.Python("models", "optional")
+		)
+	)
+	local solver = decl { "a#y" }
+	decl:ready()
+	local result = solver()
+	assert(result.a_y[0] == 123 and result.a_y[1] == 2)
+end
+
 test_call_py_error = function()
 	local decl = fhk.new(fhk.group("a", fhk.shape(1)))
 	decl:graph(
