@@ -1,0 +1,9 @@
+*.o
+*.so
+*.a
+*.pyx.c
+*.pyx.h
+.gdb_history
+/asmdef.h
+/fhk_cdef.lua
+/loader.c

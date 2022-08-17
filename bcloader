@@ -1,0 +1,293 @@
+#!/bin/env luajit
+
+local function template(src)
+	local code = { [[
+		local _i, _f, concat = table.insert, string.format, table.concat
+		return function(X)
+			local _o = {}
+	]] }
+	for line in string.gmatch(src, "[^$\n]+") do
+		if string.sub(line, 1, 1) == "@" then
+			table.insert(code, string.sub(line, 2))
+		elseif string.match(line, "{{") then
+			local parm = {}
+			line = string.gsub(line, "%%", "%%%%")
+			local fmt = string.gsub(line, "{{.-}}", function(x)
+				-- strip leading '{{' and trailing '}}'
+				table.insert(parm, string.sub(x, 3, -3))
+				return "%s"
+			end)
+			table.insert(code, string.format("_i(_o, _f([[%s]], %s))", fmt,
+				table.concat(parm, ",")))
+		else
+			table.insert(code, string.format("_i(_o, [[%s]])", line))
+		end
+	end
+	table.insert(code, [[
+			return concat(_o, "\n")
+		end
+	]])
+	return load(table.concat(code, "\n"), "=template", nil, _G)()
+end
+
+-- if we are global, then this can be either called directly or from C code
+-- if we are local, then this is always called from C code
+local bcloader_hook = template [[
+@local namecheck
+@if #X.libnames > 1 then
+@	local libnames = {}
+@	for i,name in ipairs(X.libnames) do libnames[i] = string.format("%s=true", name) end
+@	namecheck = "libnames[name]"
+local libnames = { {{table.concat(libnames, ",")}} }
+@else
+@	namecheck = string.format("name == '%s'", X.libnames[1])
+@end
+local _, fname = ...
+local ffi = require "ffi"
+ffi.cdef("int8_t luaopen_{{X.modsym}}")
+if pcall(function() return ffi.C.luaopen_{{X.modsym}} end) then
+	local ffi_C, ffi_load = ffi.C, ffi.load
+	ffi.load = function(name, global)
+		if {{namecheck}} then
+			return ffi_C
+		else
+			return ffi_load(name, global)
+		end
+	end
+elseif fname then
+	local ffi_load = ffi.load
+	ffi.load = function(name, global)
+		if {{namecheck}} then
+			name = fname()
+		end
+		return ffi_load(name, global)
+	end
+else
+	error("bcloader: can't find a way to hook `{{X.modname}}`")
+end
+@if X.chainload then
+return require '{{X.chainload}}'
+@end
+]]
+
+local bcloader_install = template [[
+table.insert(package.loaders, ...)
+]]
+
+local loader_source = template [[
+/* _GNU_SOURCE for dladdr */
+#define _GNU_SOURCE
+#include <stddef.h>
+#include <stdint.h>
+
+/*
+ * relevant lua.h+lauxlib.h definitions copied here
+ * so that luajit headers aren't required to build bcloader.
+ */
+typedef struct lua_State lua_State;
+void lua_settop(lua_State *, int);
+void lua_pushstring(lua_State *, const char *);
+void lua_pushcclosure(lua_State *, void *, int);
+void lua_pushlstring(lua_State *, const char *, size_t);
+const char *lua_pushfstring(lua_State *, const char *, ...);
+int lua_remove(lua_State *, int);
+void lua_call(lua_State *, int, int);
+const char *luaL_gsub(lua_State *, const char *, const char *, const char *);
+const char *luaL_checklstring(lua_State *, int, size_t *);
+int luaL_loadbuffer(lua_State *, const char *, size_t, const char *);
+int luaL_error(lua_State *, const char *, ...);
+
+const char luaJIT_BC_{{X.modsym}}[] = { {{X.bc_hook}} };
+
+@if X.loader then
+static const char BC_INSTALL[] = { {{X.bc_install}} };
+
+static const char *ls_bcsym(lua_State *L, const char *module) {
+	const char *sym;
+	sym = luaL_gsub(L, module, ".", "_");
+	sym = lua_pushfstring(L, "luaJIT_BC_%s", sym);
+	lua_remove(L, -2);
+	return sym;
+}
+@end
+
+int luaopen_{{X.modsym}}(lua_State *L);
+
+@if X.oldbc then
+#define BCLEN 0x7fffff00
+@else
+#define BCLEN (~(size_t)0)
+@end
+
+static void ls_loadbc(lua_State *L, const char *buf, const char *name) {
+	if(luaL_loadbuffer(L, buf, BCLEN, name))
+		luaL_error(L, "failed to load embedded bytecode: %s", name);
+}
+
+@if X.dlopen then
+#include <dlfcn.h>
+
+static int bclua_libname(lua_State *L) {
+	Dl_info info;
+	if(dladdr(luaopen_{{X.modsym}}, &info) == 0)
+		luaL_error(L, "dladdr() failed");
+	lua_pushstring(L, info.dli_fname);
+	return 1;
+}
+
+@elseif X.windows then
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+extern IMAGE_DOS_HEADER __ImageBase;
+
+static int bclua_libname(lua_State *L) {
+	char buf[256];
+	if(!GetModuleFileName((HINSTANCE) &__ImageBase, buf, sizeof(buf)))
+		luaL_error(L, "GetModuleFileName() failed: %d", GetLastError());
+	lua_pushstring(L, buf);
+	return 1;
+}
+@end
+
+@if X.loader then
+static int bclua_loader(lua_State *L) {
+	const char *module = luaL_checklstring(L, 1, NULL);
+	const char *sym = ls_bcsym(L, module);
+@if X.dlopen then
+	void *bcode = dlsym(RTLD_DEFAULT, sym);
+@elseif X.windows then
+	void *bcode = GetProcAddress((HINSTANCE)&__ImageBase, sym);
+@end
+	lua_settop(L, -2); /* pop sym */
+	if(bcode) {
+		ls_loadbc(L, bcode, module);
+		return 1;
+	} else {
+		return 0;
+	}
+}
+@end
+
+int luaopen_{{X.modsym}}(lua_State *L) {
+@if X.loader then
+	ls_loadbc(L, BC_INSTALL, "=bcloader/install");
+	lua_pushcclosure(L, bclua_loader, 0);
+	lua_call(L, 1, 0);
+@end
+	ls_loadbc(L, luaJIT_BC_{{X.modsym}}, "{{X.modname}}");
+	lua_pushlstring(L, "{{X.modname}}", {{#X.modname}});
+	lua_pushcclosure(L, bclua_libname, 0);
+	lua_call(L, 2, 1);
+	return 1;
+}
+]]
+
+local function dumparray(bc)
+	local out = {}
+	for i=1, #bc do
+		out[i] = tostring(string.byte(bc, i))
+	end
+	return table.concat(out, ",")
+end
+
+--------------------------------------------------------------------------------
+
+local function help()
+	io.stderr:write(string.format([[
+usage: bcloader [options]
+	-n modname     lua module name
+	-l libname     ffi library name to override (default: modname)
+	-o os          override os (default: %s)
+	-c modname     chainload module `modname`
+	-L             install loader (required if you want to load modules other than `modname`)
+	-B             old luaL_loadbuffer workaround (use LJ_MAXMEM for size parameter)
+	-v             dump generated code in stderr
+	-f             print linker flags and exit
+]],
+	jit.os
+	))
+	os.exit(1)
+end
+
+local function consume(argv, i)
+	local arg = argv[i]
+	if not arg then help() end
+	return arg
+end
+
+local function args(argv)
+	local out = { libnames={}, os=jit.os }
+	local i = 1
+	while i <= #argv do
+		if argv[i] == "-n" then
+			out.modname, i = consume(argv, i+1), i+2
+		elseif argv[i] == "-l" then
+			table.insert(out.libnames, consume(argv, i+1))
+			i = i+2
+		elseif argv[i] == "-o" then
+			out.os, i = consume(argv, i+1), i+2
+		elseif argv[i] == "-c" then
+			out.chainload, i = consume(argv, i+1), i+2
+		elseif argv[i] == "-L" then
+			out.loader, i = true, i+1
+		elseif argv[i] == "-B" then
+			out.oldbc, i = true, i+1
+		elseif argv[i] == "-v" then
+			out.verbose, i = true, i+1
+		elseif argv[i] == "-f" then
+			out.ldflags, i = true, i+1
+		else
+			help()
+		end
+	end
+	return out
+end
+
+local function ldflags(argv)
+	if argv.dlopen then
+		print("-ldl")
+	end
+end
+
+local function checkargs(argv)
+	argv.os = argv.os:lower()
+	argv.windows = argv.os == "windows"
+	argv.dlopen = not argv.windows
+	if argv.modname then
+		argv.modsym = string.gsub(argv.modname, "%.", "_")
+		if #argv.libnames == 0 then
+			table.insert(argv.libnames, string.match(argv.modname, "^[^%.]+"))
+		end
+	elseif not argv.ldflags then
+		io.stderr:write("bcloader: missing modname (-n)\n")
+		help()
+	end
+end
+
+local function vout(src, name)
+	io.stderr:write(">>>", name, "\n")
+	io.stderr:write(src, "\n")
+end
+
+local function main(argv)
+	argv = args(argv)
+	checkargs(argv)
+	if argv.ldflags then
+		ldflags(argv)
+		return
+	end
+	local hook = bcloader_hook(argv)
+	local install = bcloader_install(argv)
+	argv.bc_hook = dumparray(string.dump(load(hook), true))
+	argv.bc_install = dumparray(string.dump(load(install), true))
+	local source = loader_source(argv)
+	if argv.verbose then
+		vout(hook, "bcloader/hook")
+		vout(install, "bcloader/install")
+		vout(source, "bcloader/c")
+	end
+	print(source)
+end
+
+main({...})

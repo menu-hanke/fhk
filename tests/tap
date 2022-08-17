@@ -1,0 +1,19 @@
+#!/bin/sh
+# asan must be the first preloaded library.
+# prepend it if fhk.so was compiled with asan.
+libasan=$(ldd ../fhk.so | grep -oP '/.*libasan[^\s]+')
+if [[ -n "${libasan}" ]];
+then
+	preload="${libasan}:${preload}"
+fi
+tap="luajit tap.lua -C ../?.so -P ../?.lua $@"
+# run with gdb?
+for a in "$@"
+do
+	if [[ "$a" == "--gdb" ]];
+	then
+		tap="gdb --args ${tap}"
+	fi
+done
+#echo LD_PRELOAD=${preload} ${tap}
+LD_PRELOAD=${preload} ${tap}

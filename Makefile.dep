@@ -1,0 +1,9 @@
+build.o: build.c build.h def.h trace.h conf.h debug.h solve.h target.h
+debug.o: debug.c build.h def.h trace.h conf.h debug.h solve.h target.h
+solve.o: solve.c conf.h debug.h build.h def.h trace.h solve.h target.h \
+ sub.h swap.h
+sub.o: sub.c debug.h build.h def.h trace.h conf.h solve.h target.h sub.h \
+ swap.h
+swap_x64.o: swap_x64.S asmdef.h target.h
+fhk_cdef.lua: fhk_cdef.lua.h api.h build.h def.h trace.h conf.h solve.h \
+ target.h errmsg.h
