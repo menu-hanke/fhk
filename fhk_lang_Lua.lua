@@ -109,10 +109,6 @@ local convtabc_func = cache(function()
 end)
 
 -- modcall lua function w/ lua table conversion
---     f            lua function
---     mode?        override mode
---
--- MODCALL r1, r2, .., rN <- f(p1, p2, ..., pM)
 local function modcalllua(J, o, f)
 	local params, returns, conv = {}, {}, {}
 	local mode = driver.overridemode(driver.getmode(o), o.impl.signature)
@@ -148,10 +144,6 @@ local function modcalllua(J, o, f)
 end
 
 -- modcall lua function w/ ffi structs
---     f            lua function
---     mode?        override mode
---
--- MODCALL rs1, rs2, .., rsN <- f(p1, p2, ..., pM, rv1, rv2, ..., rvL)
 local function modcallffi(J, o, f)
 	local params, returns = {}, {}
 	local mode = driver.overridemode(driver.getmode(o), o.impl.signature):gmatch(".")

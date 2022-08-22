@@ -93,7 +93,7 @@ LOADER_O    = loader.o
 PYX_O       = _ctypes.pyx.o
 ifeq (y,$(LINKLUA))
 XLUACORE_O  = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o
-XLUALANG_O  = fhk_lang_Expr.lua.o fhk_lang_Lua.lua.o
+XLUALANG_O  = fhk_lang_Expr.lua.o fhk_lang_Lua.lua.o fhk_lang_Python.lua.o
 XLUALIB_O   = fhk_api.lua.o reflect.lua.o
 XLUAPY_O    = fhk_pyx.lua.o
 endif

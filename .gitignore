@@ -7,3 +7,4 @@
 /asmdef.h
 /fhk_cdef.lua
 /loader.c
+__pycache__
