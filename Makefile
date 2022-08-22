@@ -79,7 +79,7 @@ FHKCFLAGS   = $(XCFLAGS) $(CFLAGS)
 FHKLDFLAGS  = $(XLDFLAGS) $(LDFLAGS)
 
 ifneq (,$(TRACE))
-XCFLAGS    += -DFHK_TRACE=$(TRACE)
+CCDEF      += -DFHK_TRACE=$(TRACE)
 endif
 
 ifeq (y,$(SANITIZE))
