@@ -23,18 +23,9 @@ local function sum(...)
 	return s
 end
 
-local function vars(s)
-	local names = {}
-	for n in s:gmatch("[^%s]+") do
-		table.insert(names, n)
-	end
-	return getfenv(2).var(names)
-end
-
 ---- algorithm tests ----------------------------------------
 
 test_solve_simple = t.g(function()
-	vars "x r" { ctype "double" }
 	var "x" { const(123) }
 	derive "r" {
 		params "x",
@@ -45,7 +36,6 @@ test_solve_simple = t.g(function()
 end)
 
 test_solve_chain = t.g(function()
-	vars "x y r" { ctype "double" }
 	derive "x" { const(1) }
 	derive "y" { const(2) }
 	derive "r" {
@@ -57,7 +47,6 @@ test_solve_chain = t.g(function()
 end)
 
 test_solve_given_checks = t.g(function()
-	vars "x+ x- yok yfail" { ctype "double" }
 	var "x+" { const(1) }
 	var "x-" { const(-1) }
 	derive "yok" {
@@ -75,14 +64,14 @@ end)
 
 test_solve_given_kmapg = t.g(function()
 	var "m" { const(fhk.space1(5)) }
-	var "m#x" { ctype "double", id }
+	var "m#x" { id }
 	----------------------------------------
 	solution { ["m#x"] = {0, 1, 2, 3, 4} }
 end)
 
 test_solve_given_kmapd = t.g(function()
 	derive "m" { const(fhk.space1(5)) }
-	var "m#x" { ctype "double", id }
+	var "m#x" { id }
 	----------------------------------------
 	solution { ["m#x"] = {0, 1, 2, 3, 4} }
 end)
@@ -90,8 +79,7 @@ end)
 test_solve_chain_imapg = t.g(function()
 	var "g" { const(fhk.space1(3)) }
 	var "g#map" { function(j) return (j+1)%3 end, mode "s" }
-	var "g#x" { ctype "double", id }
-	var "g#y" { ctype "double" }
+	var "g#x" { id }
 	derive "g#y" {
 		params "x ~map",
 		id
@@ -101,7 +89,6 @@ test_solve_chain_imapg = t.g(function()
 end)
 
 test_solve_pruned_computed_var = t.g(function()
-	var "x" { ctype "double" }
 	model () { returns "x", const(1), cost {k=1, c=1} }
 	model () { returns "x", const(2), cost {k=2, c=1} }
 	----------------------------------------
@@ -109,8 +96,7 @@ test_solve_pruned_computed_var = t.g(function()
 end)
 
 test_solve_computed_var_chain = t.g(function()
-	var "x" { ctype "double", const(1) }
-	var "y" { ctype "double" }
+	var "x" { const(1) }
 	derive "y" {
 		check "x" *ge(0),
 		const(1)
@@ -124,8 +110,7 @@ test_solve_computed_var_chain = t.g(function()
 end)
 
 test_solve_var_heap = t.g(function()
-	var "x" { ctype "uint8_t", const(3) }
-	var "y" { ctype "double" }
+	var "x" { const(3) }
 	model "k1" {
 		returns "y",
 		check "x" *is { 1 },
@@ -155,8 +140,7 @@ test_solve_var_heap = t.g(function()
 end)
 
 test_solve_var_heap_reenter = t.g(function()
-	var "w" { ctype "uint8_t", const(1) }
-	vars "x1 x2 x3 y" { ctype "double" }
+	var "w" { const(1) }
 	derive "x1" {
 		check "w" *is { 2 } *penalty(100),
 		const(1)
@@ -193,7 +177,6 @@ test_solve_var_heap_reenter = t.g(function()
 end)
 
 test_solve_bound_retry = t.g(function()
-	vars "a x y xp xq yp yq" { ctype "double" }
 	derive "a" {
 		params "x",
 		const(1),
@@ -260,8 +243,7 @@ test_solve_collect_given_params = t.g(function()
 	var "interval" { const(fhk.tosubset{1,2,3}) }
 	var "complex" { const(fhk.tosubset{1,2,4,5}) }
 	var "g" { const(fhk.space1(10)) }
-	var "g#x" { ctype "double", id }
-	var "y" { ctype "double" }
+	var "g#x" { id }
 	derive "y" {
 		params [[
 			g#x ~interval
@@ -279,7 +261,6 @@ test_solve_collect_computed_params = t.g(function()
 	var "interval" { const(fhk.tosubset{3,4,5,6}) }
 	var "complex" { const(fhk.tosubset{0,1,5,8,9}) }
 	var "g" { const(fhk.space1(10)) }
-	vars "g#x y" { ctype "double" }
 	model "getx" {
 		returns "g#x ~*",
 		function()
@@ -300,7 +281,6 @@ test_solve_collect_computed_params = t.g(function()
 end)
 
 test_solve_overwrite_speculate = t.g(function()
-	vars "x y" { ctype "double" }
 	model () {
 		cost { k=100, c=1 },
 		returns "x y",
@@ -318,7 +298,6 @@ end)
 test_solve_multi_instance_candidate = t.g(function()
 	var "g" { const(fhk.space1(3)) }
 	var "g#x" { ctype "uint8_t", id }
-	var "y" { ctype "double" }
 	model "g#m" {
 		params "x",
 		returns "global#y",
@@ -330,7 +309,6 @@ test_solve_multi_instance_candidate = t.g(function()
 end)
 
 test_solve_tolerance = t.g(function()
-	vars "x y" { ctype "double" }
 	derive "x" {
 		cost {k=1/18, c=1},
 		const(0)
@@ -354,7 +332,6 @@ end)
 test_solve_writeback_interval = t.g(function()
 	var "g" { const(fhk.space1(3)) }
 	var "const1" { const(1), mode "s" }
-	vars "x z g#y" { ctype "double" }
 	model "->y1" {
 		returns "g#y ~const1",
 		returns "z",
@@ -377,7 +354,6 @@ end)
 test_solve_writeback_complex = t.g(function()
 	var "complex" { const(fhk.tosubset{0,1, 3,4,5, 8, 10}) }
 	var "g" { const(fhk.space1(11)) }
-	var "g#x" { ctype "double" }
 	model "->x.complex" {
 		returns "g#x ~complex",
 		const({-1, -2, -3, -4, -5, -6, -7})
@@ -392,7 +368,6 @@ test_solve_writeback_complex = t.g(function()
 end)
 
 test_solve_unused_return = t.g(function()
-	vars "x y" { ctype "double" }
 	model () {
 		returns "x y",
 		const(1, 2)
@@ -404,9 +379,8 @@ end)
 ---- "large" values ----------------------------------------
 
 test_solve_large_graph = t.g(function()
-	var "v0" { ctype "double", const(0) }
+	var "v0" { const(0) }
 	for i=1, 1000 do
-		var ("v"..i) { ctype "double" }
 		derive ("v"..i) {
 			params ("v"..(i-1)),
 			function(x) return x+1 end
@@ -419,7 +393,6 @@ end)
 test_solve_large_bitmaps = t.g(function()
 	var "g" { const(fhk.space1(10000)) }
 	var "g#b" { ctype "uint8_t", function(j) return j%4 end }
-	vars "s g#x" { ctype "double" }
 	model () {
 		returns "g#x",
 		cost {k=100, c=1},
@@ -438,25 +411,25 @@ test_solve_large_bitmaps = t.g(function()
 end)
 
 test_solve_stress_candidates = t.g(function()
-	var "k" { ctype "double", const(6.5) }
+	var "k" { const(6.5) }
 	for i=1, 10 do
-		derive (("w"..i) *as "double") {
+		derive ("w"..i) {
 			const(i),
 			check "k" *ge(i),
 			cost { k=i/10, c=1 }
 		}
-		derive (("x"..i) *as "double") {
+		derive ("x"..i) {
 			const(i),
 			check "k" *le(i),
 			cost { k=i^2, c=1 }
 		}
-		derive (("y"..i) *as "double") {
+		derive ("y"..i) {
 			const(i),
 			check "k" *le(i),
 			cost { k=100-10*i, c=1 }
 		}
 		for j=1, 10 do
-			derive ("z" *as "double") {
+			derive "z" {
 				params { "x"..i, "y"..i, "w"..j },
 				function(x, y, w) return 100*x + 10*y + w end
 			}
@@ -470,10 +443,10 @@ end)
 
 test_solve_large_bound_heap = t.g(function()
 	for i=1, 1000 do
-		var ("x"..i) { ctype "double", function() return i end }
+		var ("x"..i) { function() return i end }
 	end
 	for j=1, 100 do
-		derive (("y"..j) *as "double") {
+		derive ("y"..j) {
 			params {
 				"x"..((j-1)*10)+1,
 				"x"..((j-1)*10)+2,
@@ -490,7 +463,7 @@ test_solve_large_bound_heap = t.g(function()
 		}
 	end
 	for k=1, 10 do
-		derive (("z"..k) *as "double") {
+		derive ("z"..k) {
 			params {
 				"y"..((k-1)*10)+1,
 				"y"..((k-1)*10)+2,
@@ -506,7 +479,7 @@ test_solve_large_bound_heap = t.g(function()
 			sum
 		}
 	end
-	derive ("w" *as "double") {
+	derive "w" {
 		params "z1 z2 z3 z4 z5 z6 z7 z8 z9 z10",
 		sum
 	}
@@ -517,7 +490,6 @@ end)
 ---- edge cases ----------------------------------------
 
 test_solve_bitmap63_64_65 = t.g(function()
-	vars "s63 s64 s65 g63#x g64#x g65#x" { ctype "double" }
 	for i=63, 65 do
 		var ("g"..i) { function() return fhk.space1(i) end }
 		var ("g"..i.."#b") { ctype "uint8_t", function(j) return j%2 end }
@@ -542,9 +514,8 @@ end)
 ---- bugs found in the wild ----------------------------------------
 
 test_solve_update_exit_cost = t.g(function()
-	var "k1" { ctype "double", const(-1) }
-	var "k2" { ctype "double", const(-1) }
-	vars "x y" { ctype "double" }
+	var "k1" { const(-1) }
+	var "k2" {  const(-1) }
 	model () {
 		check "k1" *ge(0),
 		returns "x",

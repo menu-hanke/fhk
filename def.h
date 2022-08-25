@@ -87,17 +87,17 @@ enum {
 /* ---- predicates ---------------------------------------- */
 
 /* (operator, operand, sym) */
-#define FHK_PREDEF(_)            \
-	_(f32le,   float,     "<=")  \
-	_(f32ge,   float,     ">=")  \
-	_(f64le,   double,    "<=")  \
-	_(f64ge,   double,    ">=")  \
-	_(isn,     uint64_t,  "isn")
+#define FHK_PREDEF(_)   \
+	_(f32le,   float)   \
+	_(f32ge,   float)   \
+	_(f64le,   double)  \
+	_(f64ge,   double)  \
+	_(isn,     uint64_t)
 
 #define PRED(operator)   FHK_PRED_##operator
 
 enum {
-#define FHK_DEFREDICATE(operator, operand, sym) PRED(operator),
+#define FHK_DEFREDICATE(operator, operand) PRED(operator),
 	FHK_PREDEF(FHK_DEFREDICATE)
 #undef FHK_DEFREDICATE
 	FHK_PRED__num,
@@ -107,9 +107,9 @@ enum {
 #define FHK_PRED__unset  0xff
 
 typedef union fhk_operand {
-#define FHK_DEFOPERAND(operator, operand, sym) operand operator;
-	FHK_PREDEF(FHK_DEFOPERAND)
-#undef FHK_DEFOPERAND
+	float f32;
+	double f64;
+	uint64_t u64;
 } fhk_operand;
 
 /* ---- debug symbols ---------------------------------------- */

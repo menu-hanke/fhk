@@ -145,12 +145,12 @@ static void eval_predicate(fhk_predicate *pre, fhk_bmword *F, void *vp, size_t s
 
 #if FHK_x64
 	static const void *prep[] = {
-#define PREPLABEL(operator, operand, sym) &&prep_##operator,
+#define PREPLABEL(operator, operand) &&prep_##operator,
 		FHK_PREDEF(PREPLABEL)
 #undef PREPLABEL
 	};
 	static const void *op[] = {
-#define OPLABEL(operator, operand, sym) &&operator,
+#define OPLABEL(operator, operand) &&operator,
 		FHK_PREDEF(OPLABEL)
 #undef OPLABEL
 	};

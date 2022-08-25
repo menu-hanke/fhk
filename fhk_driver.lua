@@ -145,8 +145,11 @@ local function ctids(x)
 	if type(x) == "table" then
 		if x.typeid then
 			return ctids(x.typeid)
+		elseif x[0] == true then
+			-- already sorted.
+			return x
 		else
-			local out = {}
+			local out = { [0]=true }
 			for i,ct in ipairs(x) do
 				out[i] = cttoid(ct)
 			end
@@ -159,7 +162,7 @@ end
 
 local function ctintersect(A, B)
 	if not (A and B) then return A or B end
-	local C = {}
+	local C = { [0]=true }
 	local i, j = 1, 1
 	while i <= #A and j <= #B do
 		local a, b = A[i], B[j]
@@ -999,7 +1002,116 @@ local function graph_mark(graph, obj)
 	checke(graph, graph.M:mark(obj.handle))
 end
 
----- predicates ----------------------------------------
+---- layout ----------------------------------------
+
+-- Q: why not use `tonumber(hex, 16)`?
+-- A: someone at microsoft thought it would be funny to make `long` 4 bytes.
+--    luajit uses `strtoul` to parse the number (for bases other than 10)
+--    so now we have a situation where `tonumber` won't work on windows for
+--    numbers that don't fit in 4 bytes, *unless the base is 10*.
+--    base-10 is special-cased with a custom function that handles them just fine.
+local function cdataptr(cdata)
+	local hex = string.format("%p", cdata):sub(3)
+	local lo = tonumber(hex:sub(-8), 16)
+	local hi = tonumber(hex:sub(1, -9), 16) or 0
+	return ffi.cast("intptr_t", lo) + ffi.cast("intptr_t", hi)*(2^32)
+end
+
+-- XXX: this is a hack that depends on LuaJIT internals.
+-- basically we create a dummy cdata and modify the internal ctypeid
+-- to create a counterfeit ctype reference.
+-- obviously don't call this with an invalid ctype id, terrible things will happen.
+local function ctfromid(id)
+	-- it doesn't matter what type this holds, we will overwrite it
+	local dummy = ffi.typeof("void")
+
+	-- very illegal stuff happens here
+	local cdataptr = ffi.cast("uint32_t *", cdataptr(dummy))
+	cdataptr[0] = id
+
+	-- dummy now refers to our ctype!
+	return dummy
+end
+jit.off(ctfromid) -- obviously
+
+local ctpref = {
+	[cttoid "double"]  = 1, [cttoid "float"]    = 2,
+	[cttoid "int8_t"]  = 3, [cttoid "uint8_t"]  = 4,
+	[cttoid "int16_t"] = 5, [cttoid "uint16_t"] = 6,
+	[cttoid "int32_t"] = 7, [cttoid "uint32_t"] = 8,
+	[cttoid "int64_t"] = 9, [cttoid "uint64_t"] = 10,
+	[cttoid "bool"]    = 11
+}
+local function selectctype(cts)
+	if type(cts) == "table" then
+		-- reflect ctype: unique choice
+		if cts.typeid then return ctfromid(cts.typeid) end
+		-- otherwise: pick the preferred one
+		local ctid, pref = nil, math.huge
+		for _,id in ipairs(cts) do
+			local p = ctpref[id]
+			if p and p < pref then
+				ctid, pref = id, p
+			end
+		end
+		ctid = ctid or cts[1]
+		return ctid and ctfromid(ctid)
+	elseif cts then
+		-- unique choice: string/cdata/typeid
+		return ctfromid(cttoid(cts))
+	else
+		-- cts=nil, ie. all types are possible.
+		-- default to double.
+		return ffi.typeof "double"
+	end
+end
+
+local function hole(name)
+	return function()
+		error(string.format("missing jump table entry: %s", name))
+	end
+end
+
+local function invalid()
+	error("invalid jump table entry")
+end
+
+local function ok()
+	-- nothing to do here. we are done.
+end
+
+local function graph_patchrhs(graph, x)
+	if type(x) == "string" then
+		return graph.label[x] or error(string.format("missing label reference: %s", x))
+	end
+	if type(x) == "table" then
+		local tab = {}
+		for i,v in ipairs(x) do
+			tab[i] = graph_patchrhs(graph, v)
+		end
+		return tab
+	end
+	return x
+end
+
+local ctfp = { [0]=true, cttoid "float", cttoid "double" }
+table.sort(ctfp)
+local ctint = {
+	[0]=true,
+	cttoid "int8_t",  cttoid "uint8_t",
+	cttoid "int16_t", cttoid "uint16_t",
+	cttoid "int32_t", cttoid "uint32_t",
+	cttoid "int64_t", cttoid "uint64_t"
+}
+table.sort(ctint)
+local function pnum(predicate) return cdef.predicate[predicate] end
+local predcts = {
+	[">"] = ctfp, [">="] = ctfp, ["<"] = ctfp, ["<="] = ctfp,
+	is = ctint, isn = ctint,
+	[pnum "f32le"] = "float",  [pnum "f32ge"] = "float",
+	[pnum "f64le"] = "double", [pnum "f64ge"] = "double",
+	[pnum "isn"] = ctint
+}
 
 local nextafter = (function()
 	local nextafter, nextafterf
@@ -1039,22 +1151,6 @@ local function mask(x)
 	end
 end
 
-local fp32 = {[cttoid "float"] = true}
-local fp64 = {[cttoid "double"] = true}
-local int = {
-	[cttoid "int8_t"]  = true, [cttoid "uint8_t"]  = true,
-	[cttoid "int16_t"] = true, [cttoid "uint16_t"] = true,
-	[cttoid "int32_t"] = true, [cttoid "uint32_t"] = true,
-	[cttoid "int64_t"] = true, [cttoid "uint64_t"] = true
-}
-local predctid = {
-	f32le = fp32,
-	f32ge = fp32,
-	f64le = fp64,
-	f64ge = fp64,
-	isn   = int
-}
-
 local function topredicate(operator, lhs, rhs)
 	local ctid = cttoid(lhs)
 	if operator == ">" then
@@ -1066,94 +1162,17 @@ local function topredicate(operator, lhs, rhs)
 	elseif operator == "isn" then
 		rhs = mask(rhs)
 	end
+	if operator == ">=" or operator == "<=" then
+		local fp32 = ctid == cttoid "float"
+		operator = fp32 and (operator == ">=" and "f32ge" or "f32le")
+			or (operator == ">=" and "f64ge" or "f64le")
+	end
+	if type(operator) == "string" then
+		operator = cdef.predicate[operator].num
+	end
 	local crhs = ffi.new("fhk_operand[1]")
-	for name,p in pairs(cdef.predicate) do
-		if (operator == p.sym or operator == p.num) and predctid[name][ctid] then
-			crhs[0][name] = rhs
-			return p.num, crhs
-		end
-	end
-	error(string.format("invalid predicate: %s for ctype: %s", operator, lhs))
-end
-
----- layout ----------------------------------------
-
--- Q: why not use `tonumber(hex, 16)`?
--- A: someone at microsoft thought it would be funny to make `long` 4 bytes.
---    luajit uses `strtoul` to parse the number (for bases other than 10)
---    so now we have a situation where `tonumber` won't work on windows for
---    numbers that don't fit in 4 bytes, *unless the base is 10*.
---    base-10 is special-cased with a custom function that handles them just fine.
-local function cdataptr(cdata)
-	local hex = string.format("%p", cdata):sub(3)
-	local lo = tonumber(hex:sub(-8), 16)
-	local hi = tonumber(hex:sub(1, -9), 16) or 0
-	return ffi.cast("intptr_t", lo) + ffi.cast("intptr_t", hi)*(2^32)
-end
-
--- XXX: this is a hack that depends on LuaJIT internals.
--- basically we create a dummy cdata and modify the internal ctypeid
--- to create a counterfeit ctype reference.
--- obviously don't call this with an invalid ctype id, terrible things will happen.
-local function ctfromid(id)
-	-- it doesn't matter what type this holds, we will overwrite it
-	local dummy = ffi.typeof("void")
-
-	-- very illegal stuff happens here
-	local cdataptr = ffi.cast("uint32_t *", cdataptr(dummy))
-	cdataptr[0] = id
-
-	-- dummy now refers to our ctype!
-	return dummy
-end
-jit.off(ctfromid) -- obviously
-
-local function ctsstr(cts)
-	if not cts then return "<any>" end
-	local out = {}
-	for i,t in ipairs(cts) do
-		out[i] = tostring(ctfromid(t))
-	end
-	return string.format("{%s}", table.concat(out, ", "))
-end
-
-local function toctype(cts)
-	local ctid
-	if type(cts) == "table" then
-		if #cts ~= 1 then return end
-		ctid = cts[1]
-	else
-		ctid = cttoid(cts)
-	end
-	return ctid and ctfromid(ctid)
-end
-
-local function hole(name)
-	return function()
-		error(string.format("missing jump table entry: %s", name))
-	end
-end
-
-local function invalid()
-	error("invalid jump table entry")
-end
-
-local function ok()
-	-- nothing to do here. we are done.
-end
-
-local function graph_patchrhs(graph, x)
-	if type(x) == "string" then
-		return graph.label[x] or error(string.format("missing label reference: %s", x))
-	end
-	if type(x) == "table" then
-		local tab = {}
-		for i,v in ipairs(x) do
-			tab[i] = graph_patchrhs(graph, v)
-		end
-		return tab
-	end
-	return x
+	ffi.cast(ffi.typeof("$*", lhs), crhs)[0] = rhs
+	return operator, crhs
 end
 
 local function graph_typing(graph)
@@ -1171,19 +1190,23 @@ local function graph_typing(graph)
 	for h in graph.M:opairs("Trm=Vrm") do
 		setcts(graph.objs[h], subsetct)
 	end
+	-- all predicates must type according to the operator.
+	for h in graph.M:opairs("Trp=Vrp") do
+		local guard = graph.objs[h]
+		local operator = guard.predicate.operator
+		setcts(guard.lhs, predcts[operator] or error(string.format("invalid operator: '%s'", operator)))
+	end
 	-- all (non-guard) variables must now have a unique ctype.
 	for h in graph.M:opairs("Trg=Vr") do
 		local var = graph.objs[h]
-		local ctype = toctype(var.ctype)
+		local ctype = selectctype(var.ctype)
 		if not ctype then
-			error(string.format("non-unique ctype: %s: %s", desc(var), ctsstr(ctids(var.ctype))))
+			error(string.format("no possible ctype for variable '%s'", desc(var)))
 		end
 		var.ctype = ctype
 		graph.M:set_size(h, ffi.sizeof(var.ctype))
 	end
 	-- resolve predicates now that we have typing info
-	-- TODO: labels for "in" predicates.
-	-- TODO (?): this could skip already typed predicates if those are needed.
 	for h in graph.M:opairs("Trp=Vrp") do
 		local guard = graph.objs[h]
 		local predicate = guard.predicate

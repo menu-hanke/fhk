@@ -42,7 +42,7 @@ local otype = {
 }
 
 local predicate = {
-#define PREDTYPE(operator, operand, sym_) operator = {sym=sym_, num=C.PRED(operator)},
+#define PREDTYPE(operator, operand) operator = C.PRED(operator),
 	FHK_PREDEF(PREDTYPE)
 #undef PREDTYPE
 }

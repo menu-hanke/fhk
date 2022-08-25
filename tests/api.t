@@ -6,12 +6,11 @@ local ffi = require "ffi"
 function test_api_graph()
 	local g = fhk.graph(function()
 		var "x" {
-			ctype "double",
 			function() return 1 end
 		}
 		model "m" {
 			params "x",
-			returns "y" *as "double",
+			returns "y",
 			function(x) return x+1 end
 		}
 	end)
@@ -26,7 +25,7 @@ function test_api_struct_view_bound()
 		var(fhk.struct(struct))
 		model () {
 			params "x y",
-			returns "z w" *as "double",
+			returns "z w",
 			function(x, y) return y, x end
 		}
 	end)
@@ -42,7 +41,7 @@ function test_api_struct_view_unbound()
 		var(fhk.struct(ct, function(_, X) return X.struct end))
 		model () {
 			params "x y",
-			returns "z w" *as "double",
+			returns "z w",
 			function(x, y) return y, x end
 		}
 	end)
@@ -86,7 +85,7 @@ function test_api_reuse_solver()
 	local called = false
 	local graph = fhk.graph(function()
 		model () {
-			returns "x y" *as "double",
+			returns "x y",
 			function()
 				assert(not called)
 				called = true
@@ -109,7 +108,7 @@ end
 function test_api_readkey()
 	local graph = fhk.graph(function()
 		var "a" { function() return fhk.space1(4) end }
-		var "a#x" { ctype "double", function(i, X) return X.values[i] end }
+		var "a#x" { function(i, X) return X.values[i] end }
 	end)
 	local query = graph:query { "a#x", subset=fhk.key("ss"), value=fhk.key("buf") }
 	graph:prepare()
@@ -127,9 +126,9 @@ function test_api_gfile()
 	local graph = fhk.graph(
 		"example.g.lua",
 		function()
-			var "x" { ctype "double", function() return 2 end }
+			var "x" { function() return 2 end }
 			var "b" { function() return fhk.space1(4) end }
-			var "b#y" { ctype "double", function(i) return i*i end }
+			var "b#y" { function(i) return i*i end }
 			var "m" { function() return fhk.space1(4) end }
 		end
 	)
@@ -144,24 +143,24 @@ end
 
 function test_api_gcheck()
 	local graph = fhk.graph(function()
-		var "u8" { ctype "uint8_t", function() return 1 end }
-		var "f64" { ctype "double", function() return 10 end }
+		var "u8" { function() return 1 end }
+		var "f64" { function() return 10 end }
 		model () {
 			cost { k=0, c=1 },
 			check "u8" *is {4,5,6},
-			returns "x" *as "double",
+			returns "x",
 			function() return 1 end
 		}
 		model () {
 			cost { k=10, c=1 },
 			check "u8" *is {0,1,2},
 			check "f64" *ge(5),
-			returns "x" *as "double",
+			returns "x",
 			function() return 2 end
 		}
 		model () {
 			cost { k=100, c=1 },
-			returns "x" *as "double",
+			returns "x",
 			function() return 3 end
 		}
 	end)
@@ -173,11 +172,11 @@ end
 
 function test_api_label()
 	local graph = fhk.graph(function()
-		var "x" { ctype "uint8_t", function() return 1 end }
+		var "x" { function() return 1 end }
 		label { a=1, b=2 }
 		model () {
 			check "x" *is { "a", "b" },
-			returns "y" *as "double",
+			returns "y",
 			function() return 1 end
 		}
 	end)
@@ -189,8 +188,8 @@ end
 
 function test_api_derive()
 	local graph = fhk.graph(function()
-		var "x" { ctype "double", function() return 1 end }
-		derive ("y" *as "double") {
+		var "x" { function() return 1 end }
+		derive "y" {
 			params "x",
 			function(x) return x+1 end
 		}
@@ -203,9 +202,9 @@ end
 
 function test_api_skip_given_model()
 	local graph = fhk.graph(function()
-		var "x" { ctype "double", function() return 1 end }
+		var "x" { function() return 1 end }
 		model () {
-			returns "x" *as "double",
+			returns "x",
 			function() return 2 end
 		}
 	end)
@@ -219,7 +218,6 @@ function test_api_autocomplete_inverse_return()
 	local graph = fhk.graph(function()
 		var "g" { function() return fhk.space1(4) end }
 		var "m" { function() return fhk.tosubset{1,3} end }
-		var "g#x" { ctype "double" }
 		model () {
 			cost {k=100, c=1},
 			returns "g#x",
@@ -244,8 +242,8 @@ function test_api_autocomplete_inverse_explicit()
 			function(j) return (j+1)%4 end
 		}
 		var "g#i" { mode "s" }
-		var "g#x" { ctype "double", function(j) return j*j end }
-		derive ("g#y" *as "double") {
+		var "g#x" { function(j) return j*j end }
+		derive "g#y" {
 			params "x ~i",
 			function(xi) return -xi end
 		}
@@ -260,7 +258,6 @@ function test_api_autocomplete_inverse_implicit()
 	local graph = fhk.graph(function()
 		var "g" { function() return fhk.space1(3) end }
 		var "g#->global" { function() return 0 end }
-		var "g#x" { ctype "double" }
 		model "m" {
 			returns "g#x",
 			function() return {1,2,3} end
@@ -281,16 +278,15 @@ end
 
 function test_api_blacklist_missing_given()
 	local graph = fhk.graph(function()
-		var "y" { ctype "double", function() return 1 end }
-		var "z" { ctype "double" }
+		var "y" { function() return 1 end }
 		model () {
 			params "y",
-			returns "x" *as "double",
+			returns "x",
 			function(y) return y end
 		}
 		model () {
 			params "z",
-			returns "x" *as "double",
+			returns "x",
 			function(z) return z end
 		}
 	end)
@@ -302,15 +298,15 @@ end
 
 function test_api_blacklist_missing_map()
 	local graph = fhk.graph(function()
-		var "x" { ctype "double", function() return 1 end }
+		var "x" { function() return 1 end }
 		model () {
 			params "x ~missing",
-			returns "y" *as "double",
+			returns "y",
 			function(x) return x end
 		}
 		model () {
 			params "x",
-			returns "y" *as "double",
+			returns "y",
 			function(x) return -x end,
 			cost {k=100,c=1}
 		}
@@ -329,15 +325,19 @@ end
 
 function test_api_no_ctype()
 	local graph = fhk.graph(function()
-		var "x" { function() return 0 end }
+		var "x" {
+			ctype "double",
+			ctype "int",
+			function() return 0 end
+		}
 	end)
 	graph:query "x"
-	assert(fails(function() graph:prepare() end, "non%-unique ctype"))
+	assert(fails(function() graph:prepare() end, "no possible ctype"))
 end
 
 function test_api_incompatible_ctype()
 	local graph = fhk.graph(function()
-		var "x" { ctype "double", function() return 0 end }
+		var "x" { function() return 0 end }
 		model () {
 			check "x" *ge(0),
 			returns "y" *as "double",
@@ -350,15 +350,15 @@ function test_api_incompatible_ctype()
 		}
 	end)
 	graph:query "y"
-	assert(fails(function() graph:prepare() end, "non%-unique ctype"))
+	assert(fails(function() graph:prepare() end, "no possible ctype"))
 end
 
 function test_api_runtime_no_chain()
 	local graph = fhk.graph(function()
-		var "x" { ctype "double", function() return -1 end }
+		var "x" { function() return -1 end }
 		model () {
 			check "x" *ge(0),
-			returns "y" *as "double",
+			returns "y",
 			function() end
 		}
 	end)
@@ -377,5 +377,5 @@ function test_api_guard_ctype_conflict()
 		}
 	end)
 	graph:query "y"
-	assert(fails(function() graph:prepare() end, "invalid predicate"))
+	assert(fails(function() graph:prepare() end, "no possible ctype"))
 end

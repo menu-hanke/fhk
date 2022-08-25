@@ -24,7 +24,7 @@ static const uint8_t MTYPE_SIZE[FHK_MTYPE__num] = {
 
 /* predicate size table. */
 static const uint8_t PRED_SIZE[FHK_PRED__num] = {
-#define PREDSIZE(operator, operand, sym) sizeof(operand),
+#define PREDSIZE(operator, operand) sizeof(operand),
 	FHK_PREDEF(PREDSIZE)
 #undef PREDSIZE
 };
