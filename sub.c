@@ -490,8 +490,8 @@ void *fhk_getvalueD(fhk_solver *S, int idx, fhk_subset ss) {
 	for(;;) {
 		xinst inst = pkref_first(pk);
 		xinst n = pkref_size(pk);
-		tail += n*size;
 		memcpy((void*)tail, vp+inst*size, n*size);
+		tail += n*size;
 		if(!pkref_more(pk)) break;
 		pk = pkref_next(pk);
 	}
