@@ -517,18 +517,6 @@ typedef union ssbuf {
 	fhk_subset ss;
 } ssbuf;
 
-static void invert_writepk(fhk_pkref r, int32_t start, int32_t end) {
-	int32_t znum = end - start;
-	r[0] = start;
-	r[1] = start >> 8;
-	r[2] = (start >> 16) | (znum & 0xf);
-	r[3] = znum >> 4;
-	r[4] = znum >> 12;
-	// NOTE: another way is to do this write in two parts:
-	// *(uint32_t *) r = start | znum << 20;
-	// r[4] = znum >> 12;
-}
-
 static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
 	// can merge?
 	if(LIKELY(b->end == inst-1)) {
@@ -558,7 +546,7 @@ static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
 		pk = (pkbuf *) tail;
 		b->pk = pmref(b, pk);
 	}
-	invert_writepk(pk->pk+pk->used*5, pk->start, b->end);
+	pkref_write(pk->pk+pk->used*5, pk->start, b->end-pk->start);
 	pk->used++;
 	pk->start = inst;
 	b->end = inst;
@@ -611,7 +599,7 @@ void fhk_invert(fhk_mem *mem, fhk_subset *from, int fromshape, fhk_subset *to, i
 				tail -= 5*pk->used + 8;
 				fhk_pkref r = (fhk_pkref) tail;
 				memcpy(r, pk->pk, pk->used*5);
-				invert_writepk(r + pk->used*5, pk->start, b[i].end);
+				pkref_write(r + pk->used*5, pk->start, b[i].end-pk->start);
 				b[i].ss = subsetC_new(r);
 				r += 5*pk->used + 5;
 				*r++ = 0;

@@ -1168,7 +1168,7 @@ local function topredicate(operator, lhs, rhs)
 			or (operator == ">=" and "f64ge" or "f64le")
 	end
 	if type(operator) == "string" then
-		operator = cdef.predicate[operator].num
+		operator = cdef.predicate[operator]
 	end
 	local crhs = ffi.new("fhk_operand[1]")
 	ffi.cast(ffi.typeof("$*", lhs), crhs)[0] = rhs
@@ -1371,5 +1371,7 @@ return {
 	virtual      = virtual,
 	newimpl      = newimpl,
 	impl         = impl,
+	int          = ctint,
+	fp           = ctfp,
 	graph        = graph
 }

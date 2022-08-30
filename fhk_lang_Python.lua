@@ -228,7 +228,7 @@ local builtins = (function()
 	}
 end)()
 
-local ctkind = {}
+local ctkindtab = {}
 for k,v in pairs {
 	bool    = "bool",
 	float   = "float", double   = "float",
@@ -237,10 +237,14 @@ for k,v in pairs {
 	int32_t = "int",   uint32_t = "int",
 	int64_t = "int",   uint64_t = "int",
 } do
-	ctkind[tonumber(ffi.typeof(k))] = v
+	ctkindtab[tonumber(ffi.typeof(k))] = v
 end
 
-local ctconvf = {}
+local function ctkind(ctype)
+	return ctkindtab[tonumber(ctype)] or error(string.format("non-primitive ctype: %s", ctype))
+end
+
+local ctconvtab = {}
 for k,v in pairs {
 	bool     = "PyBool_FromLong",
 	float    = "PyFloat_FromDouble", double   = "PyFloat_FromDouble",
@@ -251,12 +255,16 @@ for k,v in pairs {
 	int64_t  = ffi.sizeof("long") > 4 and "PyLong_FromLong" or "PyLong_FromSsize_t",
 	uint64_t = "PyLong_FromSize_t",
 } do
-	ctconvf[tonumber(ffi.typeof(k))] = v
+	ctconvtab[tonumber(ffi.typeof(k))] = v
+end
+
+local function ctconvf(ctype)
+	return ctconvtab[tonumber(ctype)] or error(string.format("non-primitive ctype: %s", ctype))
 end
 
 -- ctype -> python struct notation
 -- see: https://docs.python.org/3/library/struct.html
-local pyfmt = {}
+local fmttab = {}
 for k,v in pairs {
 	bool     = "?",
 	float    = "f", double   = "d",
@@ -265,7 +273,11 @@ for k,v in pairs {
 	int32_t  = "i", uint32_t = "I",
 	int64_t  = "q", uint64_t = "Q",
 } do
-	pyfmt[tonumber(ffi.typeof(k))] = gcocheck(C.PyUnicode_DecodeFSDefault(v))
+	fmttab[tonumber(ffi.typeof(k))] = gcocheck(C.PyUnicode_DecodeFSDefault(v))
+end
+
+local function memfmt(ctype)
+	return fmttab[tonumber(ctype)] or error(string.format("non-memoryview ctype: %s", ctype))
 end
 
 local tup1 = gcocheck(C.PyTuple_New(1))
@@ -284,10 +296,6 @@ end
 
 ---- loader ----------------------------------------
 
-local function ctcallerr(ctype)
-	error(string.format("unsuitable ctype for python function call: %s", ctype), 2)
-end
-
 -- modcall python callable PyObject *
 local function modcallpy(J, o, f)
 	local mode = driver.getmode(o)
@@ -302,11 +310,10 @@ local function modcallpy(J, o, f)
 		code.upv.args = tuple(#o.params)
 		for i,p in ipairs(o.params) do
 			local v = ocheck(C.PyTuple_GetItem(pv, i-1))
-			local ctid = tonumber(p.var.ctype)
 			code.src:put("do\n")
 			if C.Py_IsNone(v) == 0 or mode:sub(i,i) == "v" then
 				code.upv.memoryview = memoryview
-				local fmt = code:upval(pyfmt[ctid] or ctcallerr(p.var.ctype))
+				local fmt = code:upval(memfmt(p.var.ctype))
 				code.src:putf(
 					"local x = memoryview(S.edges[%d].p, S.edges[%d].n*%d, %s)\n",
 					i-1, i-1, ffi.sizeof(p.var.ctype), fmt
@@ -321,10 +328,10 @@ local function modcallpy(J, o, f)
 				local ctp = code:upval(ffi.typeof("$*", p.var.ctype))
 				code.src:putf(
 					"local x = ocheck(%s.%s(cast(%s, S.edges[%d].p)[0]))\n",
-					uC, ctconvf[ctid] or ctcallerr(p.var.ctype), ctp, i-1
+					uC, ctconvf(p.var.ctype), ctp, i-1
 				)
 				local t = ocheck(C.PyTuple_GetItem(pt, i-1))
-				local kind = ctkind[ctid] or ctcallerr(p.var.ctype)
+				local kind = ctkind(p.var.ctype)
 				if t ~= builtins[kind] and C.Py_IsNone(t) == 0 then
 					local tconv = code:upval(gcocheckref(t))
 					code.upv.call1 = call1
@@ -356,8 +363,7 @@ local function modcallpy(J, o, f)
 		end
 		local v = ocheck(C.PyTuple_GetItem(rv, i-1))
 		local isvec = C.Py_IsNone(v) == 0 or mode:sub(#o.params+i,#o.params+i) == "v"
-		local ctid = tonumber(r.var.ctype)
-		local kind = ctkind[ctid] or ctcallerr(r.var.ctype)
+		local kind = ctkind(r.var.ctype)
 		local dest, echeck, robj
 		-- TODO: should specialize for common types (list?)
 		-- TODO: just memcpy for buffer types (like numpy.array)
@@ -420,16 +426,11 @@ return {
 	load        = py_load,
 	_finalizer  = finalizer,
 	-- for fhk_pyx
-	raise       = raise,
-	echeck3     = echeck3,
 	ocheck      = ocheck,
-	gcocheck    = gcocheck,
 	gcocheckref = gcocheckref,
+	echeck3     = echeck3,
 	tuple       = tuple,
-	memoryview  = memoryview,
 	builtins    = builtins,
 	ctkind      = ctkind,
-	ctconvf     = ctconvf,
-	pyfmt       = pyfmt,
-	call1       = call1
+	memfmt      = memfmt
 }

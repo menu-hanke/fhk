@@ -5,13 +5,10 @@ ffi.cdef[[
 #include "api.h"
 ]]
 
-#define stringify_(x) #x
-#define stringify(x)  stringify_(x)
-
 //---- build config ----------------------------------------
 local config = {
 #ifdef FHK_GITHASH
-	version = "fhk commit " .. stringify(FHK_GITHASH),
+	version = "fhk-" .. FHK_GITHASH,
 #else
 	version = "fhk (unknown commit)",
 #endif

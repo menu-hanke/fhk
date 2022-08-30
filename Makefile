@@ -1,11 +1,5 @@
 #-------------------------------------------------------------------------------#
 # fhk makefile.                                                                 #
-#                                                                               #
-# useful variables you may set when invoking `make`:                            #
-#     TRACE           set to `all` to enable all trace messages.                #
-#                     (see trace.h for more granular control.)                  #
-#     DEBUG           set to `y` to enable debugging.                           #
-#     CROSS           cross-compiler toolchain prefix.                          #
 #-------------------------------------------------------------------------------#
 
 # programs
@@ -15,6 +9,13 @@ LUAJIT         = luajit
 BCLOADER       = $(LUAJIT) bcloader
 PYTHON         = python
 CYTHON         = cython
+PKGCONFIG      = pkg-config
+PYCONFIG       = python3-config
+
+# libraries
+LUAJIT_I       = $(shell $(PKGCONFIG) --cflags-only-I luajit)
+PYTHON_I       = $(shell $(PYCONFIG) --includes)
+LUAJIT_L      ?= $(shell $(PKGCONFIG) --libs luajit)
 
 # embed lua bytecode? [y]/n
 LINKLUA       ?= y
@@ -61,6 +62,7 @@ TARGET_SO      = .dll
 else
 TARGET_SO      = .so
 endif
+TARGET_PYEXT   = $(shell $(PYCONFIG) --extension-suffix 2>/dev/null)
 
 # arch settings
 ARCHTEST = $(shell $(CC) $(CCDEF) -E -dM target.h 2>/dev/null)
@@ -75,8 +77,6 @@ endif
 
 XCFLAGS     = $(CCOPT) $(CCDEF) $(CCDEBUG) $(CCWARN)
 XLDFLAGS    =
-FHKCFLAGS   = $(XCFLAGS) $(CFLAGS)
-FHKLDFLAGS  = $(XLDFLAGS) $(LDFLAGS)
 
 ifneq (,$(TRACE))
 CCDEF      += -DFHK_TRACE=$(TRACE)
@@ -90,7 +90,7 @@ endif
 # objects
 CORE_O      = build.o debug.o solve.o sub.o swap_$(ARCH).o
 LOADER_O    = loader.o
-PYX_O       = _ctypes.pyx.o
+PYX_O       = fhk_api.pyx.o
 ifeq (y,$(LINKLUA))
 XLUACORE_O  = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o
 XLUALANG_O  = fhk_lang_Expr.lua.o fhk_lang_Lua.lua.o fhk_lang_Python.lua.o
@@ -102,21 +102,22 @@ endif
 
 help:
 	@echo "targets:"
-	@echo "    fhk$(TARGET_SO) - Lua dynamic library"
-	@echo "    libfhk.a - Lua static library"
-	@echo "    libfhkpy.a - Python static library"
+	@echo "    lua          Lua shared library (fhk$(TARGET_SO))"
+	@echo "    pyx          CPython extension  (fhk$(TARGET_PYEXT))"
 
-# fhk.so - Lua dynamic library
-fhk$(TARGET_SO): FHKCFLAGS += -fPIC
-fhk$(TARGET_SO): FHKLDFLAGS += $(shell $(BCLOADER) -f)
+.PHONY: lua pyx
+lua: fhk$(TARGET_SO)
+pyx: fhk$(TARGET_PYEXT)
+
+# Lua dynamic library
+fhk$(TARGET_SO): XCFLAGS += -fPIC
 fhk$(TARGET_SO): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUALIB_O) $(LOADER_O)
-	$(CC) -shared $^ $(FHKLDFLAGS) -o $@
+	$(CC) -shared $^ $(XLDFLAGS) $(LDFLAGS) -o $@
 
-# libfhk.a - Lua static library
-libfhk.a: $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUALIB_O)
-
-# libfhkpy.a - Python static library
-libfhky.a: $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
+# Python dynamic library
+fhk$(TARGET_PYEXT): XCFLAGS += -fPIC
+fhk$(TARGET_PYEXT): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
+	$(CC) -shared $^ $(XLDFLAGS) $(LUAJIT_L) $(LDFLAGS) -o $@
 
 #--------------------------------------------------------------------------------
 
@@ -124,10 +125,10 @@ libfhky.a: $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
 	$(AR) rcs $@ $^
 
 %.o: %.c
-	$(CC) $(FHKCFLAGS) -c $< -o $@
+	$(CC) $(XCFLAGS) $(CFLAGS) -c $< -o $@
 
 %.o: %.S
-	$(CC) $(FHKCFLAGS) -c $< -o $@
+	$(CC) $(XCFLAGS) $(CFLAGS) -c $< -o $@
 
 %.lua.o: %.lua
 	$(LUAJIT) -b -n $(subst _,.,$(notdir $*)) $< $@
@@ -135,8 +136,8 @@ libfhky.a: $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
 %.lua: %.lua.h
 	$(CC) $(CCDEF) $(LUAHDEF) -P -E -nostdinc $< 2>/dev/null >$@ || true
 
-%.pyx.c: %.pyx
-	$(CYTHON) $< -o $@
+fhk_api.pyx.c: fhk_api.pyx
+	$(CYTHON) -f --module-name fhk $< -o $@
 
 asmdef.h: asmdef.lua fhk_cdef.lua
 	$(LUAJIT) asmdef.lua > $@
@@ -144,8 +145,9 @@ asmdef.h: asmdef.lua fhk_cdef.lua
 loader.c:
 	$(BCLOADER) -o $(TARGET) -n fhk -c fhk_api -L > $@
 
-CCGITHASH = $(shell HASH=$$(git rev-parse --short HEAD) && echo -DFHK_GITHASH=$$HASH)
+CCGITHASH = $(shell HASH=$$(git rev-parse --short HEAD) && echo -DFHK_GITHASH='\"'$$HASH'\"')
 fhk_cdef.lua: LUAHDEF = -DFHK_CORO=$(CORO) $(CCGITHASH)
+fhk_api.pyx.o: XCFLAGS += $(LUAJIT_I) $(PYTHON_I) $(CCGITHASH)
 
 #--------------------------------------------------------------------------------
 

@@ -315,6 +315,7 @@ typedef int64_t fhk_subset;
 #define subset_isC(ss)    ((ss) < -2)   // is it a complex set?
 #define subset_is1(ss)    ((uint64_t)(ss) <= 0xfffff) // is it an interval containing exactly one element?
 #define subsetI_first(ss) ((int32_t)(ss))  // note: subsetI_first(SUBSET_EMPTY) = -1
+#define subsetI_new(first, zn) ((fhk_subset)(zn)<<32 | (first))
 #define subsetIE_znum(ss) ((ss) >> 32)  // note: subsetIE_znum(SUBSET_EMPTY) = -1
 #define subsetIE_size(ss) (1 + subsetIE_znum(ss))
 #define subsetC_pk(ss)    ((fhk_pkref)~(ss))
@@ -333,23 +334,34 @@ typedef int64_t fhk_subset;
  */
 typedef int8_t *fhk_pkref;
 #define pkref_next(pk)    ((pk) + 5)
-#define pkref_nth(pk,n)   ((pk) + 5*(n))
+#define pkref_prev(pk)    ((pk) - 5)
 #define pkref_first(pk)   (pkref_load32(pk) & 0xfffff)
 #define pkref_znum(pk)    ((pkref_load32((pk)+2) >> 4) & 0xfffff)
 #define pkref_size(pk)    (1 + pkref_znum(pk))
 #define pkref_more(pk)    ((pkref_load32((pk)+5)) & 0xffffff)
 // TODO: pkref_unpack: unpack first/znum with one 64-bit load.
 
-AINLINE static uint64_t pkref_load64(fhk_pkref pk){
+AINLINE static uint64_t pkref_load64(fhk_pkref pk) {
 	uint64_t pk64;
 	memcpy(&pk64, pk, sizeof(pk64));
 	return pk64;
 }
 
-AINLINE static uint32_t pkref_load32(fhk_pkref pk){
+AINLINE static uint32_t pkref_load32(fhk_pkref pk) {
 	uint32_t pk32;
 	memcpy(&pk32, pk, sizeof(pk32));
 	return pk32;
+}
+
+AINLINE static void pkref_write(fhk_pkref pk, xinst first, xinst znum) {
+	pk[0] = first;
+	pk[1] = first >> 8;
+	pk[2] = (first >> 16) | ((znum & 0xf) << 4);
+	pk[3] = znum >> 4;
+	pk[4] = znum >> 12;
+	// NOTE: another way is to do this write in two parts:
+	// *(uint32_t *) pk = first | znum << 20;
+	// pk[4] = znum >> 12;
 }
 
 /* ---- maps ---------------------------------------- */
