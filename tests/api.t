@@ -269,13 +269,6 @@ function test_api_autocomplete_inverse_implicit()
 	assert(res.g_x[0] == 1 and res.g_x[1] == 2 and res.g_x[2] == 3)
 end
 
---function test_api_lang_Expr()
---	-- TODO.
---	-- maybe this even deserves its own file like lang_Python.
---	-- needs also Const tests.
---	error("TODO")
---end
-
 function test_api_blacklist_missing_given()
 	local graph = fhk.graph(function()
 		var "y" { function() return 1 end }
