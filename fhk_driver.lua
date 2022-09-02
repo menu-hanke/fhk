@@ -1220,9 +1220,9 @@ local nextafter = (function()
 	end
 	return function(from, to, ctid)
 		if ctid == cttoid("double") then
-			return nextafter(from, to)
+			return ffi.C[nextafter](from, to)
 		elseif ctid == cttoid("float") then
-			return nextafterf(from, to)
+			return ffi.C[nextafterf](from, to)
 		else
 			error(string.format("non-fp ctype: %s", ct))
 		end
