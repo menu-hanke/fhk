@@ -456,9 +456,13 @@ end
 ---- codegen ----------------------------------------
 
 local function code_upval(code, v)
-	local name = string.format("_%p", v)
-	code.upv[name] = v
-	return name
+	if type(v) == "number" then
+		return tostring(v)
+	else
+		local name = string.format("_%p", v)
+		code.upv[name] = v
+		return name
+	end
 end
 
 local function emitupvals(code, buf)
