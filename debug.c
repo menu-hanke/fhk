@@ -16,33 +16,6 @@
 
 #if FHK_DSYM
 
-void fhk_mut_set_dsym(fhk_mut_ref *mp, fhk_mref32 objH, const char *sym) {
-	fhk_mut_graph *M = mrefM(mp);
-	fhk_mut_obj *o = mrefp(M, objH);
-	if(!mtype_isobj(o->tag & MTAG_TYPE)) return;
-	fhk_mut_dsym *ds = M->dsym;
-	fhk_mref32 n = strlen(sym) + 1;
-	if(!ds) {
-		// no error checking. it's just debug symbols.
-		// if malloc is failing during debugging, i'll rather just let it crash.
-		ds = malloc(1024);
-		M->dsym = ds;
-		ds->used = sizeof(*ds);
-		ds->cap = 1024;
-	}
-	fhk_mref32 ptr = ds->used;
-	fhk_mref32 cap = ds->cap;
-	o->dsym = ptr;
-	ds->used += n;
-	if(ptr+n > cap) {
-		do { cap <<= 1; } while(ptr+n > cap);
-		ds = realloc(ds, cap);
-		M->dsym = ds;
-		ds->cap = cap;
-	}
-	memcpy((void *)ds + ptr, sym, n);
-}
-
 static char *rotatebuf() {
 	static char buf[4][128];
 	static int64_t idx = 0;
@@ -51,11 +24,9 @@ static char *rotatebuf() {
 }
 
 const char *fhk_debug_sym(fhk_Gref G, xidx idx) {
-	fhk_mref32 *dsym = grefG(G)->dsym;
-	if(dsym) {
-		fhk_mref32 ptr = dsym[idx];
-		if(ptr) return (void*)dsym + ptr;
-	}
+	fhk_mref32 *tab = mrefp(G, grefG(G)->symtab);
+	fhk_mref32 sym = tab[idx];
+	if(sym) return mrefp(G, sym);
 	char *buf = rotatebuf();
 	sprintf(buf, "<anon.%d>", (int)idx);
 	return buf;
@@ -69,9 +40,8 @@ const char *fhk_mut_debug_sym(fhk_mut_graph *M, fhk_mref32 ref) {
 	};
 	fhk_mtag tag = *(fhk_mtag *) mrefp(M, ref);
 	if(mtype_isobj(tag & MTAG_TYPE)) {
-		fhk_mref32 ptr = ((fhk_mut_obj *) mrefp(M, ref))->dsym;
-		// nonzero ptr implies M->dsym is allocated.
-		if(ptr) return mrefp(M->dsym, ptr);
+		fhk_mref32 sym = ((fhk_mut_obj *) mrefp(M, ref))->sym;
+		if(sym) return mrefp(M, sym);
 	}
 	char *buf = rotatebuf();
 	sprintf(buf, "<%s.0x%x>", objtag[tag & MTAG_TYPE], ref);
@@ -107,12 +77,4 @@ const char *fhk_debug_value(fhk_Sref S, xidx idx, xinst inst) {
 	return buf;
 }
 
-#else // FHK_DSYM
-
-void fhk_mut_set_dsym(fhk_mut_ref *mp, fhk_mref32 objH, const char *sym) {
-	(void)mp;
-	(void)objH;
-	(void)sym;
-}
-
-#endif // FHK_DSYM
+#endif

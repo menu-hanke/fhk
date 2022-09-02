@@ -19,7 +19,8 @@
 #define MAX_STACK                8192
 
 /* initial mutgraph size (bytes). */
-#define MUT_INIT                 1024
+#define MUT_INIT_UP              1024
+#define MUT_INIT_DOWN            1024
 
 /* initial pruning heap size (slots). */
 #define BHEAP_INIT               64

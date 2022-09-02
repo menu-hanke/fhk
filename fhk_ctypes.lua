@@ -199,7 +199,7 @@ local function mut_opairs(mref, mask, match)
 	if mask and not match then
 		match = mask
 	end
-	local used = mref.mp.used
+	local used = mref.mp.uused
 	local ref = mref_start
 	local function nextobj()
 		if ref >= used then return end

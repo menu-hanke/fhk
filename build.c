@@ -32,36 +32,62 @@ static const uint8_t PRED_SIZE[FHK_PRED__num] = {
 
 /* ---- buffer management ---------------------------------------- */
 
-static fhk_mref32 mgraph_alloc(fhk_mut_ref *mp, fhk_mref32 size){
+static fhk_mref32 mgraph_alloc_up(fhk_mut_ref *mp, fhk_mref32 size) {
 	assert(!(size & (alignof(fhk_mref32)-1)));
 	fhk_mut_graph *M = mrefM(mp);
-	fhk_mref32 ptr = M->used;
-	M->used += size;
-	if(UNLIKELY(ptr+size > M->cap)) {
+	fhk_mref32 ptr = M->uused;
+	M->uused += size;
+	if(UNLIKELY(ptr+size > M->ucap)) {
 		// don't need a loop here.
 		// we don't have any variable size allocs so we know everything will fit
 		// after one doubling.
-		M->cap <<= 1;
-		M = realloc(M, M->cap);
+		M->ucap <<= 1;
+		fhk_mref32 dcap = M->dcap;
+		M = realloc((void*)M - dcap, dcap + M->ucap);
 		if(UNLIKELY(!M))
 			return 0;
-		mrefM(mp) = M;
+		mrefM(mp) = (void*)M + dcap;
 	}
 	return ptr;
 }
 
+#if FHK_DSYM
+
+static fhk_mref32 mgraph_alloc_down(fhk_mut_ref *mp, fhk_mref32 size) {
+	// don't require alignment here. this is where debug info goes.
+	fhk_mut_graph *M = mrefM(mp);
+	M->dused += size;
+	ptrdiff_t dcap = M->dcap;
+	if(UNLIKELY(M->dused > dcap)) {
+		if(UNLIKELY(!dcap))
+			M->dcap = MUT_INIT_DOWN;
+		while(M->dused > M->dcap)
+			M->dcap <<= 1;
+		fhk_mut_graph *MM = malloc(M->dcap+M->ucap);
+		if(UNLIKELY(!MM))
+			return 0;
+		fhk_mref32 used = M->dused-size;
+		memcpy((void*)MM+M->dcap-used, (void*)M-used, used+M->uused);
+		mrefM(mp) = (void*)MM + M->dcap;
+		free((void*)M-dcap);
+		M = mrefM(mp);
+	}
+	return -M->dused;
+}
+
+#endif
+
 /* ---- mutation ---------------------------------------- */
 
 fhk_status fhk_create_mut(fhk_mut_ref *mp) {
-	fhk_mut_graph *M = malloc(sizeof(*M) + MUT_INIT);
+	fhk_mut_graph *M = malloc(sizeof(*M) + MUT_INIT_UP);
 	if(UNLIKELY(!M)) return ecode(MEM);
-	M->cap = sizeof(*M) + MUT_INIT;
-	M->used = MREF_USER;
+	M->ucap = sizeof(*M) + MUT_INIT_UP;
+	M->uused = MREF_USER;
+	M->dcap = 0;
+	M->dused = 0;
 	M->k = INIT_K;
 	M->c = INIT_C;
-#if FHK_DSYM
-	M->dsym = 0;
-#endif
 	mrefM(mp) = M;
 	// identity map
 	fhk_mut_var *id = mrefp(M, MREF_IDENT);
@@ -79,15 +105,16 @@ fhk_status fhk_create_mut(fhk_mut_ref *mp) {
 	g->size = sizeof(fhk_subset);
 	g->group = MREF_GLOBAL;
 	g->inverse = 0;
+#if FHK_DSYM
+	id->sym = 0;
+	g->sym = 0;
+#endif
 	return 0;
 }
 
 void fhk_destroy_mut(fhk_mut_ref *mp) {
 	fhk_mut_graph *M = mrefM(mp);
-#if FHK_DSYM
-	if(M->dsym) free(M->dsym);
-#endif
-	free(M);
+	free((void*)M - M->dcap);
 	mrefM(mp) = NULL;
 }
 
@@ -124,7 +151,7 @@ static int obj_setguard(fhk_mut_graph *M, fhk_mref32 varH) {
 fhk_status fhk_mut_add_var(fhk_mut_ref *mp, fhk_mref32 groupH) {
 	if(UNLIKELY(!obj_setmap(mrefM(mp), groupH)))
 		return ecode(TYPE) | etagA(HANDLE, groupH);
-	fhk_mref32 varH = mgraph_alloc(mp, sizeof(fhk_mut_var));
+	fhk_mref32 varH = mgraph_alloc_up(mp, sizeof(fhk_mut_var));
 	if(UNLIKELY(!varH)) return ecode(MEM);
 	fhk_mut_graph *M = mrefM(mp);
 	fhk_mut_var *var = mrefp(M, varH);
@@ -132,7 +159,7 @@ fhk_status fhk_mut_add_var(fhk_mut_ref *mp, fhk_mref32 groupH) {
 	var->size = MSIZE_UNSET;
 	var->group = groupH;
 #if FHK_DSYM
-	var->dsym = 0;
+	var->sym = 0;
 #endif
 	return varH;
 }
@@ -175,7 +202,7 @@ fhk_status fhk_mut_set_size(fhk_mut_ref *mp, fhk_mref32 varH, uint16_t size) {
 fhk_status fhk_mut_add_model(fhk_mut_ref *mp, fhk_mref32 groupH) {
 	if(UNLIKELY(!obj_setmap(mrefM(mp), groupH)))
 		return ecode(TYPE) | etagA(HANDLE, groupH);
-	fhk_mref32 modH = mgraph_alloc(mp, sizeof(fhk_mut_model));
+	fhk_mref32 modH = mgraph_alloc_up(mp, sizeof(fhk_mut_model));
 	if(UNLIKELY(!modH)) return ecode(MEM);
 	fhk_mut_graph *M = mrefM(mp);
 	fhk_mut_model *mod = mrefp(M, modH);
@@ -184,7 +211,7 @@ fhk_status fhk_mut_add_model(fhk_mut_ref *mp, fhk_mref32 groupH) {
 	mod->k = M->k;
 	mod->c = M->c;
 #if FHK_DSYM
-	mod->dsym = 0;
+	mod->sym = 0;
 #endif
 	return modH;
 }
@@ -219,7 +246,7 @@ static fhk_status addedge(fhk_mut_ref *mp, fhk_mref32 modelH, fhk_mref32 varH, f
 		fhk_mtag tag) {
 	fhk_status err;
 	if(UNLIKELY(err = checkedge(mrefM(mp), modelH, varH, mapH))) return err;
-	fhk_mref32 edgeH = mgraph_alloc(mp, sizeof(fhk_mut_edge));
+	fhk_mref32 edgeH = mgraph_alloc_up(mp, sizeof(fhk_mut_edge));
 	if(UNLIKELY(!edgeH)) return ecode(MEM);
 	fhk_mut_graph *M = mrefM(mp);
 	fhk_mut_edge *edge = mrefp(M, edgeH);
@@ -243,7 +270,7 @@ fhk_status fhk_mut_add_check(fhk_mut_ref *mp, fhk_mref32 modelH, fhk_mref32 guar
 	fhk_status err;
 	if(UNLIKELY(err = checkedge(mrefM(mp), modelH, guardH, mapH))) return err;
 	if(UNLIKELY(!obj_setguard(mrefM(mp), guardH))) return ecode(TYPE) | etagA(HANDLE, guardH);
-	fhk_mref32 checkH = mgraph_alloc(mp, sizeof(fhk_mut_check));
+	fhk_mref32 checkH = mgraph_alloc_up(mp, sizeof(fhk_mut_check));
 	if(UNLIKELY(!checkH)) return ecode(MEM);
 	fhk_mut_graph *M = mrefM(mp);
 	fhk_mut_check *check = mrefp(M, checkH);
@@ -264,7 +291,7 @@ fhk_status fhk_mut_add_rcheck(fhk_mut_ref *mp, fhk_mref32 edge, fhk_mref32 check
 }
 
 fhk_status fhk_mut_add_predicate(fhk_mut_ref *mp) {
-	fhk_mref32 preH = mgraph_alloc(mp, sizeof(fhk_mut_predicate));
+	fhk_mref32 preH = mgraph_alloc_up(mp, sizeof(fhk_mut_predicate));
 	if(UNLIKELY(!preH)) return ecode(MEM);
 	fhk_mut_graph *M = mrefM(mp);
 	fhk_mut_predicate *pre = mrefp(M, preH);
@@ -305,6 +332,22 @@ fhk_status fhk_mut_set_predicate(fhk_mut_ref *mp, fhk_mref32 obj, fhk_mref32 pre
 	return ecode(TYPE) | etagA(HANDLE, obj);
 }
 
+void fhk_mut_set_sym(fhk_mut_ref *mp, fhk_mref32 ref, const char *sym) {
+#if FHK_DSYM
+	fhk_mtag tag = *(fhk_mtag *) mrefp(mrefM(mp), ref);
+	if(UNLIKELY(!mtype_isobj(tag & MTAG_TYPE))) return;
+	size_t num = strlen(sym)+1;
+	fhk_mref32 ptr = mgraph_alloc_down(mp, num);
+	if(UNLIKELY(!ptr)) return;
+	fhk_mut_graph *M = mrefM(mp);
+	memcpy(mrefp(M, ptr), sym, num);
+	fhk_mut_obj *obj = mrefp(M, ref);
+	obj->sym = ptr;
+#else
+	(void)mp; (void)ref; (void)sym;
+#endif
+}
+
 void fhk_mut_disable(fhk_mut_ref *mp, fhk_mref32 obj) {
 	fhk_mut_graph *M = mrefM(mp);
 	*(fhk_mtag *) mrefp(M, obj) |= MTAG_SKIP;
@@ -319,7 +362,7 @@ static void intern(fhk_mut_graph *M) {
 	fhk_mtag tag;
 	// intern checks, reset var->next.
 	fhk_mref32 head = 0;
-	for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE)) {
 			case MTYPE(predicate):
@@ -350,7 +393,7 @@ static void intern(fhk_mut_graph *M) {
 nextp: continue;
 	}
 	// intern guards.
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_PREGRD|MTAG_TYPE)) {
 			case MTAG_PREGRD|MTYPE(var):
@@ -480,7 +523,7 @@ static void relink(fhk_mut_graph *M) {
 	M->var = 0;
 	M->model = 0;
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE)) {
 			case MTYPE(var):
@@ -519,7 +562,7 @@ static void relink(fhk_mut_graph *M) {
 // check skipped             ->   add penalty
 static void bound_setskip(fhk_mut_graph *M) {
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & MTAG_TYPE) {
 			case MTYPE(var):
@@ -694,7 +737,7 @@ static fhk_status bound_visit_model_high(fhk_mut_graph *M, fhk_heapref *hp, fhk_
 static fhk_status bound_init_heap(fhk_mut_graph *M, fhk_heapref *hp) {
 	fhk_status err;
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE))  {
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE))  {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE)) {
 			case MTYPE(var):
@@ -895,7 +938,7 @@ fhk_status fhk_mut_mark(fhk_mut_ref *mp, fhk_mref32 ref) {
 	if(!mtype_isobj(tag & (MTAG_TYPE|MTAG_MARKREC))) return 0;
 	if(UNLIKELY(tag & MTAG_SKIP)) return ecode(SKIP);
 	fhk_mut_obj *obj = mrefp(M, ref);
-	if(UNLIKELY(!isfinitecx(obj->clo))) return ecode(CHAIN);
+	if(UNLIKELY(!isfinitecx(obj->clo))) return ecode(CHAIN) | etagA(HANDLE, ref);
 	switch(tag & MTAG_TYPE) {
 		case MTYPE(var):
 			mark_visit_var(M, ref);
@@ -912,7 +955,7 @@ fhk_status fhk_mut_mark(fhk_mut_ref *mp, fhk_mref32 ref) {
 
 static void layout_setskip(fhk_mut_graph *M) {
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		if(!(tag & MTAG_RETAIN))
 			*(fhk_mtag *) mrefp(M, ref) |= MTAG_SKIP;
@@ -922,7 +965,7 @@ static void layout_setskip(fhk_mut_graph *M) {
 static void layout_classify(fhk_mut_graph *M) {
 	fhk_mtag tag;
 	// don't classify builtins.
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *)mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE|MTAG_PREGRD|MTAG_DERIVE)) {
 			case MTYPE(var):
@@ -973,7 +1016,7 @@ static fhk_status layout_count(fhk_mut_graph *M) {
 	memset(M->nlc, 0, sizeof(M->nlc));
 	fhk_mtag tag;
 	// don't count builtins.
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *)mrefp(M, ref);
 		if(mtype_isobj(tag & (MTAG_SKIP|MTAG_TYPE))) {
 			fhk_mut_obj *obj = mrefp(M, ref);
@@ -1177,7 +1220,7 @@ static fhk_status layout_order(fhk_mut_graph *M) {
 	memset(&ls.curi, 0, sizeof(ls.curi));
 	for(int i=0; i<LC__NUM; i++) ls.cursor[i] = ls.start[i][0];
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE|MTAG_IDX)) {
 			case MTYPE(var):
@@ -1205,7 +1248,7 @@ static fhk_mref32 layout_reserve(fhk_mut_graph *M, fhk_mref32 size, fhk_mref32 a
 
 static void layout_offsets(fhk_mut_graph *M) {
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_USER; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *)mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE|MTAG_PREGRD|MTAG_DERIVE)) {
 			case MTYPE(var):
@@ -1250,11 +1293,38 @@ static void layout_offsets(fhk_mut_graph *M) {
 	}
 }
 
+#if FHK_DSYM
+
+static void layout_symtab(fhk_mut_graph *M) {
+	M->symtab = layout_reserve(M, M->nx*sizeof(fhk_mref32), alignof(fhk_mref32));
+	fhk_mtag tag;
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
+		tag = *(fhk_mtag *) mrefp(M, ref);
+		if(!mtype_isobj(tag & (MTAG_SKIP|MTAG_TYPE)))
+			continue;
+		fhk_mut_obj *obj = mrefp(M, ref);
+		if(!obj->sym)
+			continue;
+		// for derives, if both have a symbol, layout only the variable's sym.
+		if((tag & (MTAG_DERIVE|MTAG_TYPE)) == (MTAG_DERIVE|MTYPE(model))) {
+			fhk_mut_edge *e = mrefp(M, ((fhk_mut_model *) obj)->fwdR);
+			fhk_mut_var *var = mrefp(M, e->var);
+			if(var->sym) {
+				obj->symofs = 0;
+				continue;
+			}
+		}
+		obj->symofs = layout_reserve(M, strlen(mrefp(M, obj->sym))+1, 1);
+	}
+}
+
+#endif
+
 #if FHK_TRACEON(build)
 
 static void layout_trace(fhk_mut_graph *M) {
 	fhk_mtag tag;
-	for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
 		switch(tag & (MTAG_SKIP|MTAG_TYPE)) {
 			case MTYPE(var):
@@ -1295,6 +1365,9 @@ fhk_status fhk_mut_layout(fhk_mut_ref *mp) {
 	if(UNLIKELY(err = layout_count(M))) return err;
 	if(UNLIKELY(err = layout_order(M))) return err;
 	layout_offsets(M);
+#if FHK_DSYM
+	layout_symtab(M);
+#endif
 #if FHK_TRACEON(build)
 	layout_trace(M);
 #endif
@@ -1306,16 +1379,9 @@ size_t fhk_mut_size(fhk_mut_ref *mp) {
 	for(int i=LAYOUT_MAXHOLE-1;; i--) {
 		assert(i >= 0);
 		if(M->endhole[i])
-			return ALIGN(M->nx*sizeof(fhk_meta), alignof(void *))    // meta table
-#if FHK_DSYM
-				+ (M->dsym ? ALIGN(
-						dsym_size(M->dsym)            // debug sym data
-						+ M->nx*sizeof(fhk_mref32),   // debug sym table
-						alignof(void *)
-				) : 0)
-#endif
-				+ sizeof(fhk_graph)          // graph
-				+ M->hole[i];                // graph data (including object table)
+			return ALIGN(M->nx*sizeof(fhk_meta), alignof(void *))   // meta table
+				+ sizeof(fhk_graph)                                 // graph
+				+ M->hole[i];                                       // graph data (including object table)
 	}
 }
 
@@ -1539,41 +1605,45 @@ static void build_model_obj(fhk_mut_graph *M, fhk_Gref G, fhk_mref32 modelH) {
 	mg->n_rcheck = 0;
 }
 
-fhk_status fhk_mut_build(fhk_mut_ref *mp, void *buf) {
-	fhk_mut_graph *M = mrefM(mp);
-	fhk_mtag tag;
 #if FHK_DSYM
-	fhk_mref32 *dstab = NULL;
-	if(M->dsym) {
-		dstab = buf;
-		buf += M->nx * sizeof(fhk_mref32);
-		fhk_mref32 adj = ((intptr_t)buf-(intptr_t)dstab) - ((intptr_t)dsym_mem(M->dsym)-(intptr_t)M->dsym);
-		memcpy(buf, dsym_mem(M->dsym), dsym_size(M->dsym));
-		buf += dsym_size(M->dsym);
-		for(fhk_mref32 ref=MREF_START; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
-			tag = *(fhk_mtag *)mrefp(M, ref);
-			if(mtype_isobj(tag & (MTAG_SKIP|MTAG_TYPE))) {
-				fhk_mut_obj *obj = mrefp(M, ref);
-				dstab[obj->idx] = obj->dsym ? (obj->dsym + adj) : 0;
-			}
+
+static void build_symtab(fhk_mut_graph *M, fhk_Gref G) {
+	grefG(G)->symtab = M->symtab;
+	fhk_mref32 *tab = mrefp(G, M->symtab);
+	memset(tab, 0, M->nx*sizeof(*tab));
+	fhk_mtag tag;
+	for(fhk_mref32 ref=MREF_START; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
+		tag = *(fhk_mtag *) mrefp(M, ref);
+		if(!mtype_isobj(tag & (MTAG_SKIP|MTAG_TYPE)))
+			continue;
+		fhk_mut_obj *obj = mrefp(M, ref);
+		if(obj->sym && obj->sym) {
+			fhk_mref32 ofs = obj->symofs;
+			strcpy(mrefp(G, ofs), mrefp(M, obj->sym));
+			tab[obj->idx] = ofs;
 		}
 	}
+}
+
 #endif
+
+fhk_status fhk_mut_build(fhk_mut_ref *mp, void *buf) {
+	fhk_mut_graph *M = mrefM(mp);
 	buf += M->nx * sizeof(fhk_meta);
 	buf += sizeof(fhk_graph);
 	buf = ALIGN(buf, alignof(void *));
 	fhk_Gref G = (fhk_Gref) buf;
 	assert(ALIGN(grefG(G), max(alignof(fhk_meta), alignof(fhk_graph))) == grefG(G));
 #if FHK_DSYM
-	grefG(G)->dsym = dstab;
+	build_symtab(M, G);
 #endif
 	grefG(G)->nx = M->nx;
 	grefG(G)->nv = M->nv;
 	memcpy(grefG(G)->j, M->j, sizeof(M->j));
 	grefG(G)->kmapg = M->kmapg;
-	fhk_status err;
 	build_ident_meta(G);
-	for(fhk_mref32 ref=MREF_GLOBAL; ref<M->used; ref+=mtype_size(tag & MTAG_TYPE)) {
+	fhk_mtag tag;
+	for(fhk_mref32 ref=MREF_GLOBAL; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *)mrefp(M, ref);
 		if(mtype_isobj(tag & (MTAG_SKIP|MTAG_TYPE))) {
 			fhk_mut_obj *obj = mrefp(M, ref);
@@ -1586,6 +1656,7 @@ fhk_status fhk_mut_build(fhk_mut_ref *mp, void *buf) {
 		switch(tag & (MTAG_SKIP|MTAG_TYPE)) {
 			case MTYPE(var):
 			{
+				fhk_status err;
 				if(UNLIKELY(err = build_var_meta(M, G, ref)))
 					return err;
 				fhk_mut_var *var = mrefp(M, ref);
@@ -1617,7 +1688,7 @@ fhk_status fhk_mut_build(fhk_mut_ref *mp, void *buf) {
 	return (fhk_status) grefG(G);
 }
 
-/* ---- build ---------------------------------------- */
+/* ---- query ---------------------------------------- */
 
 fhk_query fhk_mut_query(fhk_mut_ref *mp, fhk_mref32 ref) {
 	fhk_mut_graph *M = mrefM(mp);
@@ -1636,3 +1707,5 @@ fhk_query fhk_mut_query(fhk_mut_ref *mp, fhk_mref32 ref) {
 			return query_newI(obj->idx);
 	}
 }
+
+

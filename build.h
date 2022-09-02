@@ -96,17 +96,17 @@ typedef struct fhk_mut_retcheck {
 } fhk_mut_retcheck;
 
 #if FHK_DSYM
-#define MUT_OBJ_DSYM fhk_mref32 dsym;
+#define MUT_OBJ_SYM fhk_mref32 sym, symofs;
 #else
-#define MUT_OBJ_DSYM
+#define MUT_OBJ_SYM
 #endif
 
 #define MUT_OBJ_HEADER \
 	fhk_mtag tag;      \
 	uint8_t lc;        \
 	uint16_t idx;      \
-	MUT_OBJ_DSYM       \
 	fhk_mref32 group;  \
+	MUT_OBJ_SYM        \
 	float clo, chi
 
 typedef struct fhk_mut_obj {
@@ -158,33 +158,22 @@ typedef struct fhk_mut_predicate {
 	fhk_operand operand;  // operand. unused bits are always zeroed, so these can be compared with memcmp
 } fhk_mut_predicate;
 
-typedef struct fhk_mut_dsym {
-	fhk_mref32 cap;
-	fhk_mref32 used;
-	// -> dsym data continues
-} fhk_mut_dsym;
-
-#define dsym_size(ds)           ((ds)->used-sizeof(fhk_mut_dsym))
-#define dsym_mem(ds)            ((fhk_mut_dsym *)(ds)+1)
-
 typedef struct fhk_mut_graph {
-	fhk_mref32 cap;       // allocated memory
-	fhk_mref32 used;      // written memory
-	fhk_mref32 var;       // variable linked list head                            --> mut var
-	fhk_mref32 model;     // model linked list head                               --> mut model
-	float k, c;           // initial cost params
+	fhk_mref32 ucap, uused; // allocated/used memory UP
+	fhk_mref32 dcap, dused; // allocated/used memory DOWN
+	fhk_mref32 var;         // variable linked list head                            --> mut var
+	fhk_mref32 model;       // model linked list head                               --> mut model
+	float k, c;             // initial cost params
 	fhk_mref32 hole[LAYOUT_MAXHOLE];   // hole offset (from objtable base)                 (layout)
 	fhk_mref32 endhole[LAYOUT_MAXHOLE]; // hole end offset (from objtable base)            (layout)
-	fhk_mref32 tail;      // alloc tail (from objtable base)                               (layout)
-	uint16_t nx;          // solver xtable size: total layouted objects                    (layout)
-	uint16_t nv;          // solver vtable size: tail models excluded                      (layout)
-	uint16_t nlc[LC__NUM]; // object count by layout class                                 (layout)
-	uint8_t j[2];         // jump table offsets                                            (layout)
-	int8_t kmapg;         // given k-map offset                                            (layout)
-#if FHK_DSYM
-	fhk_mut_dsym *dsym;   // debug symbols
-#endif
-	fhk_mref32 mem[];     // memory (defined as mref32 for alignment)
+	fhk_mref32 tail;        // alloc tail (from objtable base)                             (layout)
+	fhk_mref32 symtab;      // symtab offset (from G)                                      (layout)
+	uint16_t nx;            // solver xtable size: total layouted objects                  (layout)
+	uint16_t nv;            // solver vtable size: tail models excluded                    (layout)
+	uint16_t nlc[LC__NUM];  // object count by layout class                                (layout)
+	uint8_t j[2];           // jump table offsets                                          (layout)
+	int8_t kmapg;           // given k-map offset                                          (layout)
+	fhk_mref32 mem[];       // memory (defined as mref32 for alignment)
 } fhk_mut_graph;
 
 typedef struct fhk_mut_ref {

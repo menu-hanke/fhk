@@ -54,6 +54,7 @@ fhk_status fhk_mut_add_rcheck(fhk_mut_ref *M, fhk_mref32 edge, fhk_mref32 check,
 fhk_status fhk_mut_add_predicate(fhk_mut_ref *M);
 fhk_status fhk_mut_set_operator(fhk_mut_ref *M, fhk_mref32 obj, int operator, fhk_operand *rhs);
 fhk_status fhk_mut_set_predicate(fhk_mut_ref *M, fhk_mref32 obj, fhk_mref32 pre);
+void fhk_mut_set_sym(fhk_mut_ref *M, fhk_mref32 obj, const char *sym);
 void fhk_mut_disable(fhk_mut_ref *M, fhk_mref32 obj);
 fhk_status fhk_mut_analyze(fhk_mut_ref *M);
 fhk_status fhk_mut_mark(fhk_mut_ref *M, fhk_mref32 ref);
@@ -61,6 +62,3 @@ fhk_status fhk_mut_layout(fhk_mut_ref *M);
 size_t fhk_mut_size(fhk_mut_ref *M);
 fhk_status fhk_mut_build(fhk_mut_ref *M, void *buf);
 fhk_query fhk_mut_query(fhk_mut_ref *M, fhk_mref32 ref);
-
-/* debug */
-void fhk_mut_set_dsym(fhk_mut_ref *M, fhk_mref32 obj, const char *sym);

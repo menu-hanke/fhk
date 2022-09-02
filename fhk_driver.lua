@@ -78,6 +78,96 @@ local function checkv(graph, x, e)
 	end
 end
 
+---- debug/inspect ----------------------------------------
+
+local tagchar = "VMXDCPR"
+local tagmask = "mgpdsjrx"
+
+local function objcolor(cobj)
+	if bit.band(cobj.tag, cdef.mtagmask.s) ~= 0 then return 31 end
+	if cobj.what == "var" then return 36 end
+	if cobj.what == "model" then return 33 end
+	return ""
+end
+
+local function costcolor(cost)
+	if cost == math.huge then return 31 end
+	if cost == 0 then return 32 end
+	return ""
+end
+
+local function dumpcost(buf, cost, color)
+	if color then buf:put("\027[", costcolor(cost), "m") end
+	local num = #buf
+	buf:put(cost)
+	num = #buf - num
+	if color then buf:put("\027[m") end
+	return num
+end
+
+local function dumpidx(buf, idx, color)
+	if color then buf:put("\027[34m") end
+	buf:putf("%04d", idx)
+	if color then buf:put("\027[m") end
+end
+
+local function dumpobj(graph, buf, handle, cobj, color)
+	local obj = graph.objs[handle]
+	buf:putf("0x%04x ", handle)
+	if obj and obj.idx then
+		dumpidx(buf, obj.idx, color)
+	else
+		buf:put((" "):rep(4))
+	end
+	buf:put(" ")
+	if color then buf:put("\027[", objcolor(cobj), "m") end
+	local tag = cobj.tag
+	local typ = bit.band(tag, cdef.mtagmask.T)
+	buf:putf(tagchar:sub(typ+1,typ+1))
+	for i=1, #tagmask do
+		local c = tagmask:sub(i,i)
+		buf:put(bit.band(tag, cdef.mtagmask[c]) == 0 and "-" or c)
+	end
+	if color then buf:put("\027[m") end
+	buf:putf(" %-15s ", obj and obj.name or "")
+	if bit.band(tag, cdef.mtagmask.s) ~= 0 then return end
+	buf:put(" ")
+	if cobj.what == "var" or cobj.what == "model" then
+		buf:put("[")
+		local num = dumpcost(buf, cobj.clo, color)
+		buf:put(", ")
+		num = num + dumpcost(buf, cobj.chi, color)
+		buf:put("]")
+		if num < 8 then buf:put((" "):rep(8-num)) end
+	end
+	if obj and type(obj.ctype) == "cdata" then
+		local ct = tostring(obj.ctype):match("ctype<([^>]+)>")
+		if color then buf:put("\027[35m") end
+		buf:putf(" %-9s", ct)
+		if color then buf:put("\027[m") end
+	else
+		buf:put((" "):rep(10))
+	end
+	if obj and obj.jump then
+		buf:put("->")
+		dumpidx(buf, obj.jump, color)
+		if obj.impl then
+			buf:put(" ", tostring(obj.impl.loader))
+		end
+	end
+end
+
+local function graph_dump(graph, color)
+	local buf = buffer.new()
+	for h,o in graph.M:opairs() do
+		if o.what == "var" or o.what == "model" then
+			dumpobj(graph, buf, h, o, color)
+			buf:put("\n")
+		end
+	end
+	return buf:get()
+end
+
 ---- building ----------------------------------------
 
 local function graph_setname(graph, obj, name)
@@ -87,7 +177,7 @@ local function graph_setname(graph, obj, name)
 	end
 	obj.name = name
 	if cdef.debug then
-		C.fhk_mut_set_dsym(graph.M, obj.handle, name)
+		C.fhk_mut_set_sym(graph.M, obj.handle, name)
 	end
 	local o = graph.M:get(obj.handle)
 	if o.what == "var" then
@@ -806,7 +896,7 @@ local function derive(graph, ret, ...)
 			end
 		end
 		if #sym > 0 then
-			C.fhk_mut_set_dsym(graph.M, mod.handle, "derive["..table.concat(sym, ",").."]")
+			C.fhk_mut_set_sym(graph.M, mod.handle, "derive["..table.concat(sym, ",").."]")
 		end
 	end
 	return mod
@@ -1298,6 +1388,7 @@ local graph_mt = {
 		addrcheck    = graph_addrcheck,
 		addpredicate = graph_addpredicate,
 		setpredicate = graph_setpredicate,
+		dump         = graph_dump,
 		setname      = graph_setname,
 		read         = graph_read,
 		analyze      = graph_analyze,

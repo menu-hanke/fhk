@@ -47,6 +47,10 @@ typedef int32_t fhk_mref32;
 #define MAX_MODEL  (1 << 8)
 #define MAX_INST   (1 << 20)
 
+/* ---- debug symbols ---------------------------------------- */
+
+#define FHK_DSYM          (!!TRACE(FHK_TRACE))
+
 /* ---- error values ---------------------------------------- */
 /*  +--------+--------+--------+--------+-------+
  *  | 63..58 | 57..55 | 54..52 | 51..32 | 31..0 |
@@ -111,10 +115,6 @@ typedef union fhk_operand {
 	double f64;
 	uint64_t u64;
 } fhk_operand;
-
-/* ---- debug symbols ---------------------------------------- */
-
-#define FHK_DSYM          (!!TRACE(FHK_TRACE))
 
 /* ---- graph ---------------------------------------- */
 
@@ -255,12 +255,12 @@ typedef struct fhk_meta {
 } fhk_meta;
 
 typedef struct fhk_graph {
-	uint16_t nx;    // number of xslots
-	uint16_t nv;    // number of vslots
-	uint8_t j[2];   // jump table offsets
-	int8_t kmapg;   // kmapg start index
+	uint16_t nx;       // number of xslots
+	uint16_t nv;       // number of vslots
+	uint8_t j[2];      // jump table offsets
+	int8_t kmapg;      // kmapg start index
 #if FHK_DSYM
-	fhk_mref32 *dsym; // index -> debug symbol
+	fhk_mref32 symtab; // -> mref32[] sym table
 #endif
 } fhk_graph;
 
@@ -272,12 +272,12 @@ typedef struct fhk_graph {
 #define OBJ_IDENT          0xff
 
 /*
- *                                          +-------+
- *                                          | idx[] |
- * +--------+-----------+-------+-----------+-------+---------+
- * | dsym[] | dsym data | aux[] | fhk_graph | graph data ...  |
- * +--------+-----------+-------+-----------+-----------------+
- *                                          ^- fhk_Gref
+ *                              +-------+
+ *                              | idx[] |
+ * +-------+--------+-----------+-------+---------+
+ * | sym[] | meta[] | fhk_graph | graph data ...  |
+ * +-------+--------+-----------+-----------------+
+ *                              ^- fhk_Gref
  */
 typedef intptr_t fhk_Gref;
 
@@ -286,6 +286,7 @@ typedef intptr_t fhk_Gref;
 
 #define grefobj(G, idx)    ((void **)(G))[(idx)]
 #define grefmeta(G, idxn)  ((fhk_meta *)grefG(G))[(idxn)]
+#define grefsym(G, idx)    mrefp((G), (void*)(G)-((fhk_graph *)(G))-)
 
 /* ---- subsets ---------------------------------------- */
 /*

@@ -496,6 +496,14 @@ cdef class Graph:
     def solver(self, mem=None):
         return Solver(self.graph, mem)
 
+    def dump(self, color=False):
+        fhk_pyx_loadmethod(self.lua.L, self.ref, b"dump")
+        lua_pushboolean(self.lua.L, color)
+        self.lua.pcall(2, 1)
+        dump = lua_tostring(self.lua.L, -1).decode("utf8")
+        lua_pop(self.lua.L, 1)
+        return dump
+
 cdef int setvalue_scatter(fhk_solver *S, int idx, str fmt, object it, fhk_subset ss) except -1:
     fhk_setvalueD(S, idx, ss)
     cdef object mem = fhk_pyx_memV(S, idx).cast(fmt)
