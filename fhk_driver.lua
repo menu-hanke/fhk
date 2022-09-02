@@ -487,7 +487,7 @@ local function code_emit(code, buf)
 	buf = buf or buffer.new()
 	local uval = emitupvals(code, buf)
 	buf:put(code.src)
-	return load(buf, code.name)(unpack(uval))
+	return assert(load(buf, code.name))(unpack(uval))
 end
 
 local function code_emitjmp(code, J, buf)
@@ -499,7 +499,7 @@ local function code_emitjmp(code, J, buf)
 	buf:put(code.src)
 	buf:put("return J[C.fhk_continue(S)](S, X)\n")
 	buf:put("end\n")
-	return load(buf, code.name)(unpack(uval))
+	return assert(load(buf, code.name))(unpack(uval))
 end
 
 local code_mt = {
