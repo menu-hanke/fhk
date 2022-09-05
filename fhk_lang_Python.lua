@@ -17,9 +17,10 @@ void Py_DecRef(PyObject *);
 void Py_IncRef(PyObject *);
 PyObject *PyErr_Occurred();
 void PyErr_Fetch(PyObject **, PyObject **, PyObject **);
+void PyErr_NormalizeException(PyObject **, PyObject **, PyObject **);
+int PyException_SetTraceback(PyObject *, PyObject *);
 PyObject *PyObject_Str(PyObject *);
 PyObject *PyObject_GetItem(PyObject *, PyObject *);
-PyObject *Py_BuildValue(const char *, ...);
 const char *PyUnicode_AsUTF8AndSize(PyObject *, Py_ssize_t *);
 PyObject *PyUnicode_DecodeFSDefault(const char *);
 PyObject *PyDict_New();
@@ -40,6 +41,8 @@ PyObject *PyObject_GetAttrString(PyObject *, const char *);
 PyObject *PyObject_Call(PyObject *, PyObject *, PyObject *);
 PyObject *PyObject_CallNoArgs(PyObject *);
 PyObject *PyObject_CallMethodObjArgs(PyObject *, PyObject *, ...);
+PyObject *PyObject_CallFunction(PyObject *, const char *, ...);
+PyObject *PyObject_CallFunctionObjArgs(PyObject *, ...);
 PyObject *Py_CompileString(const char *, const char *, int);
 PyObject *PyEval_EvalCode(PyObject *, PyObject *, PyObject *);
 PyObject *PyEval_GetBuiltins();
@@ -55,6 +58,7 @@ local py_src = [[
 from collections.abc import Iterable, Sequence
 from functools import wraps
 from inspect import Signature, signature
+from traceback import format_exception
 from typing import Tuple, Union, get_origin, get_args
 def _optional(t):
 	@wraps(t)
@@ -107,6 +111,8 @@ def sig(f, np, nr):
 		else:
 			rv[0] = _isvec(ra)
 	return tuple(pt), tuple(pv), tuple(rv)
+def fmtexc(exc):
+	return "".join(format_exception(exc))
 ]]
 
 -- init code to run when we are the ones setting up the python interpreter.
@@ -139,15 +145,51 @@ local function gcoref(o)
 	return o
 end
 
+local finalizer
+if C.Py_IsInitialized() == 0 then
+	-- if we init python, we'll close it as well.
+	-- this could blow up if someone inits python after us, but oh well.
+	-- this works in most cases.
+	finalizer = newproxy(true)
+	getmetatable(finalizer).__gc = function() C.Py_Finalize() end
+	C.Py_InitializeEx(0)
+	local code = assert(
+		gco(C.Py_CompileString(py_hostinit, "<fhk-hostinit>", Py_file_input)),
+		"failed to compile <fhk-hostinit>"
+	)
+	local globals = assert(gco(C.PyDict_New()), "PyDict_New() failed")
+	C.Py_DecRef(C.PyEval_EvalCode(code, globals, nil))
+	if C.PyErr_Occurred() ~= nil then error("python error in <fhk-hostinit>") end
+end
+
+local anchor, pysig, pyfmtexc = (function()
+	local code = assert(
+		gco(C.Py_CompileString(py_src, "<fhk-init>", Py_file_input)),
+		"failed to compile <fhk-init>"
+	)
+	local globals = assert(gco(C.PyDict_New()), "PyDict_New() failed")
+	C.Py_DecRef(C.PyEval_EvalCode(code, globals, nil))
+	if C.PyErr_Occurred() ~= nil then error("python error in <fhk-init>") end
+	local sig = assert(C.PyDict_GetItemString(globals, "sig"), "<fhk-init> didn't export `sig`")
+	local fmtexc = assert(C.PyDict_GetItemString(globals, "fmtexc"), "<fhk-init> didn't export `fmtexc`")
+	return {code=code, globals=globals}, sig, fmtexc
+end)()
+
 local function raise(err)
 	err = err or "python error"
 	if C.PyErr_Occurred() ~= nil then
 		local e = ffi.new("PyObject *[3]")
 		C.PyErr_Fetch(e+0, e+1, e+2)
-		local s = gco(C.PyObject_Str(e[1]))
-		if s then
+		C.PyErr_NormalizeException(e+0, e+1, e+2)
+		C.Py_DecRef(e[0])
+		local value = gco(e[1])
+		local tb = gco(e[2])
+		if value then
+			if tb then C.PyException_SetTraceback(value, tb) end
+			local exc = assert(gco(C.PyObject_CallFunctionObjArgs(pyfmtexc, value, nil)),
+				"yo dawg i heard u like errors")
 			local size = ffi.new("Py_ssize_t[1]")
-			local p = C.PyUnicode_AsUTF8AndSize(s, size)
+			local p = C.PyUnicode_AsUTF8AndSize(exc, size)
 			if p ~= nil then
 				error(string.format("%s: %s", err, ffi.string(p, size[0])), 2)
 			end
@@ -178,6 +220,7 @@ local function gcocheckref(o, err)
 end
 
 -- intern list of argument tuples.
+local tup1 = gcocheck(C.PyTuple_New(1))
 local pytuples = {}
 local function tuple(n)
 	if not pytuples[n] then
@@ -187,31 +230,8 @@ local function tuple(n)
 	return pytuples[n]
 end
 
-local finalizer
-if C.Py_IsInitialized() == 0 then
-	-- if we init python, we'll close it as well.
-	-- this could blow up if someone inits python after us, but oh well.
-	-- this works in most cases.
-	finalizer = newproxy(true)
-	getmetatable(finalizer).__gc = function() C.Py_Finalize() end
-	C.Py_InitializeEx(0)
-	local code = gcocheck(C.Py_CompileString(py_hostinit, "<fhk-hostinit>", Py_file_input))
-	local globals = gcocheck(C.PyDict_New())
-	C.Py_DecRef(C.PyEval_EvalCode(code, globals, nil))
-	if C.PyErr_Occurred() ~= nil then raise() end
-end
-
-local pysig = (function()
-	local code = gcocheck(C.Py_CompileString(py_src, "<fhk-init>", Py_file_input))
-	local globals = gcocheck(C.PyDict_New())
-	C.Py_DecRef(C.PyEval_EvalCode(code, globals, nil))
-	if C.PyErr_Occurred() ~= nil then raise() end
-	return ocheck(C.PyDict_GetItemString(globals, "sig"))
-end)()
-
 local function infersig(pf, np, nr)
-	local args = gcocheck(C.Py_BuildValue("(Oii)", pf, ffi.cast("int", np), ffi.cast("int", nr)))
-	local info = gcocheck(C.PyObject_Call(pysig, args, nil))
+	local info = gcocheck(C.PyObject_CallFunction(pysig, "Oii", pf, ffi.cast("int", np), ffi.cast("int", nr)))
 	local pt = ocheck(C.PyTuple_GetItem(info, 0))
 	local pv = ocheck(C.PyTuple_GetItem(info, 1))
 	local rv = ocheck(C.PyTuple_GetItem(info, 2))
@@ -280,7 +300,6 @@ local function memfmt(ctype)
 	return fmttab[tonumber(ctype)] or error(string.format("non-memoryview ctype: %s", ctype))
 end
 
-local tup1 = gcocheck(C.PyTuple_New(1))
 local function call1(x, a)
 	C.PyTuple_SetItem(tup1, 0, a)
 	return C.PyObject_Call(x, tup1, nil)
@@ -424,7 +443,9 @@ end
 
 return {
 	load        = py_load,
+	-- must hold a reference to these two for as long as this module is loaded.
 	_finalizer  = finalizer,
+	_anchor     = anchor,
 	-- for fhk_pyx
 	ocheck      = ocheck,
 	gcocheckref = gcocheckref,
