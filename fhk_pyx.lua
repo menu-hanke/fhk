@@ -29,6 +29,7 @@ local function vrefvpy(J, o)
 	local code = driver.code()
 	code.upv.f = o.impl.f
 	code.upv.ocheck = Py.ocheck
+	code.upv.echeck3 = Py.echeck3
 	if #o.impl.params > 0 then
 		code.upv.args = Py.tuple(#o.impl.params)
 		for i=1, #o.impl.params do
@@ -48,7 +49,6 @@ local function vrefvpy(J, o)
 	end
 	if C.Py_IsNone(o.impl.vec) == 0 then
 		-- TODO: use fhk_setvalue/fhk_setvalueC for directly copyable vectors
-		code.upv.echeck3 = Py.echeck3
 		code.src:putf(
 			[[
 				local ok = C.%s(S, %d, %s, r)
