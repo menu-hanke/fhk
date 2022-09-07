@@ -504,6 +504,11 @@ cdef class Graph:
         lua_pop(self.lua.L, 1)
         return dump
 
+    def sethook(self, hook):
+        fhk_pyx_loadmethod(self.lua.L, self.ref, b"sethook")
+        self.lua.pushoptstring(hook)
+        self.lua.pcall(2, 0)
+
 cdef int setvalue_scatter(fhk_solver *S, int idx, str fmt, object it, fhk_subset ss) except -1:
     fhk_setvalueD(S, idx, ss)
     cdef object mem = fhk_pyx_memV(S, idx).cast(fmt)

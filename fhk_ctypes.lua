@@ -224,6 +224,16 @@ local function mut_get(mref, handle)
 	return cast(cdef.otype[band(tag, 7)].ctypeptr, base+handle)
 end
 
+---- solver inspection ----------------------------------------
+
+local function solver_V(S, idx)
+	return ffi.cast("void **", S+1)[idx]
+end
+
+local function solver_X(S, idx)
+	return ffi.cast("fhk_sp **", S)[bit.bnot(idx)]
+end
+
 ---- metatypes ----------------------------------------
 
 for tag,ct in pairs {
@@ -285,6 +295,13 @@ ffi.metatype("fhk_mem", {
 	__index = {
 		destroy = C.fhk_destroy_mem,
 		reset = C.fhk_reset_mem
+	}
+})
+
+ffi.metatype("fhk_solver", {
+	__index = {
+		V = solver_V,
+		X = solver_X
 	}
 })
 

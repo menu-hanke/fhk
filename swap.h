@@ -8,6 +8,7 @@ NOAPI void fhk_yield(int);
 NOAPI void fhk_callback_return(void);
 NOAPI ERRFUNC void fhk_yield_err(fhk_status);
 NOAPI void fhk_enter_trampoline(void);
+NOAPI void fhk_yieldhook(void);
 NOAPI void fhk_fail_trampoline(void);
 
 #if FHK_x64
@@ -43,7 +44,7 @@ COLD static inline void fhk_fail(fhk_solver *S, fhk_status err) {
  *   +-----+-----+-----+-----+-----+-----+
  *   | rbp | rbx | r15 | r14 | r13 | rip |
  *   +-----+-----+-----+-----+-----+-----+
- *   ^ 
+ *   ^
  *   16n alignment
  *
  * we schedule the callback by writing a new frame below the swapped one:
@@ -60,6 +61,21 @@ static inline void fhk_callback(fhk_solver *S, void *cb) {
 	sp[-1] = fhk_callback_return;
 	sp[-2] = cb;
 	S->sp = sp-7;
+}
+
+/*
+ * schedule a yield before the solver continues.
+ * must be run from outside the solver.
+ * this is used for debug hooks.
+ * see `fhk_callback` for the stack layout: the only difference is that we don't store
+ * a return address, instead the driver calls fhk_continue() again.
+ * this preserves stack alignment.
+ */
+static inline void fhk_callhook(fhk_solver *S, int j) {
+	void **sp = S->sp;
+	sp[-1] = fhk_yieldhook;
+	sp[-5] = (void *) (intptr_t) j;
+	S->sp = sp-6;
 }
 
 /*

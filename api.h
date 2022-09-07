@@ -21,6 +21,7 @@ void fhk_setvalueC(fhk_solver *S, int idx, fhk_subset ss, void *p);
 void *fhk_setvalueD(fhk_solver *S, int idx, fhk_subset ss);
 void fhk_getvalue(fhk_solver *S, int idx, fhk_subset ss, void *p);
 void *fhk_getvalueD(fhk_solver *S, int idx, fhk_subset ss);
+void fhk_sethook(fhk_solver *S, int jidx);
 void fhk_invert(fhk_mem *mem, fhk_subset *from, int fromshape, fhk_subset *to, int toshape);
 
 /*

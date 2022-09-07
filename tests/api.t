@@ -310,6 +310,25 @@ function test_api_blacklist_missing_map()
 	assert(result.y == -1)
 end
 
+function test_api_sethook()
+	local graph = fhk.graph(function()
+		var "x" { function() return 1 end }
+	end)
+	local precalled, postcalled = 0, 0
+	graph:sethook(
+		function()
+			precalled = precalled+1
+			return function()
+				postcalled = postcalled+1
+			end
+		end
+	)
+	local query = graph:query "x"
+	graph:prepare()
+	query()
+	assert(precalled == 1 and postcalled == 1)
+end
+
 function test_api_no_chain()
 	local graph = fhk.graph()
 	graph:query "x"

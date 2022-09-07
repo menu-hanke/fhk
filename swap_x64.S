@@ -42,6 +42,7 @@ fhk_yield:
 	push rbx
 	push rbp
 
+1:
 	// swap to caller's stack.
 	mov rcx, rsp
 	mov rsp, [r12-SIZEOF_fhk_solver]
@@ -125,6 +126,17 @@ fhk_enter_trampoline:
 	mov edi, 1
 	call fhk_yield
 	jmp fhk_enter_trampoline
+
+/*
+ * solver -> outside world debug hook.
+ * this is a jump target for fhk_continue, not a function.
+ * rbx is the hook index.
+ */
+.global fhk_yieldhook
+.hidden fhk_yieldhook
+fhk_yieldhook:
+	mov edi, ebx
+	jmp 1b
 
 /*
  * solver -> outside world after the solver has failed in the outside world.

@@ -498,6 +498,10 @@ void *fhk_getvalueD(fhk_solver *S, int idx, fhk_subset ss) {
 	return ret;
 }
 
+void fhk_sethook(fhk_solver *S, int jidx) {
+	fhk_callhook(S, jidx);
+}
+
 /* ---- subset routines ---------------------------------------- */
 
 typedef struct pkbuf {

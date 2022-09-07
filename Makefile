@@ -92,7 +92,7 @@ CORE_O      = build.o debug.o solve.o sub.o swap_$(ARCH).o
 LOADER_O    = loader.o
 PYX_O       = fhk_api.pyx.o
 ifeq (y,$(LINKLUA))
-XLUACORE_O  = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o
+XLUACORE_O  = fhk_cdef.lua.o fhk_clib.lua.o fhk_ctypes.lua.o fhk_driver.lua.o fhk_trace.lua.o
 XLUALANG_O  = fhk_lang_Expr.lua.o fhk_lang_Lua.lua.o fhk_lang_Python.lua.o
 XLUALIB_O   = fhk_api.lua.o reflect.lua.o
 XLUAPY_O    = fhk_pyx.lua.o

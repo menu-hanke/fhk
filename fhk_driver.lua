@@ -80,92 +80,12 @@ end
 
 ---- debug/inspect ----------------------------------------
 
-local tagchar = "VMXDCPR"
-local tagmask = "mgpdsjrx"
-
-local function objcolor(cobj)
-	if bit.band(cobj.tag, cdef.mtagmask.s) ~= 0 then return 31 end
-	if cobj.what == "var" then return 36 end
-	if cobj.what == "model" then return 33 end
-	return ""
-end
-
-local function costcolor(cost)
-	if cost == math.huge then return 31 end
-	if cost == 0 then return 32 end
-	return ""
-end
-
-local function dumpcost(buf, cost, color)
-	if color then buf:put("\027[", costcolor(cost), "m") end
-	local num = #buf
-	buf:put(cost)
-	num = #buf - num
-	if color then buf:put("\027[m") end
-	return num
-end
-
-local function dumpidx(buf, idx, color)
-	if color then buf:put("\027[34m") end
-	buf:putf("%04d", idx)
-	if color then buf:put("\027[m") end
-end
-
-local function dumpobj(graph, buf, handle, cobj, color)
-	local obj = graph.objs[handle]
-	buf:putf("0x%04x ", handle)
-	if obj and obj.idx then
-		dumpidx(buf, obj.idx, color)
-	else
-		buf:put((" "):rep(4))
-	end
-	buf:put(" ")
-	if color then buf:put("\027[", objcolor(cobj), "m") end
-	local tag = cobj.tag
-	local typ = bit.band(tag, cdef.mtagmask.T)
-	buf:putf(tagchar:sub(typ+1,typ+1))
-	for i=1, #tagmask do
-		local c = tagmask:sub(i,i)
-		buf:put(bit.band(tag, cdef.mtagmask[c]) == 0 and "-" or c)
-	end
-	if color then buf:put("\027[m") end
-	buf:putf(" %-15s ", obj and obj.name or "")
-	if bit.band(tag, cdef.mtagmask.s) ~= 0 then return end
-	buf:put(" ")
-	if cobj.what == "var" or cobj.what == "model" then
-		buf:put("[")
-		local num = dumpcost(buf, cobj.clo, color)
-		buf:put(", ")
-		num = num + dumpcost(buf, cobj.chi, color)
-		buf:put("]")
-		if num < 8 then buf:put((" "):rep(8-num)) end
-	end
-	if obj and type(obj.ctype) == "cdata" then
-		local ct = tostring(obj.ctype):match("ctype<([^>]+)>")
-		if color then buf:put("\027[35m") end
-		buf:putf(" %-9s", ct)
-		if color then buf:put("\027[m") end
-	else
-		buf:put((" "):rep(10))
-	end
-	if obj and obj.jump then
-		buf:put("->")
-		dumpidx(buf, obj.jump, color)
-		if obj.impl then
-			buf:put(" ", tostring(obj.impl.loader))
-		end
-	end
-end
-
 local function graph_dump(graph, color)
-	local buf = buffer.new()
-	for h,o in graph.M:opairs() do
-		if o.what == "var" or o.what == "model" then
-			dumpobj(graph, buf, h, o, color)
-			buf:put("\n")
-		end
-	end
-	return buf:get()
+	return require("fhk_trace").dumpgraph(graph, color)
+end
+
+local function graph_sethook(graph, hook, obj)
+	(obj or graph).hook = hook or "v"
 end
 
 ---- building ----------------------------------------
@@ -1325,13 +1245,38 @@ local function graph_errf(graph)
 	end
 end
 
+local function graph_hookf(graph, f, hook)
+	local hstate = graph.hstate
+	if not hstate then
+		hstate = {}
+		graph.hstate = hstate
+	end
+	local jidx = graph.jnum+2
+	return function(S, X)
+		hstate.post = hook(S, X)
+		if hstate.post then
+			C.fhk_sethook(S, jidx)
+		end
+		return f(S, X)
+	end
+end
+
+local function graph_callhookf(graph)
+	local J, hstate = graph.J, graph.hstate
+	return function(S, X)
+		hstate.post(S, X)
+		return J[C.fhk_continue(S)](S, X)
+	end
+end
+
 local function graph_impl(graph)
 	graph.J[1] = ok
+	graph.jnum = cdef.jtabsize(graph.M)
 	-- prefill J first to make sure it doesn't become a hash table.
-	for i=2, cdef.jtabsize(graph.M) do
+	for i=2, graph.jnum+1 do
 		graph.J[i] = invalid
 	end
-	for h in graph.M:opairs("r") do
+	for h, o in graph.M:opairs("r") do
 		local obj = graph.objs[h]
 		if obj then
 			local idx, jump = graph.M:query(obj.handle)
@@ -1347,7 +1292,13 @@ local function graph_impl(graph)
 								error(string.format("module fhk_lang_%s doesn't export `load'", loader))
 							end
 						end
-						graph.J[jump] = loader(graph.J, obj)
+						local jfunc = loader(graph.J, obj)
+						local hook = graph.hook or obj.hook
+						if hook then
+							if hook == "v" then hook = require("fhk_trace").tracehook(graph, obj, o.what) end
+							jfunc = graph_hookf(graph, jfunc, hook)
+						end
+						graph.J[jump] = jfunc
 					else
 						graph.J[jump] = hole(desc(obj))
 					end
@@ -1356,6 +1307,9 @@ local function graph_impl(graph)
 		end
 	end
 	graph.J[0] = graph_errf(graph)
+	if graph.hstate then
+		graph.J[graph.jnum+2] = graph_callhookf(graph)
+	end
 end
 
 local function graph_layout(graph)
@@ -1393,6 +1347,7 @@ local graph_mt = {
 		addpredicate = graph_addpredicate,
 		setpredicate = graph_setpredicate,
 		dump         = graph_dump,
+		sethook      = graph_sethook,
 		setname      = graph_setname,
 		read         = graph_read,
 		analyze      = graph_analyze,
