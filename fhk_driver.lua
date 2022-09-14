@@ -1132,7 +1132,7 @@ local ctint = {
 	cttoid "int64_t", cttoid "uint64_t"
 }
 table.sort(ctint)
-local function pnum(predicate) return cdef.predicate[predicate] end
+local function pnum(predicate) return cdef.prednum[predicate] end
 local predcts = {
 	[">"] = ctfp, [">="] = ctfp, ["<"] = ctfp, ["<="] = ctfp,
 	is = ctint, isn = ctint,
@@ -1196,10 +1196,10 @@ local function topredicate(operator, lhs, rhs)
 			or (operator == ">=" and "f64ge" or "f64le")
 	end
 	if type(operator) == "string" then
-		operator = cdef.predicate[operator]
+		operator = cdef.prednum[operator]
 	end
 	local crhs = ffi.new("fhk_operand[1]")
-	ffi.cast(ffi.typeof("$*", lhs), crhs)[0] = rhs
+	ffi.cast(ffi.typeof("$*", cdef.predtype[operator]), crhs)[0] = rhs
 	return operator, crhs
 end
 

@@ -38,8 +38,14 @@ local otype = {
 #undef MUTOBJ
 }
 
-local predicate = {
-#define PREDTYPE(operator, operand) operator = C.PRED(operator),
+local prednum = {
+#define PREDNUM(operator, _) operator = C.PRED(operator),
+	FHK_PREDEF(PREDNUM)
+#undef PREDNUM
+}
+
+local predtype = {
+#define PREDTYPE(operator, operand) [C.PRED(operator)] = typeof(#operand),
 	FHK_PREDEF(PREDTYPE)
 #undef PREDTYPE
 }
@@ -77,7 +83,8 @@ return {
 	errmsg    = errmsg,
 	errtag    = errtag,
 	otype     = otype,
-	predicate = predicate,
+	prednum   = prednum,
+	predtype  = predtype,
 	mtagmask  = mtagmask,
 	jtabsize  = jtabsize,
 #if FHK_DSYM
