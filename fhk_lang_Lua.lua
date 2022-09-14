@@ -183,6 +183,9 @@ local function lua_load(J, o)
 	else
 		func = o.impl[1]
 	end
+	if o.impl.load then
+		func = o.impl.load(func)
+	end
 	if o.impl.mode == "ffi" then
 		return modcallffi(J, o, func)
 	else
