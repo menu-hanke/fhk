@@ -16,12 +16,11 @@ cdef extern from *:
 
     #include <stddef.h>
 
-    #define FHK_PYX_GRAPH   "!@fhk_pyx_graph"  /* function graph() */
+    #define FHK_PYX_GRAPH      "!@fhk_pyx_graph"
 
-    static void copyregfield(lua_State *L, const char *field, const char *rkey) {
-        // registry[rkey] = top[field]
-        lua_getfield(L, -1, field);
-        lua_setfield(L, LUA_REGISTRYINDEX, rkey);
+    static int fhk_pyx_traceback(lua_State *L) {
+        luaL_traceback(L, L, lua_tostring(L, 1), 1);
+        return 1;
     }
 
     static void *fhk_pyx_newstate() {
@@ -31,8 +30,11 @@ cdef extern from *:
         lua_getfield(L, LUA_GLOBALSINDEX, "require");
         lua_pushliteral(L, "fhk_pyx");
         lua_call(L, 1, 1);
-        copyregfield(L, "graph", FHK_PYX_GRAPH);
+        lua_getfield(L, -1, "graph");
+        lua_setfield(L, LUA_REGISTRYINDEX, FHK_PYX_GRAPH);
         lua_pop(L, 1);
+        // traceback handler left on stack for the rest of the lifetime of this lua state.
+        lua_pushcfunction(L, fhk_pyx_traceback);
         return L;
     }
 
@@ -75,8 +77,10 @@ cdef extern from *:
 
     int LUA_REGISTRYINDEX
     const char *FHK_PYX_GRAPH
+    const char *FHK_PYX_TRACEBACK
     ctypedef struct lua_State
     void lua_pop(lua_State *, int)
+    int lua_gettop(lua_State *)
     int lua_pcall(lua_State *, int, int, int)
     void lua_pushnil(lua_State *)
     void lua_pushstring(lua_State *, const char *)
@@ -140,17 +144,19 @@ class FhkError(Exception):
 @cython.auto_pickle(False)
 cdef class GCLua:
     cdef lua_State *L
+    cdef int16_t tb
 
     def __cinit__(self):
         self.L = fhk_pyx_newstate()
         if self.L == NULL:
             raise FhkError("failed to create lua state")
+        self.tb = lua_gettop(self.L)
 
     def __dealloc__(self):
         lua_close(self.L)
 
     cdef int pcall(self, int narg, int nret) except -1:
-        cdef int r = lua_pcall(self.L, narg, nret, 0)
+        cdef int r = lua_pcall(self.L, narg, nret, self.tb)
         if r != 0:
             self.raise_()
 
