@@ -200,6 +200,23 @@ function test_api_derive()
 	assert(res.y == 2)
 end
 
+function test_api_pattern()
+	local graph = fhk.graph(function()
+		pattern("global#(%w+)%+(%w+)", function(v, x, y)
+			derive(v) {
+				params {x, y},
+				impl.Expr "$1+$2"
+			}
+		end)
+		var "a" { function() return 1 end }
+		var "b" { function() return 2 end }
+	end)
+	local query = graph:query "a+b"
+	graph:prepare()
+	local res = query()
+	assert(res.a_b == 1+2)
+end
+
 function test_api_skip_given_model()
 	local graph = fhk.graph(function()
 		var "x" { function() return 1 end }

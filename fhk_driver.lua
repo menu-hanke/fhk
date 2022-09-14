@@ -874,6 +874,19 @@ local function var(graph, var, ...)
 	return applyvar(graph, var, props)
 end
 
+local function patterncall(f, var, x, ...)
+	if x then return f(var, x, ...) end
+end
+
+local function pattern(graph, pattern, f)
+	pattern = "^"..pattern.."$"
+	table.insert(graph.virt, function(var)
+		if var.name then
+			patterncall(f, var, var.name:match(pattern))
+		end
+	end)
+end
+
 local function applylabel(graph, key, x)
 	if type(x) == "table" then
 		for k,v in pairs(x) do
@@ -931,6 +944,7 @@ local function env(graph)
 			return function(...) return var(graph, x, ...) end
 		end
 	end
+	env.pattern = function(p,f) return pattern(graph, p, f) end
 	env.label   = function(...) return label(graph, ...) end
 	env.virtual = virtual
 	env.params  = params
