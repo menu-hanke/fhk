@@ -194,6 +194,9 @@ cdef class Mem:
     def __cinit__(self):
         self.mem = fhk_create_mem()
 
+    def __dealloc__(self):
+        self.destroy()
+
     def __enter__(self):
         return self
 
@@ -201,10 +204,14 @@ cdef class Mem:
         self.destroy()
 
     def reset(self):
+        if self.mem == NULL:
+            raise FhkError("memory is destroyed")
         fhk_reset_mem(self.mem)
 
     def destroy(self):
-        fhk_destroy_mem(self.mem)
+        if self.mem != NULL:
+            fhk_destroy_mem(self.mem)
+        self.mem = NULL
 
 @cython.auto_pickle(False)
 cdef class Solver:
