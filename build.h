@@ -76,6 +76,7 @@ typedef struct fhk_mut_edge {
 	fhk_mref32 model;     // the model                                      --> mut model
 } fhk_mut_edge;
 
+// note: fhk_mut_check must be castable to fhk_mut_edge
 typedef struct fhk_mut_check {
 	fhk_mtag tag;
 	fhk_mref32 mapMV;     // model->guard map                               --> mut var
@@ -122,10 +123,7 @@ typedef struct fhk_mut_var {
 	fhk_mref32 back;      // model back list / guarded var (guards)         --> mut edge | mut var
 	fhk_mref32 fwdM;      // model forward list head                        --> mut edge
 	union {
-		struct {
-			fhk_mref32 predicate; // predicate (predicated guards only)     --> mut predicate
-			fhk_mref32 fwdC;      // check forward list head (guards only)  --> mut check
-		};
+		fhk_mref32 predicate; // predicate (predicated guards only)         --> mut predicate
 		fhk_mref32 inverse;  // inverse map (maps only)                     --> mut var
 	};
 } fhk_mut_var;

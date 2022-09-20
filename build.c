@@ -144,7 +144,6 @@ static int obj_setguard(fhk_mut_graph *M, fhk_mref32 varH) {
 	var->tag = MTYPE(var) | MTAG_GUARD;
 	var->size = 0;
 	var->predicate = 0;
-	var->fwdC = 0;
 	return 1;
 }
 
@@ -443,7 +442,6 @@ static void linkvar(fhk_mut_graph *M, fhk_mref32 ref) {
 	fhk_mut_var *var = mrefp(M, ref);
 	var->next = M->var;
 	if(!(var->tag & MTAG_PREGRD)) var->back = 0;
-	if(var->tag & MTAG_GUARD) var->fwdC = 0;
 	var->fwdM = 0;
 	var->nm = 0;
 	M->var = ref;
@@ -481,11 +479,8 @@ static void linkrcheck(fhk_mut_graph *M, fhk_mref32 ref) {
 static void linkcheck(fhk_mut_graph *M, fhk_mref32 ref) {
 	fhk_mut_check *check = mrefp(M, ref);
 	fhk_mut_model *mod = mrefp(M, check->model);
-	fhk_mut_var *guard = mrefp(M, check->guard);
-	assert(!((check->tag|mod->tag|guard->tag) & MTAG_SKIP));
+	assert(!((check->tag|mod->tag|((fhk_mut_var *) mrefp(M, check->guard))->tag) & MTAG_SKIP));
 	check->nextM = mod->backC;
-	check->nextV = guard->fwdC;
-	guard->fwdC = ref;
 	mod->backC = ref;
 	mod->nc++;
 	trace(LINKCHECK, ref, fhk_mut_debug_sym(M, check->model), fhk_mut_debug_sym(M, check->guard),
@@ -556,10 +551,18 @@ static void relink(fhk_mut_graph *M) {
 
 /* ---- bound analysis ---------------------------------------- */
 
+static void bound_skipchain(fhk_mut_graph *M, fhk_mref32 back) {
+	fhk_mut_var *lhs = mrefp(M, back);
+	if(UNLIKELY((lhs->tag & (MTAG_PREGRD|MTAG_SKIP)) == MTAG_PREGRD)) {
+		bound_skipchain(M, lhs->back);
+		lhs->tag |= *((fhk_mtag *) mrefp(M, lhs->back)) & MTAG_SKIP;
+	}
+}
+
 // group skipped             ->   skip+unlink vars, models
 // var, map, model skipped   ->   skip+unlink edges
+// lhs skipped               ->   skip guard
 // edge skipped              ->   partial skip model (set k=inf, but don't unlink)
-// check skipped             ->   add penalty
 static void bound_setskip(fhk_mut_graph *M) {
 	fhk_mtag tag;
 	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
@@ -572,16 +575,17 @@ static void bound_setskip(fhk_mut_graph *M) {
 				fhk_mut_var *group = mrefp(M, obj->group);
 				if(group->tag & MTAG_SKIP)
 					obj->tag |= MTAG_SKIP;
-				if(tag & MTAG_PREGRD) {
-					// group is always shared with var so group skips also propagate correctly.
-					fhk_mut_var *var = mrefp(M, ref);
-					if(var->tag & MTAG_SKIP)
-						obj->tag |= MTAG_SKIP;
+				if(UNLIKELY((tag & (MTAG_PREGRD|MTAG_SKIP)) == MTAG_PREGRD)) {
+					fhk_mut_var *guard = (fhk_mut_var *) obj;
+					if(UNLIKELY(guard->back > ref))
+						bound_skipchain(M, guard->back);
+					obj->tag |= *((fhk_mtag *) mrefp(M, guard->back)) & MTAG_SKIP;
 				}
 				break;
 			}
 			case MTYPE(edgeP):
 			case MTYPE(edgeR):
+			case MTYPE(check):
 			{
 				fhk_mut_edge *edge = mrefp(M, ref);
 				fhk_mut_var *var = mrefp(M, edge->var);
