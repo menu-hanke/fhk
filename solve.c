@@ -69,10 +69,8 @@ static void eval_given(xidx idx, xinst inst) {
 	fhk_Gref G = srefS(S)->G;
 	yield_jmp(idx - grefG(G)->j[jidx(idx)]);
 	fhk_bmword *bm = srefX(S, ~idx);
-	if(UNLIKELY((bm[bitmap_idx(inst)] >> bitmap_shift(inst)) & 1)) goto unset;
-	return;
-unset:
-	yield_err_unset(idx, inst);
+	if(UNLIKELY((bm[bitmap_idx(inst)] >> bitmap_shift(inst)) & 1))
+		yield_err_unset(idx, inst);
 }
 
 /*
