@@ -1540,7 +1540,7 @@ static void build_model_obj(fhk_mut_graph *M, fhk_Gref G, fhk_mref32 modelH) {
 		ec[j] = ci;
 	}
 	// build parameters.
-	int32_t order[MAX_PARAM];
+	uint32_t order[MAX_PARAM];
 	fhk_edgeX *ex = mg->ex;
 	fhk_mut_edge *e;
 	int ncp = 0;
@@ -1552,7 +1552,7 @@ static void build_model_obj(fhk_mut_graph *M, fhk_Gref G, fhk_mref32 modelH) {
 		e = mrefp(M, eh);
 		fhk_mut_var *var = mrefp(M, e->var);
 		if(var->back) {
-			// TODO: precomputed
+			// TODO: precomputed (should get -2)
 			ncp++;
 			order[pi] = fu32(var->chi - var->clo);
 		} else {
@@ -1565,18 +1565,19 @@ static void build_model_obj(fhk_mut_graph *M, fhk_Gref G, fhk_mref32 modelH) {
 		ex->idx = var->idx;
 		ex->map = ((fhk_mut_var *) mrefp(M, e->mapMV))->idx;
 	}
-	// reorder parameters.
-	// computed -> precomputed -> given.
-	// order computed params in decreasing cost difference.
+	// reorder parameters:
+	//   [computed params in *increasing* order of cost difference]
+	//   [precomputed params (cost diff=0)]
+	//   [given params]
 	mg->e_cparam = ncp;
 	mg->e_xcparam = ncp + nx;
 	mg->e_param = np;
 	for(int64_t i=1; i<np; i++) {
 		fhk_edgeX ei = mg->ex[i];
-		int32_t o = order[i];
+		uint32_t o = order[i];
 		int64_t j = i;
 		for(; j>0; j--) {
-			if(order[j-1] >= o) break;
+			if(order[j-1] <= o) break;
 			order[j] = order[j-1];
 			mg->ex[j] = mg->ex[j-1];
 		}
