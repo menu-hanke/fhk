@@ -561,3 +561,19 @@ test_solve_update_exit_cost = t.g(function()
 	----------------------------------------
 	solution { y=2 }
 end)
+
+test_solve_fixup_edge_vp = t.g(function()
+	var "g" { const(fhk.space1(2)) }
+	var "g#k" { function(j) return 1-2*(j%2) end }
+	var "h" { const(fhk.space1(1)) }
+	var "h#m1" { const(fhk.tosubset{1}) }
+	derive "g#x" {
+		const(0)
+	}
+	derive "h#z" {
+		params "g#x ~m1",
+		const(0)
+	}
+	----------------------------------------
+	solution { ["h#z"]=0 }
+end)

@@ -528,7 +528,7 @@ static void expandbufV(xidx idx, fhk_frameC *F, void *W) {
 	if(UNLIKELY(F->base == WBASE)) return;
 	fhk_model *fm = grefobj(G, F->idx);
 	fhk_edgeX *fe = fm->ex + F->ei;
-	fhk_subset ss = map_subset_unchecked(fe->map, F->p_inst);
+	fhk_subset ss = map_subset_unchecked(fe->map, F->m_inst);
 	if(LIKELY(subset_isI(ss))) {
 		xidx vidx = fe->idx;
 		fhk_cedge *ce = F->ce + edgeP_order(fe->info);
