@@ -74,8 +74,7 @@ static void eval_given(xidx idx, xinst inst) {
 }
 
 /*
- * evaluate computed variable. caller must ensure it has no value yet,
- * but it may or may not have a chain.
+ * evaluate computed variable. caller must ensure one or none (but not both) of C/V is set.
  * X-state must be allocated.
  * return 0 on success, 1 on error.
  */
@@ -89,15 +88,18 @@ static int eval_computed(xidx var, xinst inst, void *W) {
 		assert(sp->cost == INFINITY);
 		return 1;
 	}
-	assert(!(sp->u8[SP8_FLAGS] & SPV8));
 	fhk_Gref G = srefS(S)->G;
 	xidx midx;
 	xinst minst;
 	if(grefmeta(G, ~var).tag & TAG_DERIVE) {
+		// can't speculate derives.
+		assert(!(sp->u8[SP8_FLAGS] & SPV8));
 		midx = var;
 		minst = inst;
 	} else {
 		uint32_t state = sp->state;
+		// solver picked speculated model?
+		if(UNLIKELY(state & SP_FLAGS32(SPV8))) return 0;
 		fhk_var *x = grefobj(G, var);
 		midx = vheap(x, ~(uint64_t)sp_ei(state))->idx;
 		minst = sp_inst(state);

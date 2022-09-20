@@ -295,6 +295,26 @@ test_solve_overwrite_speculate = t.g(function()
 	solution { x=3 } -- solve after y for speculation.
 end)
 
+test_solve_eval_computed_speculate = t.g(function()
+	model () {
+		returns "x w",
+		const(1, 2)
+	}
+	model () {
+		check "w" *ge(0),
+		returns "y",
+		const(1)
+	}
+	model () {
+		check "x" *ge(0),
+		params "y",
+		returns "z",
+		const(1)
+	}
+	----------------------------------------
+	solution { z=1 }
+end)
+
 test_solve_multi_instance_candidate = t.g(function()
 	var "g" { const(fhk.space1(3)) }
 	var "g#x" { ctype "uint8_t", id }
