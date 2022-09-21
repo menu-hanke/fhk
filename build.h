@@ -61,8 +61,9 @@ typedef uint16_t fhk_mtag;
 #define MTAG_VARTYPE   (MTAG_TYPE|MTAG_MAP|MTAG_GUARD)
 #define MTAG_PREGRD    0x0020   // variable is a guard with a builtin predicate.
 #define MTAG_DERIVE    0x0040   // var or model is derived.
-#define MTAG_SKIP      0x0100   // marker should pretend this object doesn't exist. linker should unlink.
-#define MTAG_IDX       0x0200   // object has a layouted index
+#define MTAG_SKIP      0x0100   // object will not be included in graph
+#define MTAG_SKIPNEXT  0x0200   // skip if not cleared
+#define MTAG_IDX       0x0400   // object has a layouted index
 #define MTAG_RETAIN    0x0800   // retain in graph, but does not imply recursively marked
 #define MTAG_MARKREC   0x1000   // recursively marked
 #define MTAG_MARK      (MTAG_RETAIN|MTAG_MARKREC)

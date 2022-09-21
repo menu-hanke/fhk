@@ -551,61 +551,106 @@ static void relink(fhk_mut_graph *M) {
 
 /* ---- bound analysis ---------------------------------------- */
 
-static void bound_skipchain(fhk_mut_graph *M, fhk_mref32 back) {
-	fhk_mut_var *lhs = mrefp(M, back);
-	if(UNLIKELY((lhs->tag & (MTAG_PREGRD|MTAG_SKIP)) == MTAG_PREGRD)) {
-		bound_skipchain(M, lhs->back);
-		lhs->tag |= *((fhk_mtag *) mrefp(M, lhs->back)) & MTAG_SKIP;
-	}
-}
-
-// group skipped             ->   skip+unlink vars, models
-// var, map, model skipped   ->   skip+unlink edges
-// lhs skipped               ->   skip guard
-// edge skipped              ->   partial skip model (set k=inf, but don't unlink)
 static void bound_setskip(fhk_mut_graph *M) {
 	fhk_mtag tag;
 	for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
 		tag = *(fhk_mtag *) mrefp(M, ref);
-		switch(tag & MTAG_TYPE) {
+		switch(tag & (MTAG_SKIP|MTAG_PREGRD|MTAG_TYPE)) {
 			case MTYPE(var):
-			case MTYPE(model):
 			{
-				fhk_mut_obj *obj = mrefp(M, ref);
-				fhk_mut_var *group = mrefp(M, obj->group);
-				if(group->tag & MTAG_SKIP)
-					obj->tag |= MTAG_SKIP;
-				if(UNLIKELY((tag & (MTAG_PREGRD|MTAG_SKIP)) == MTAG_PREGRD)) {
-					fhk_mut_var *guard = (fhk_mut_var *) obj;
-					if(UNLIKELY(guard->back > ref))
-						bound_skipchain(M, guard->back);
-					obj->tag |= *((fhk_mtag *) mrefp(M, guard->back)) & MTAG_SKIP;
-				}
+				fhk_mut_var *var = mrefp(M, ref);
+				var->back = 0;
 				break;
 			}
-			case MTYPE(edgeP):
 			case MTYPE(edgeR):
-			case MTYPE(check):
 			{
 				fhk_mut_edge *edge = mrefp(M, ref);
 				fhk_mut_var *var = mrefp(M, edge->var);
-				fhk_mut_model *model = mrefp(M, edge->model);
-				fhk_mut_var *map = mrefp(M, edge->mapMV);
-				if((tag | var->tag | map->tag | model->tag) & MTAG_SKIP) {
-					edge->tag |= MTAG_SKIP;
-					model->k = INFINITY;
-				} else if((tag & MTAG_TYPE) == MTYPE(edgeR)) {
-					if(map->inverse) {
-						fhk_mut_var *inverse = mrefp(M, map->inverse);
-						if(inverse->tag & MTAG_SKIP) {
-							edge->tag |= MTAG_SKIP;
-							model->k = INFINITY;
-						}
-					}
-				}
+				var->back = 1;
 				break;
 			}
 		}
+	}
+	for(;;) {
+		int fixpoint = 1;
+		int nnext = 0;
+		for(fhk_mref32 ref=MREF_USER; ref<M->uused; ref+=mtype_size(tag & MTAG_TYPE)) {
+			tag = *(fhk_mtag *) mrefp(M, ref);
+			switch(tag & (MTAG_SKIP|MTAG_SKIPNEXT|MTAG_TYPE)) {
+				case MTYPE(var):
+				{
+					fhk_mut_var *var = mrefp(M, ref);
+					fhk_mut_var *group = mrefp(M, var->group);
+					if(group->tag & MTAG_SKIP) {
+						var->tag |= MTAG_SKIP;
+						fixpoint = 0;
+					} else if(tag & MTAG_PREGRD) {
+						fhk_mut_var *lhs = mrefp(M, var->back);
+						if(lhs->tag & MTAG_SKIP) {
+							var->tag |= MTAG_SKIP;
+							fixpoint = 0;
+						}
+					} else if(var->back) {
+						var->tag |= MTAG_SKIPNEXT;
+						nnext++;
+					}
+					break;
+				}
+				case MTAG_SKIPNEXT|MTYPE(var):
+				{
+					fhk_mut_var *var = mrefp(M, ref);
+					var->tag |= MTAG_SKIP;
+					fixpoint = 0;
+					break;
+				}
+				case MTYPE(model):
+				{
+					fhk_mut_model *model = mrefp(M, ref);
+					fhk_mut_var *group = mrefp(M, model->group);
+					if(group->tag & MTAG_SKIP) {
+						model->tag |= MTAG_SKIP;
+						fixpoint = 0;
+					}
+					break;
+				}
+				case MTYPE(edgeP):
+				case MTYPE(edgeR):
+				case MTYPE(check):
+				{
+					fhk_mut_edge *edge = mrefp(M, ref);
+					fhk_mut_var *var = mrefp(M, edge->var);
+					fhk_mut_model *mod = mrefp(M, edge->model);
+					fhk_mut_var *map = mrefp(M, edge->mapMV);
+					fhk_mtag mask = var->tag | mod->tag | map->tag;
+					if((tag & MTAG_TYPE) == MTYPE(edgeR) && LIKELY(map->inverse))
+						mask |= ((fhk_mut_var *) mrefp(M, map->inverse))->tag;
+					if(mask & MTAG_SKIP) {
+						edge->tag |= MTAG_SKIP;
+						fixpoint = 0;
+					} else {
+						if((tag & MTAG_TYPE) == MTYPE(edgeR) && (var->tag & MTAG_SKIPNEXT)) {
+							var->tag &= ~MTAG_SKIPNEXT;
+							nnext--;
+						}
+						break;
+					}
+				}
+				// fallthrough.
+				case MTAG_SKIP|MTYPE(edgeP):
+				case MTAG_SKIP|MTYPE(edgeR):
+				case MTAG_SKIP|MTYPE(check):
+				{
+					fhk_mut_edge *edge = mrefp(M, ref);
+					fhk_mut_model *mod = mrefp(M, edge->model);
+					if(!(mod->tag & MTAG_SKIP)) {
+						mod->tag |= MTAG_SKIP;
+						fixpoint = 0;
+					}
+					break;
+				}
+			}
+		}
+		if(fixpoint && nnext == 0) break;
 	}
 }
 
@@ -821,12 +866,12 @@ static void bound_normalize(fhk_mut_graph *M) {
 }
 
 fhk_status fhk_mut_analyze(fhk_mut_ref *mp) {
-	bound_setskip(mrefM(mp));
-	relink(mrefM(mp));
+	fhk_mut_graph *M = mrefM(mp);
+	bound_setskip(M);
+	relink(M);
 	fhk_heapref hp;
 	if(UNLIKELY(!bheap_new(&hp))) return ecode(MEM);
 	fhk_status err = 0;
-	fhk_mut_graph *M = mrefM(mp);
 	if(UNLIKELY(err = bound_init_heap(M, &hp))) goto out;
 	if(UNLIKELY(err = bound_propagate(M, &hp))) goto out;
 	bound_normalize(M);
