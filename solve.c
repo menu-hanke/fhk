@@ -542,6 +542,7 @@ static void expandbufV(xidx idx, fhk_frameC *F, void *W) {
 #define reg(name) _reg_##name
 #define root(name) _root_##name
 
+NO_ASAN
 static int solver_chain(xidx root(X), xinst root(I), void *root(W)) {
 	int64_t reg(1); int64_t reg(2); int64_t reg(3); int64_t reg(4);
 	void *reg(P1); void *reg(P2);

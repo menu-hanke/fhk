@@ -35,6 +35,7 @@ typedef int32_t fhk_mref32;
 #define NOAPI             __attribute__((visibility("hidden"))) extern
 #define ERRFUNC           __attribute__((cold, noinline, noreturn))
 #define DEBUGFUNC         NOAPI __attribute__((section("fhkdbg")))
+#define NO_ASAN           __attribute__((no_sanitize_address))
 
 /* ---- indexing ---------------------------------------- */
 
