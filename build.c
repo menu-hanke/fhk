@@ -1383,9 +1383,7 @@ size_t fhk_mut_size(fhk_mut_ref *mp) {
 	for(int i=LAYOUT_MAXHOLE-1;; i--) {
 		assert(i >= 0);
 		if(M->endhole[i])
-			return ALIGN(M->nx*sizeof(fhk_meta), alignof(void *))   // meta table
-				+ sizeof(fhk_graph)                                 // graph
-				+ M->hole[i];                                       // graph data (including object table)
+			return ALIGN(M->nx*sizeof(fhk_meta)+sizeof(fhk_graph), alignof(void *)) + M->hole[i];
 	}
 }
 
