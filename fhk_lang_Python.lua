@@ -28,10 +28,10 @@ PyObject *PyDict_GetItemString(PyObject *, const char *);
 PyObject *PyTuple_New(Py_ssize_t);
 PyObject *PyTuple_GetItem(PyObject *, Py_ssize_t);
 int PyTuple_SetItem(PyObject *, Py_ssize_t, PyObject *);
-PyObject *PyLong_FromLong(long);
 PyObject *PyLong_FromSsize_t(Py_ssize_t);
 PyObject *PyLong_FromSize_t(size_t);
-long PyLong_AsLong(PyObject *);
+Py_ssize_t PyLong_AsSsize_t(PyObject *);
+size_t PyLong_AsSize_t(PyObject *);
 PyObject *PyFloat_FromDouble(double);
 double PyFloat_AsDouble(PyObject *);
 PyObject *PyBool_FromLong(long);
@@ -121,13 +121,53 @@ import sys, os
 sys.path.append(os.getcwd())
 ]]
 
+-- find the python C library.
+-- on linux this is easy: if we are running inside a python interpreter, we don't need to do
+-- anything. otherwise load libpython3.
+-- on windows it's more involved: if we are running inside a python interpreter, we must
+-- load the same dll as the python interpreter. otherwise load libpython3. except that it's
+-- not always available (eg. on mingw), so we must instead load libpythonX.Y.dll. except
+-- sometimes it may be called pythonXY.dll instead.
 local C = ffi.C
-if not pcall(function() return C.Py_InitializeEx end) then
-	-- libpython3 must be loaded with RTLD_GLOBAL.
-	-- see: https://docs.python.org/3/whatsnew/3.8.html#changes-in-the-c-api
-	C = ffi.load("python3", true)
-	if not C then
-		error("couldn't find python shared library")
+if jit.os == "Windows" then
+	-- https://learn.microsoft.com/en-us/windows/win32/winprog/windows-data-types
+	-- https://learn.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-enumprocessmodules
+	-- https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getprocaddress
+	ffi.cdef [[
+	bool K32EnumProcessModules(void *, void **, uint32_t, uint32_t *);
+	void *GetProcAddress(void *, const char *);
+	uint32_t GetModuleFileNameA(void *, char *, uint32_t);
+	]]
+	local modules = ffi.new("void *[1024]")
+	local msize = ffi.new("uint32_t[1]")
+	local cproc = ffi.cast("void *", -1)
+	if not C.K32EnumProcessModules(cproc, modules, 1024*8, msize) then
+		error("EnumProcessModules() failed")
+	end
+	C = (function()
+		for i=0, msize[0]/8-1 do
+			if C.GetProcAddress(modules[i], "Py_InitializeEx") ~= nil then
+				local buf = require("string.buffer").new()
+				local p, n = buf:reserve(1024)
+				local size = C.GetModuleFileNameA(modules[i], p, n)
+				if size == 0 then
+					error("GetModuleFileNameA() failed")
+				end
+				buf:commit(size+1)
+				local dll = buf:get()
+				return ffi.load(dll) or error(string.format("failed to load %s", dll))
+			end
+		end
+		-- this will not work if only pythonXY is not installed or if it's called libpythonX.dll
+		-- or whatever.
+		-- but atleast it works for the default windows installation.
+		return ffi.load("python3") or error("failed to load libpython3")
+	end)()
+else
+	if not pcall(function() return C.Py_InitializeEx end) then
+		-- libpython3 must be loaded with RTLD_GLOBAL.
+		-- see: https://docs.python.org/3/whatsnew/3.8.html#changes-in-the-c-api
+		C = ffi.load("python3", true) or error("failed to load libpython3")
 	end
 end
 
@@ -252,10 +292,10 @@ local ctkindtab = {}
 for k,v in pairs {
 	bool    = "bool",
 	float   = "float", double   = "float",
-	int8_t  = "int",   uint8_t  = "int",
-	int16_t = "int",   uint16_t = "int",
-	int32_t = "int",   uint32_t = "int",
-	int64_t = "int",   uint64_t = "int",
+	int8_t  = "int",   uint8_t  = "uint",
+	int16_t = "int",   uint16_t = "uint",
+	int32_t = "int",   uint32_t = "uint",
+	int64_t = "int",   uint64_t = "uint",
 } do
 	ctkindtab[tonumber(ffi.typeof(k))] = v
 end
@@ -264,22 +304,28 @@ local function ctkind(ctype)
 	return ctkindtab[tonumber(ctype)] or error(string.format("non-primitive ctype: %s", ctype))
 end
 
-local ctconvtab = {}
-for k,v in pairs {
-	bool     = "PyBool_FromLong",
-	float    = "PyFloat_FromDouble", double   = "PyFloat_FromDouble",
-	int8_t   = "PyLong_FromLong",    uint8_t  = "PyLong_FromLong",
-	int16_t  = "PyLong_FromLong",    uint16_t = "PyLong_FromLong",
-	int32_t  = "PyLong_FromLong",
-	uint32_t = ffi.sizeof("long") > 4 and "PyLong_FromLong" or "PyLong_FromSize_t",
-	int64_t  = ffi.sizeof("long") > 4 and "PyLong_FromLong" or "PyLong_FromSsize_t",
-	uint64_t = "PyLong_FromSize_t",
-} do
-	ctconvtab[tonumber(ffi.typeof(k))] = v
+-- C -> Python type conversion
+local cpyconv = {
+	bool  = "PyBool_FromLong",
+	float = "PyFloat_FromDouble",
+	int   = "PyLong_FromSsize_t",
+	uint  = "PyLong_FromSize_t"
+}
+
+local function cpyconvf(ctype)
+	return cpyconv[ctkind(ctype)]
 end
 
-local function ctconvf(ctype)
-	return ctconvtab[tonumber(ctype)] or error(string.format("non-primitive ctype: %s", ctype))
+-- Python -> C type conversion
+local pycconv = {
+	bool  = "PyLong_AsSsize_t",
+	float = "PyFloat_AsDouble",
+	int   = "PyLong_AsSsize_t",
+	uint  = "PyLong_AsSize_t"
+}
+
+local function pycconvf(ctype)
+	return pycconv[ctkind(ctype)]
 end
 
 -- ctype -> python struct notation
@@ -347,11 +393,11 @@ local function modcallpy(J, o, f)
 				local ctp = code:upval(ffi.typeof("$*", p.var.ctype))
 				code.src:putf(
 					"local x = ocheck(%s.%s(cast(%s, S.edges[%d].p)[0]))\n",
-					uC, ctconvf(p.var.ctype), ctp, i-1
+					uC, cpyconvf(p.var.ctype), ctp, i-1
 				)
 				local t = ocheck(C.PyTuple_GetItem(pt, i-1))
 				local kind = ctkind(p.var.ctype)
-				if t ~= builtins[kind] and C.Py_IsNone(t) == 0 then
+				if t ~= builtins[kind == "uint" and "int" or kind] and C.Py_IsNone(t) == 0 then
 					local tconv = code:upval(gcocheckref(t))
 					code.upv.call1 = call1
 					-- no need to decref: call1 eats the reference
@@ -382,7 +428,6 @@ local function modcallpy(J, o, f)
 		end
 		local v = ocheck(C.PyTuple_GetItem(rv, i-1))
 		local isvec = C.Py_IsNone(v) == 0 or mode:sub(#o.params+i,#o.params+i) == "v"
-		local kind = ctkind(r.var.ctype)
 		local dest, echeck, robj
 		-- TODO: should specialize for common types (list?)
 		-- TODO: just memcpy for buffer types (like numpy.array)
@@ -392,7 +437,7 @@ local function modcallpy(J, o, f)
 			robj = "robj"
 			code.src:putf([[
 				for i=0, tonumber(S.edges[%d].n)-1 do
-					local oi = %s.PyLong_FromLong(i)
+					local oi = %s.PyLong_FromSsize_t(i)
 					if oi == nil then echeck3(r) end
 					local robj = %s.PyObject_GetItem(y, oi)
 					%s.Py_DecRef(oi)
@@ -403,13 +448,11 @@ local function modcallpy(J, o, f)
 			echeck = "echeck3(r)"
 			robj = "y"
 		end
-		if kind == "float" then
-			code.src:putf("local v = %s.PyFloat_AsDouble(%s)\n", uC, robj)
-		elseif kind == "int" or kind == "bool" then
-			code.src:putf("local v = %s.PyLong_AsLong(%s)\n", uC, robj)
-		end
-		code.src:putf("if v == -1 then %s end\n", echeck)
-		code.src:putf("%s = v\n", dest)
+		code.src:putf([[
+			local v = %s.%s(%s)
+			if v == -1 then %s end
+			%s = v
+		]], uC, pycconvf(r.var.ctype), robj, echeck, dest)
 		if isvec then
 			code.src:putf([[
 					%s.Py_DecRef(robj)
@@ -447,11 +490,13 @@ return {
 	_finalizer  = finalizer,
 	_anchor     = anchor,
 	-- for fhk_pyx
+	C           = C,
 	ocheck      = ocheck,
 	gcocheckref = gcocheckref,
 	echeck3     = echeck3,
 	tuple       = tuple,
 	builtins    = builtins,
 	ctkind      = ctkind,
+	pycconvf    = pycconvf,
 	memfmt      = memfmt
 }

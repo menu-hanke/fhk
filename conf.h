@@ -16,7 +16,7 @@
 #define SOLVER_HEAP_COPY_UNROLL  4
 
 /* solver call stack size (bytes). */
-#define MAX_STACK                8192
+#define MAX_STACK                (1ULL << 20)
 
 /* initial mutgraph size (bytes). */
 #define MUT_INIT_UP              1024

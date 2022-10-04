@@ -80,24 +80,32 @@ local loader_source = template [[
 #include <stddef.h>
 #include <stdint.h>
 
+@if X.windows then
+#define LUA_API __declspec(dllimport)
+#define EXPORT  __declspec(dllexport)
+@else
+#define LUA_API
+#define EXPORT
+@end
+
 /*
  * relevant lua.h+lauxlib.h definitions copied here
  * so that luajit headers aren't required to build bcloader.
  */
 typedef struct lua_State lua_State;
-void lua_settop(lua_State *, int);
-void lua_pushstring(lua_State *, const char *);
-void lua_pushcclosure(lua_State *, void *, int);
-void lua_pushlstring(lua_State *, const char *, size_t);
-const char *lua_pushfstring(lua_State *, const char *, ...);
-int lua_remove(lua_State *, int);
-void lua_call(lua_State *, int, int);
-const char *luaL_gsub(lua_State *, const char *, const char *, const char *);
-const char *luaL_checklstring(lua_State *, int, size_t *);
-int luaL_loadbuffer(lua_State *, const char *, size_t, const char *);
-int luaL_error(lua_State *, const char *, ...);
+LUA_API void lua_settop(lua_State *, int);
+LUA_API void lua_pushstring(lua_State *, const char *);
+LUA_API void lua_pushcclosure(lua_State *, void *, int);
+LUA_API void lua_pushlstring(lua_State *, const char *, size_t);
+LUA_API const char *lua_pushfstring(lua_State *, const char *, ...);
+LUA_API int lua_remove(lua_State *, int);
+LUA_API void lua_call(lua_State *, int, int);
+LUA_API const char *luaL_gsub(lua_State *, const char *, const char *, const char *);
+LUA_API const char *luaL_checklstring(lua_State *, int, size_t *);
+LUA_API int luaL_loadbuffer(lua_State *, const char *, size_t, const char *);
+LUA_API int luaL_error(lua_State *, const char *, ...);
 
-const char luaJIT_BC_{{X.modsym}}[] = { {{X.bc_hook}} };
+static const char luaJIT_BC_{{X.modsym}}[] = { {{X.bc_hook}} };
 
 @if X.loader then
 static const char BC_INSTALL[] = { {{X.bc_install}} };
@@ -169,7 +177,7 @@ static int bclua_loader(lua_State *L) {
 }
 @end
 
-int luaopen_{{X.modsym}}(lua_State *L) {
+EXPORT int luaopen_{{X.modsym}}(lua_State *L) {
 @if X.loader then
 	ls_loadbc(L, BC_INSTALL, "=bcloader/install");
 	lua_pushcclosure(L, bclua_loader, 0);
@@ -203,7 +211,6 @@ usage: bcloader [options]
 	-L             install loader (required if you want to load modules other than `modname`)
 	-B             old luaL_loadbuffer workaround (use LJ_MAXMEM for size parameter)
 	-v             dump generated code in stderr
-	-f             print linker flags and exit
 ]],
 	jit.os
 	))
@@ -235,19 +242,11 @@ local function args(argv)
 			out.oldbc, i = true, i+1
 		elseif argv[i] == "-v" then
 			out.verbose, i = true, i+1
-		elseif argv[i] == "-f" then
-			out.ldflags, i = true, i+1
 		else
 			help()
 		end
 	end
 	return out
-end
-
-local function ldflags(argv)
-	if argv.dlopen then
-		print("-ldl")
-	end
 end
 
 local function checkargs(argv)
@@ -259,7 +258,7 @@ local function checkargs(argv)
 		if #argv.libnames == 0 then
 			table.insert(argv.libnames, string.match(argv.modname, "^[^%.]+"))
 		end
-	elseif not argv.ldflags then
+	else
 		io.stderr:write("bcloader: missing modname (-n)\n")
 		help()
 	end
@@ -273,10 +272,6 @@ end
 local function main(argv)
 	argv = args(argv)
 	checkargs(argv)
-	if argv.ldflags then
-		ldflags(argv)
-		return
-	end
 	local hook = bcloader_hook(argv)
 	local install = bcloader_install(argv)
 	argv.bc_hook = dumparray(string.dump(load(hook), true))

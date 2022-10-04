@@ -5,7 +5,21 @@
 #include "target.h"
 
 #if FHK_WINDOWS
-#error "TODO: windows"
+#define CARG1  rcx
+#define CARG1d ecx
+#else
+#define CARG1  rdi
+#define CARG1d edi
+#endif
+
+#if __ELF__
+#define HIDDEN(sym)   .hidden sym
+#define FUNCTION(sym) .type sym, @function
+#elif FHK_WINDOWS
+#define HIDDEN(sym)
+#define FUNCTION(sym)
+.section .drectve
+.asciz "-export:fhk_continue"
 #endif
 
 .intel_syntax noprefix
@@ -16,13 +30,13 @@
  * noreturn void fhk_yield_err(fhk_status err)
  */
 .globl fhk_yield_err
-.hidden fhk_yield_err
-.type fhk_yield_err, @function
+FUNCTION(fhk_yield_err)
+HIDDEN(fhk_yield_err)
 fhk_yield_err:
 	lea rax, [rip+fhk_fail_trampoline]
 	mov [rsp], rax                     // swap return address
-	mov [r12+OFFSETOF_sref_err], rdi   // srefs(S)->err = rdi
-	xor edi, edi                       // return 0
+	mov [r12+OFFSETOF_sref_err], CARG1 // srefs(S)->err = rdi
+	xor CARG1d, CARG1d                 // return 0
 	// -> continue to fhk_yield
 
 /*
@@ -30,8 +44,8 @@ fhk_yield_err:
  * void fhk_yield(int)
  */
 .globl fhk_yield
-.hidden fhk_yield
-.type fhk_yield, @function
+FUNCTION(fhk_yield)
+HIDDEN(fhk_yield)
 .align 16
 fhk_yield:
 	// save solver registers - we don't need to save r12 here.
@@ -41,14 +55,22 @@ fhk_yield:
 	push r15
 	push rbx
 	push rbp
+#if FHK_WINDOWS
+	push rdi
+	push rsi
+#endif
 
 1:
 	// swap to caller's stack.
-	mov rcx, rsp
+	mov rax, rsp
 	mov rsp, [r12-SIZEOF_fhk_solver]
-	mov [r12-SIZEOF_fhk_solver], rcx
+	mov [r12-SIZEOF_fhk_solver], rax
 
 	// restore caller's registers (including r12).
+#if FHK_WINDOWS
+	pop rsi
+	pop rdi
+#endif
 	pop rbp
 	pop rbx
 	pop r15
@@ -57,7 +79,7 @@ fhk_yield:
 	pop r12
 
 	// return idx
-	mov eax, edi
+	mov eax, CARG1d
 
 	// return to caller.
 	// TODO: is it faster to load return address earlier?
@@ -69,9 +91,9 @@ fhk_yield:
  * int fhk_continue(fhk_solver *)
  */
 .globl fhk_continue
-.type fhk_continue, @function
+FUNCTION(fhk_continue)
 .globl fhk_callback_return
-.hidden fhk_callback_return
+HIDDEN(fhk_callback_return)
 .align 16
 fhk_continue:
 	// save outside world registers on outside world stack.
@@ -81,17 +103,25 @@ fhk_continue:
 	push r15
 	push rbx
 	push rbp
+#if FHK_WINDOWS
+	push rdi
+	push rsi
+#endif
 
 	// swap to solver stack.
 	mov rax, rsp
-	mov rsp, [rdi]
-	mov [rdi], rax
+	mov rsp, [CARG1]
+	mov [CARG1], rax
 
 	// restore solver registers.
-	lea r12, [rdi+SIZEOF_fhk_solver]
+	lea r12, [CARG1+SIZEOF_fhk_solver]
 
 	// solver->solver return.
 fhk_callback_return:
+#if FHK_WINDOWS
+	pop rsi
+	pop rdi
+#endif
 	pop rbp
 	pop rbx
 	pop r15
@@ -108,7 +138,7 @@ fhk_callback_return:
  * this function should *return* when there's no more work to be done.
  * void fhk_solver_main()   (r12 is solver)
  */
-.hidden fhk_solver_main
+ HIDDEN(fhk_solver_main)
 
 /*
  * asm entry point.
@@ -117,13 +147,13 @@ fhk_callback_return:
  * void fhk_solver_enter()   (r12 is solver)
  */
 .globl fhk_enter_trampoline
-.hidden fhk_enter_trampoline
+HIDDEN(fhk_enter_trampoline)
 fhk_enter_trampoline:
 	// note: we don't need to change the stack pointer here. if we have reached this point,
 	// then the solver was just initialized, or it returned all the way back up here.
 	// either way, sp now points at the top of the shared stack.
 	call fhk_solver_main
-	mov edi, 1
+	mov CARG1d, 1
 	call fhk_yield
 	jmp fhk_enter_trampoline
 
@@ -132,10 +162,10 @@ fhk_enter_trampoline:
  * this is a jump target for fhk_continue, not a function.
  * rbx is the hook index.
  */
-.global fhk_yieldhook
-.hidden fhk_yieldhook
+.globl fhk_yieldhook
+HIDDEN(fhk_yieldhook)
 fhk_yieldhook:
-	mov edi, ebx
+	mov CARG1d, ebx
 	jmp 1b
 
 /*
@@ -143,8 +173,8 @@ fhk_yieldhook:
  * this is a jump target for fhk_continue, not a function.
  */
 .globl fhk_fail_trampoline
-.hidden fhk_fail_trampoline
+HIDDEN(fhk_fail_trampoline)
 fhk_fail_trampoline:
-	xor edi, edi
+	xor CARG1d, CARG1d
 	call fhk_yield
 	jmp fhk_fail_trampoline

@@ -24,6 +24,22 @@
 /* the S register must: (1) be C callee-saved, and (2) match the assembly coroutine. */
 register fhk_Sref S asm(ASMREG_S);
 
+#if FHK_x64 && FHK_WINDOWS
+/*
+ * xmm6-xmm15 are callee-saved in the ms abi.
+ * this means that normally the coroutine swap would have to save/restore them.
+ * we can do fine with just xmm0-xmm5, so we will disable xmm6-xmm15 entirely on windows
+ * to avoid the extra saves & restores.
+ *
+ * note that this only has to be done here.
+ * all other functions are called and return normally, so they can use all registers.
+ */
+#define DISABLE(xmm) register double _##xmm asm(#xmm)
+DISABLE(xmm6);  DISABLE(xmm7);  DISABLE(xmm8);  DISABLE(xmm9);  DISABLE(xmm10);
+DISABLE(xmm11); DISABLE(xmm12); DISABLE(xmm13); DISABLE(xmm14); DISABLE(xmm15);
+#undef DISABLE
+#endif
+
 // we will be calling recursively into the solver a lot, so declare the main functions here.
 static int solver_chain(xidx, xinst, void *);
 static void eval_modcall(xidx, xinst, void *);
@@ -554,6 +570,7 @@ static int solver_chain(xidx root(X), xinst root(I), void *root(W)) {
 		xidx idx = root(X);
 		xinst inst = root(I);
 		W = (fhk_frameW *)((int64_t *)root(W)+1) - 1;
+		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) (W+1));
 		W->base = WBASE;
 		fhk_Gref G = srefS(S)->G;
 		fhk_sp *sp = srefX(S, ~idx);
@@ -594,7 +611,7 @@ enter_computed:
 		fhk_frameW *W_ = W;
 		fhk_edgeH *heapw = (fhk_edgeH *) (W+1);
 		W = (fhk_frameW *) (heapw+nh);
-		// TODO check for overflow somewhere around here
+		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) (W+1));
 		int h = nh;
 		for(;;) {
 			memcpy(heapw, heapx, SOLVER_HEAP_COPY_UNROLL*sizeof(*heapw));
@@ -612,7 +629,7 @@ enter_computed:
 		W->beta = reg(B);
 		W->link = (intptr_t)W - (intptr_t)W_;
 		W->tol = 0x75; // initial exponent: 01110101 = 2^-10
-		trace(ENTERV, (intptr_t)W-(intptr_t)mem_W(srefS(S)->mem), fhk_debug_sym(G, var), inst, W->beta);
+		trace(ENTERV, (intptr_t)W-(intptr_t)mem_W(srefS(S)->mem), fhk_debug_sym(G, var), (int)inst, W->beta);
 		goto enter_cand;
 	}
 
@@ -727,12 +744,12 @@ enter_checkcand:
 				// the variable has a speculated value. we will be overwriting it anyway.
 				xsp->state = SP_FLAGS32(SPC8) | (inst << 8) | wtop(W)->ei;
 			}
-			trace(CHAINC, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), (xidx)W->v_inst,
-					fhk_debug_sym(srefS(S)->G, model), inst, sp->cost);
+			trace(CHAINC, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), W->v_inst,
+					fhk_debug_sym(srefS(S)->G, model), (int)inst, sp->cost);
 			reg(D) = sp->cost;
 			goto exit_chosen;
 		}
-		trace(ENTERC, relW(W), fhk_debug_sym(srefS(S)->G, model), inst, reg(B), reg(D));
+		trace(ENTERC, relW(W), fhk_debug_sym(srefS(S)->G, model), (int)inst, reg(B), reg(D));
 		goto enter_mod;
 	}
 
@@ -748,13 +765,14 @@ enter_derive:
 		fhk_sp *sp = reg(P1);
 		xinst inst = reg(2);
 		W = (void *)W + sizeof(fhk_edgeH) + sizeof(*W);
+		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) (W+1));
 		wtop(W)->idx = reg(1);
 		wtop(W)->c = INFINITY;
 		W->v_sp = sp + inst;
 		W->link = sizeof(fhk_edgeH) + sizeof(*W);
 		W->beta = reg(B);
 		reg(D) = INFINITY;
-		trace(ENTERD, relW(W), fhk_debug_sym(srefS(S)->G, reg(1)), reg(2), reg(B));
+		trace(ENTERD, relW(W), fhk_debug_sym(srefS(S)->G, reg(1)), (int)reg(2), reg(B));
 		goto enter_mod;
 	}
 
@@ -861,7 +879,7 @@ check_next:
 			continue;
 check_penalty:
 			trace(PENALTY, relW(W), ~(int)ci, fhk_debug_sym(srefS(S)->G, wtop(W)->idx),
-					(xinst)W->m_inst, fhk_debug_sym(srefS(S)->G, ce->idx),
+					W->m_inst, fhk_debug_sym(srefS(S)->G, ce->idx),
 					fhk_debug_sym(srefS(S)->G, ce->map),
 					ce->penalty, penalty+ce->penalty, lim);
 			penalty += ce->penalty;
@@ -1020,7 +1038,7 @@ param_edge:
 			inst++;
 		}
 		trace(PARAM, relW(W), (int)reg(1), fhk_debug_sym(srefS(S)->G, wtop(W)->idx),
-				reg(2), fhk_debug_sym(srefS(S)->G, m->ex[reg(1)].idx),
+				(int)reg(2), fhk_debug_sym(srefS(S)->G, m->ex[reg(1)].idx),
 				fhk_debug_sym(srefS(S)->G, m->ex[reg(1)].map),
 				ce, ci+ce, reg(B));
 		reg(C) = ci + ce;
@@ -1044,7 +1062,7 @@ solved:
 		spm->state = SP_FLAGS32(SPC8);
 		float cost = costf(m, ci);
 		spm->cost = cost;
-		trace(CHAINM, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), inst, cost, ci);
+		trace(CHAINM, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), (int)inst, cost, ci);
 		if(LIKELY(!m->n_rcheck)) {
 			fhk_sp *spv = W->v_sp;
 			spv->state = SP_FLAGS32(SPC8) | (inst << 8) | wtop(W)->ei;
@@ -1076,8 +1094,8 @@ solved:
 			}
 		}
 		if(spm != W->v_sp)
-			trace(CHAINV, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), (xidx)W->v_inst,
-					fhk_debug_sym(srefS(S)->G, wtop(W)->idx), inst, cost, ci);
+			trace(CHAINV, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), W->v_inst,
+					fhk_debug_sym(srefS(S)->G, wtop(W)->idx), (int)inst, cost, ci);
 		reg(D) = cost;
 		goto exit_chosen;
 	}
@@ -1105,7 +1123,7 @@ exit_chosen:
 			fhk_pkref pk = W->p_pk;
 			if(LIKELY(!pk)) {
 				trace(TAILP, relW(W), W->p_ei,
-						fhk_debug_sym(srefS(S)->G, wtop(W)->idx), (xinst)W->m_inst,
+						fhk_debug_sym(srefS(S)->G, wtop(W)->idx), W->m_inst,
 						fhk_debug_sym(srefS(S)->G, m->ex[W->p_ei].idx),
 						fhk_debug_sym(srefS(S)->G, m->ex[W->p_ei].map),
 						ce, ci+ce, W->bi);
@@ -1139,7 +1157,7 @@ bound:
 		sp->cost = reg(D);
 		// more candidates left?
 		float delta = wtop(W)->c;
-		trace(BOUND, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), inst, reg(D), W->beta, delta);
+		trace(BOUND, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), (int)inst, reg(D), W->beta, delta);
 		if(delta <= W->beta) {
 			if(LIKELY(reg(D) > delta)) goto candidate;
 			// stalling due to rounding error (we have ci > bi but cost <= delta <= beta).
@@ -1154,7 +1172,7 @@ bound:
 			reg(A) = W->p_ce;
 			reg(B) = W->bi + uf32((uint32_t)W->tol << 22);
 			reg(C) = W->ci;
-			trace(TOLER, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), inst, W->tol, reg(B));
+			trace(TOLER, relW(W), fhk_debug_sym(srefS(S)->G, wtop(W)->idx), (int)inst, W->tol, reg(B));
 			W->tol++;
 			goto param_edge;
 		}
@@ -1171,7 +1189,7 @@ bound:
 exit_bound:
 	{
 		assert(reg(D) == W->v_sp->cost);
-		trace(BOUNDV, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), (xidx)W->v_inst, reg(D));
+		trace(BOUNDV, relW(W), fhk_debug_sym(srefS(S)->G, W->v_idx), W->v_inst, reg(D));
 		W = (void*)W - W->link;
 		if(UNLIKELY(W->base == WBASE)) return 1;
 		fhk_Gref G = srefS(S)->G;
@@ -1297,8 +1315,9 @@ static void eval_modcall(xidx root(M), xinst root(I), void *root(W)) {
 /* enter root modcall. */
 	{
 		F = (fhk_frameC *)((int64_t *)root(W)+1) - 1;
-		F->base = WBASE;
 		W = F+1;
+		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) W);
+		F->base = WBASE;
 		reg(1) = root(M);
 		reg(2) = root(I);
 		goto enter;
@@ -1318,18 +1337,20 @@ LABEL(enter)
 		if(UNLIKELY(!(((uint8_t *)srefX(S, ~idx))[-1] & HV)))
 			expandbufV(idx, F, W);
 		fhk_model *m = grefobj(G, idx);
-		((fhk_frameC *)W)->link = (intptr_t)W - (intptr_t)F;
-		F = W;
 		// always allocate 1 extra edge for derives.
 		// in case of non-derive we may temporarily waste 16 bytes of scratch space.
 		// no big deal.
-		W += sizeof(fhk_frameC) + (ptrdiff_t)(m->e_return+1)*sizeof(fhk_cedge);
+		void *WW = W + sizeof(fhk_frameC) + (ptrdiff_t)(m->e_return+1)*sizeof(fhk_cedge);
+		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) WW);
+		((fhk_frameC *)W)->link = (intptr_t)W - (intptr_t)F;
+		F = W;
+		W = WW;
 		F->m_inst = reg(2);
 		F->idx = idx;
 		F->c_pk = 0;
 		reg(1) = m->e_xcparam;
 		reg(P1) = m;
-		trace(EVALM, relW(W), fhk_debug_sym(G, idx), reg(2));
+		trace(EVALM, relW(W), fhk_debug_sym(G, idx), (int)reg(2));
 		goto paramxc;
 	}
 
@@ -1420,6 +1441,7 @@ LABEL(paramxc_edge)
 				void *vp = srefV(S, e->idx);
 				size_t n = 1 + pkref_znum(pk);
 				size_t size = F->c_size*n;
+				fhk_mem_commit_head(srefS(S)->mem, (intptr_t)W + size);
 				memcpy(W, vp + F->c_size*pkref_first(pk), size);
 				W += size;
 				*F->c_n += n;
@@ -1489,6 +1511,7 @@ paramg_retry:
 					eval_given_interval(idx, first, zn, bm);
 					size_t sz = size*(1+zn);
 					n += 1+zn;
+					fhk_mem_commit_head(srefS(S)->mem, (intptr_t)W + sz);
 					// reload vp here because we can't load it before eval_given.
 					memcpy(W, srefV(S, idx) + first*size, sz);
 					W += sz;
@@ -1613,6 +1636,7 @@ returns_retry:
 				// TODO: eval return checks, increase cost
 				yield_err_nyi();
 			}
+			fhk_mem_commit_head(srefS(S)->mem, (intptr_t) W);
 			yield_jmp(jmp);
 			if(UNLIKELY(wback)) {
 				e = m->ex + m->e_param;

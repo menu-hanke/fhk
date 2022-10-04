@@ -1,5 +1,6 @@
 /* solver subroutines. */
 
+#include "api.h"
 #include "debug.h"
 #include "def.h"
 #include "sub.h"
@@ -37,6 +38,8 @@ static void vm_unmap(fhk_mem *mem) {
 	munmap(mem, VM_SIZE);
 }
 
+#define mem_commit_ident(mem) ((void)(mem))
+
 #elif FHK_WINDOWS
 
 #define WIN32_LEAN_AND_MEAN
@@ -56,15 +59,32 @@ static void vm_unmap(fhk_mem *mem) {
 	VirtualFree((LPVOID)mem, 0, MEM_RELEASE);
 }
 
+static void mem_commit_ident(fhk_mem *mem) {
+	VirtualAlloc((LPVOID)mem_id(mem), (mem->ident+1)*sizeof(fhk_subset), MEM_COMMIT, PAGE_READWRITE);
+}
+
+void fhk_mem_win_commit_head(fhk_mem *mem, intptr_t head) {
+	head = (head + 4095) & ~4095;
+	VirtualAlloc((LPVOID)mem->chead, head-mem->chead, MEM_COMMIT, PAGE_READWRITE);
+	mem->chead = head;
+}
+
+void fhk_mem_win_commit_tail(fhk_mem *mem, intptr_t tail) {
+	tail &= ~4095;
+	VirtualAlloc((LPVOID)tail, mem->ctail-tail, MEM_COMMIT, PAGE_READWRITE);
+	mem->ctail = tail;
+}
+
 #endif
 
 fhk_mem *fhk_create_mem() {
 	fhk_mem *mem = vm_map();
 	if(UNLIKELY(!mem)) return NULL;
 	mem->tail = (intptr_t) mem_tail(mem);
+	// note: mem->ident is znum so this means the first index is initialized.
+	// it will not be actually committed though until fhk_mem_grow_ident is called.
+	// this is fine because initially the solver identmap points to IDENT_INTERN.
 	mem->ident = 0;
-	// mem->ident is znum, so mem->ident=0 means the first index must be initialized.
-	*mem_id(mem) = 0;
 	fhk_stack_init(mem_stack(mem) + MAX_STACK);
 	return mem;
 }
@@ -152,10 +172,10 @@ void fhk_mem_newbitmapV(fhk_Sref S, xidx idx, xinst shape) {
 	tail &= ~(alignof(fhk_bmword) - 1);
 	fhk_bmword *f = (fhk_bmword *) tail;
 	srefV(S, idx) = f;
-	size_t i = 0;
-	do { *f++ = 0; } while(++i < words);
 	tail -= sizeof(fhk_bmword) * words;
 	fhk_mem_commit_tail(mem, tail);
+	size_t i = 0;
+	do { *f++ = 0; } while(++i < words);
 	mem->tail = tail;
 	fhk_bmword *m = (fhk_bmword *) tail;
 	if(LIKELY(shape & 63))
@@ -236,6 +256,7 @@ void fhk_mem_grow_ident(fhk_Sref S, int32_t znum) {
 	if(znum > ident) {
 		fhk_subset *id = mem_id(mem) + ident;
 		mem->ident = znum;
+		mem_commit_ident(mem);
 		do {
 			*++id = ++ident;
 		} while(ident < znum);
@@ -383,7 +404,7 @@ static void vref_copyvalue(fhk_solver *S, xidx idx, fhk_subset ss, void *p, void
 		xinst num = subsetIE_size(ss);
 		vref_clear(S, idx, bm, start, start+num);
 		memcpy(vp+start*size, p, size*num);
-		trace(SETVALI, fhk_debug_sym(S->G, idx), start, num-1, fhk_debug_value(S2ref(S), idx, start));
+		trace(SETVALI, fhk_debug_sym(S->G, idx), (int)start, (int)num-1, fhk_debug_value(S2ref(S), idx, start));
 	} else {
 		fhk_pkref pk = subsetC_pk(ss);
 		for(;;) {
@@ -392,7 +413,7 @@ static void vref_copyvalue(fhk_solver *S, xidx idx, fhk_subset ss, void *p, void
 			xinst skip = size*num;
 			vref_clear(S, idx, bm, start, start+num);
 			memcpy(vp + size*start, p, skip);
-			trace(SETVALI, fhk_debug_sym(S->G, idx), start, num-1, fhk_debug_value(S2ref(S), idx, start));
+			trace(SETVALI, fhk_debug_sym(S->G, idx), (int)start, (int)num-1, fhk_debug_value(S2ref(S), idx, start));
 			if(!pkref_more(pk)) return;
 			p += skip;
 			pk = pkref_next(pk);
@@ -422,7 +443,7 @@ void *fhk_setvalueD(fhk_solver *S, int idx, fhk_subset ss) {
 		xinst start = subsetI_first(ss);
 		xinst num = subsetIE_size(ss);
 		vref_clear(S, idx, bm, start, start+num);
-		trace(SETVALD, fhk_debug_sym(S->G, idx), start, num-1);
+		trace(SETVALD, fhk_debug_sym(S->G, idx), (int)start, (int)num-1);
 		return vp + start*size;
 	} else {
 		fhk_pkref pk = subsetC_pk(ss);
@@ -431,7 +452,7 @@ void *fhk_setvalueD(fhk_solver *S, int idx, fhk_subset ss) {
 			xinst start = pkref_first(pk);
 			xinst num = pkref_size(pk);
 			vref_clear(S, idx, bm, start, start+num);
-			trace(SETVALD, fhk_debug_sym(S->G, idx), start, num-1);
+			trace(SETVALD, fhk_debug_sym(S->G, idx), (int)start, (int)num-1);
 			if(!pkref_more(pk)) return vp;
 			pk = pkref_next(pk);
 		}
@@ -521,7 +542,7 @@ typedef union ssbuf {
 	fhk_subset ss;
 } ssbuf;
 
-static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
+static void invert_put(fhk_mem *mem, intptr_t *tail, ssbuf *b, int32_t inst) {
 	// can merge?
 	if(LIKELY(b->end == inst-1)) {
 		b->end = inst;
@@ -531,8 +552,8 @@ static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
 	if(b->end < 0) {
 		// alloc 8 intervals
 		*tail -= sizeof(pkbuf) + 8*5;
-		// TODO: commit
 		pkbuf *pk = (pkbuf *) *tail;
+		fhk_mem_commit_tail(mem, *tail);
 		pk->cap = 8;
 		pk->used = 0;
 		pk->start = inst;
@@ -545,7 +566,7 @@ static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
 	if(UNLIKELY(pk->used == pk->cap)) {
 		pk->cap <<= 1;
 		*tail -= sizeof(pkbuf) + pk->cap*5;
-		// TODO: commit
+		fhk_mem_commit_tail(mem, *tail);
 		memcpy((void *)tail, pk, sizeof(pkbuf)+pk->used*5);
 		pk = (pkbuf *) tail;
 		b->pk = pmref(b, pk);
@@ -556,9 +577,9 @@ static void invert_put(intptr_t *tail, ssbuf *b, int32_t inst) {
 	b->end = inst;
 }
 
-static void invert_putall(intptr_t *tail, ssbuf *bb, int32_t inst, xinst znum) {
+static void invert_putall(fhk_mem *mem, intptr_t *tail, ssbuf *bb, int32_t inst, xinst znum) {
 	do {
-		invert_put(tail, bb++, inst);
+		invert_put(mem, tail, bb++, inst);
 	} while(--znum >= 0);
 }
 
@@ -576,11 +597,11 @@ void fhk_invert(fhk_mem *mem, fhk_subset *from, int fromshape, fhk_subset *to, i
 	for(int i=0; i<fromshape; i++, from++) {
 		fhk_subset ss = *from;
 		if(LIKELY(subset_isI(ss))) {
-			invert_putall(&tail, b+subsetI_first(ss), i, subsetIE_znum(ss));
+			invert_putall(mem, &tail, b+subsetI_first(ss), i, subsetIE_znum(ss));
 		} else {
 			fhk_pkref pk = subsetC_pk(ss);
 			for(;;) {
-				invert_putall(&tail, b+pkref_first(pk), i, pkref_znum(pk));
+				invert_putall(mem, &tail, b+pkref_first(pk), i, pkref_znum(pk));
 				if(!pkref_more(pk)) break;
 				pk = pkref_next(pk);
 			}
@@ -599,8 +620,8 @@ void fhk_invert(fhk_mem *mem, fhk_subset *from, int fromshape, fhk_subset *to, i
 				b[i].pk = pk->start;
 			} else {
 				// pk->used+1 intervals +3 trailing zero bytes.
-				// TODO: commit
 				tail -= 5*pk->used + 8;
+				fhk_mem_commit_tail(mem, tail);
 				fhk_pkref r = (fhk_pkref) tail;
 				memcpy(r, pk->pk, pk->used*5);
 				pkref_write(r + pk->used*5, pk->start, b[i].end-pk->start);
@@ -615,9 +636,9 @@ void fhk_invert(fhk_mem *mem, fhk_subset *from, int fromshape, fhk_subset *to, i
 	// step 3: move all complex subsets
 	if(tail != tail0) {
 		ptrdiff_t size = tail0 - tail;
-		memcpy((void *)mem->tail - size, (void *)tail, size);
 		ptrdiff_t off = mem->tail - tail0;
-		mem->tail = size;
+		mem->tail -= size;
+		memcpy((void *)mem->tail, (void *)tail, size);
 		// ~(~c+x) = -(-c-1+x)-1 = c+1+x-1 = c-x
 		for(int i=0; i<toshape; i++) {
 			if(subset_isC(b[i].ss)) {

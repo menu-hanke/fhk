@@ -41,5 +41,4 @@
 
 #if FHK_OS == FHK_OS_POSIX
 #define FHK_MMAP           1
-#define FHK_ASM_CORO       1
 #endif

@@ -45,6 +45,7 @@ cdef extern from *:
     }
 
     #include "api.h"
+    #include "sub.h"
 
     static void fhk_pyx_setrootM_group(fhk_solver *S, int idx) {
         fhk_setrootM(S, idx, grefmeta(S->G, ~(xidx)idx).group, 0);
@@ -73,6 +74,11 @@ cdef extern from *:
             pk = pkref_next(pk);
         }
     }
+
+    // hack to make cython output __declspec(dllexport) on windows.
+    #define FHK_API_fhk_pyx_setrootinfo            FHK_API fhk_pyx_setrootinfo
+    #define FHK_API_fhk_pyx_setvalue_scatter_space FHK_API fhk_pyx_setvalue_scatter_space
+    #define FHK_API_fhk_pyx_setvalue_scatter2      FHK_API fhk_pyx_setvalue_scatter2
     """
 
     int LUA_REGISTRYINDEX
@@ -133,6 +139,7 @@ cdef extern from *:
     object fhk_pyx_memV(fhk_solver *, int)
     int fhk_pyx_size(fhk_solver *, int)
     int subset_size(fhk_subset)
+    void fhk_mem_commit_tail(fhk_mem *, intptr_t)
 
     const char *FHK_GITHASH
 
@@ -239,7 +246,7 @@ cdef class PyxRoot:
     def __cinit__(self, attr):
         self.attr = attr
 
-cdef public void fhk_pyx_setrootinfo(void *r, void *fmt, int idx):
+cdef public void FHK_API_fhk_pyx_setrootinfo(void *r, void *fmt, int idx):
     (<PyxRoot>r).fmt = <str> fmt
     (<PyxRoot>r).idx = idx
 
@@ -269,13 +276,14 @@ cdef fhk_subset tosubset(fhk_solver *S, object o) except -2:
     pk[2] = 0
     pk = pkref_prev(pk)
     while True:
-        # TODO(win): commit
+        fhk_mem_commit_tail(mem, <intptr_t> pk)
         pkref_write(pk, first, last-first)
         pk = pkref_prev(pk)
         last = j
         first = last
         while True:
             if i == 0:
+                fhk_mem_commit_tail(mem, <intptr_t> pk)
                 pkref_write(pk, first, last-first)
                 mem.tail = <intptr_t> pk
                 return subsetC_new(pk)
@@ -543,8 +551,8 @@ cdef int setvalue_scatter(fhk_solver *S, int idx, str fmt, object it, fhk_subset
             pk = pkref_next(pk)
     return 0
 
-cdef public int fhk_pyx_setvalue_scatter_space(fhk_solver *S, int idx, str fmt, object it) except -1:
+cdef public int FHK_API_fhk_pyx_setvalue_scatter_space(fhk_solver *S, int idx, str fmt, object it) except -1:
     return setvalue_scatter(S, idx, fmt, it, fhk_pyx_space(S, idx))
 
-cdef public int fhk_pyx_setvalue_scatter2(fhk_solver *S, int idx, str fmt, object rv) except -1:
+cdef public int FHK_API_fhk_pyx_setvalue_scatter2(fhk_solver *S, int idx, str fmt, object rv) except -1:
     return setvalue_scatter(S, idx, fmt, rv[0], tosubset(S, rv[1]))

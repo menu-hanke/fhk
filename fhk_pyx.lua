@@ -3,8 +3,8 @@ local C = require "fhk_clib"
 local ffi = require "ffi"
 local cast = ffi.cast
 local Py = require "fhk_lang_Python"
+local pyC, gcocheckref = Py.C, Py.gcocheckref
 local PyObjectp, solverp = ffi.typeof("PyObject *"), ffi.typeof("fhk_solver *")
-local gcocheckref = Py.gcocheckref
 
 ffi.cdef[[
 void *PyMem_Malloc(size_t);
@@ -27,6 +27,7 @@ end
 
 local function vrefvpy(J, o)
 	local code = driver.code()
+	code.upv.pyC = pyC
 	code.upv.f = o.impl.f
 	code.upv.ocheck = Py.ocheck
 	code.upv.echeck3 = Py.echeck3
@@ -35,19 +36,19 @@ local function vrefvpy(J, o)
 		for i=1, #o.impl.params do
 			local p = o.impl.params:sub(i,i)
 			if p == "i" then
-				code.src:putf("C.PyTuple_SetItem(args, %d, ocheck(C.PyLong_FromLong(S.inst)))\n", i-1)
+				code.src:putf("pyC.PyTuple_SetItem(args, %d, ocheck(pyC.PyLong_FromSsize_t(S.inst)))\n", i-1)
 			elseif p == "x" then
 				code.src:putf([[
-					C.Py_IncRef(X)
-					C.PyTuple_SetItem(args, %d, X)
+					pyC.Py_IncRef(X)
+					pyC.PyTuple_SetItem(args, %d, X)
 				]], i-1)
 			end
 		end
-		code.src:put("local r = ocheck(C.PyObject_Call(f, args, nil))\n")
+		code.src:put("local r = ocheck(pyC.PyObject_Call(f, args, nil))\n")
 	else
-		code.src:put("local r = ocheck(C.PyObject_CallNoArgs(f))\n")
+		code.src:put("local r = ocheck(pyC.PyObject_CallNoArgs(f))\n")
 	end
-	if C.Py_IsNone(o.impl.vec) == 0 then
+	if pyC.Py_IsNone(o.impl.vec) == 0 then
 		-- TODO: use fhk_setvalue/fhk_setvalueC for directly copyable vectors
 		code.src:putf(
 			[[
@@ -59,16 +60,12 @@ local function vrefvpy(J, o)
 		)
 	else
 		code.upv.cast = ffi.cast
-		local kind = Py.ctkind(o.ctype)
-		if kind == "float" then
-			code.src:put("local v = C.PyFloat_AsDouble(r)\n")
-		elseif kind == "int" or kind == "bool" then
-			code.src:put("local v = C.PyLong_AsLong(r)\n")
-		end
-		code.src:putf("cast(%s, C.fhk_setvalueD(S, %d, S.inst))[0] = v\n",
-			code:upval(ffi.typeof("$*", o.ctype)), o.idx)
-		code.src:put("C.Py_DecRef(r)\n")
-		code.src:put("if v == -1 then echeck3(r) end\n")
+		code.src:putf([[	
+			local v = pyC.%s(r)
+			cast(%s, C.fhk_setvalueD(S, %d, S.inst))[0] = v
+			pyC.Py_DecRef(r)
+			if v == -1 then echeck3(r) end
+		]], Py.pycconvf(o.ctype), code:upval(ffi.typeof("$*", o.ctype)), o.idx)
 	end
 	code.name = string.format("=fhk:vrefvpy<%s>@%s", driver.desc(o), o.impl.desc)
 	return code:emitjmp(J)
@@ -118,7 +115,7 @@ local function pyx_graph_prepare(graph)
 	end
 	local size = graph:size()
 	-- note: match deallocation in fhk_api.pyx
-	local buf = C.PyMem_Malloc(size)
+	local buf = pyC.PyMem_Malloc(size)
 	return tonumber(ffi.cast("intptr_t", buf)), tonumber(ffi.cast("intptr_t", graph:build(buf)))
 end
 

@@ -1,6 +1,8 @@
 local ffi = require "ffi"
 local C = ffi.C
 
+#define FHK_API
+
 ffi.cdef[[
 #include "api.h"
 ]]

@@ -13,17 +13,24 @@ NOAPI void fhk_fail_trampoline(void);
 
 #if FHK_x64
 
+#if FHK_WINDOWS
+#define FRAME_NUM 7
+#else
+#define FRAME_NUM 5
+#endif
+
 #define ASMREG_S  "r12"
 
 /*
  * fail from _outside_ of the solver.
  * this patches the return address to the fail trampoline.
  * stack layout here must match swap_x64.S
+ * on sysv abi it looks like this:
  *
- * +-----+-----+-----+-----+-----+-----+
- * | rbp | rbx | r15 | r14 | r13 | rip |
- * +-----+-----+-----+-----+-----+-----+
- * 0     1     2     3     4     5
+ *   +-----+-----+-----+-----+-----+-----+
+ *   | rbp | rbx | r15 | r14 | r13 | rip |
+ *   +-----+-----+-----+-----+-----+-----+
+ *   0     1     2     3     4     5
  *
  * TODO: maybe a better way to do this would be to redirect the stack pointer to
  * some pre-allocated stack reserved for fail situations and let the trampoline
@@ -32,7 +39,7 @@ NOAPI void fhk_fail_trampoline(void);
  */
 COLD static inline void fhk_fail(fhk_solver *S, fhk_status err) {
 	S->err = err;
-	((void **) S->sp)[5] = fhk_fail_trampoline;
+	((void **) S->sp)[FRAME_NUM] = fhk_fail_trampoline;
 }
 
 /*
@@ -60,7 +67,7 @@ static inline void fhk_callback(fhk_solver *S, void *cb) {
 	void **sp = S->sp;
 	sp[-1] = fhk_callback_return;
 	sp[-2] = cb;
-	S->sp = sp-7;
+	S->sp = sp-(FRAME_NUM+2);
 }
 
 /*
@@ -75,24 +82,24 @@ static inline void fhk_callhook(fhk_solver *S, int j) {
 	void **sp = S->sp;
 	sp[-1] = fhk_yieldhook;
 	sp[-5] = (void *) (intptr_t) j;
-	S->sp = sp-6;
+	S->sp = sp-(FRAME_NUM+1);
 }
 
 /*
  * stack pointer must be aligned to 16 when jumping to the asm entry point.
- * since we pop 6 registers, the original alignment is preserved,
+ * since we pop either 6 or 8 registers, the original alignment is preserved,
  * so top should be aligned to 16.
  * (refer to the comment above in fhk_fail)
  */
 static inline void *fhk_stack_align(void *p) {
 	p = (void *) ((intptr_t)p & ~15);
-	p -= 6*8;
+	p -= (FRAME_NUM+1)*8;
 	return p;
 }
 
 /* prepare stack for first call of fhk_continue. */
 static inline void fhk_stack_init(void *p) {
-	((void **) fhk_stack_align(p))[5] = fhk_enter_trampoline;
+	((void **) fhk_stack_align(p))[FRAME_NUM] = fhk_enter_trampoline;
 }
 
 #else

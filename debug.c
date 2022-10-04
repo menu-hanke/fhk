@@ -11,6 +11,7 @@
 #include "debug.h"
 #include "def.h"
 
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,7 +68,7 @@ const char *fhk_debug_value(fhk_Sref S, xidx idx, xinst inst) {
 	v += size*inst;
 	switch(size) {
 		case 4: sprintf(buf, "u32: 0x%x f32: %f", ((v32*)v)->i32, ((v32*)v)->f32); break;
-		case 8: sprintf(buf, "u64: 0x%lx f64: %f", ((v64*)v)->i64, ((v64*)v)->f64); break;
+		case 8: sprintf(buf, "u64: 0x%" PRIx64 " f64: %f", ((v64*)v)->i64, ((v64*)v)->f64); break;
 		default:
 			strcpy(buf, "hex: 0x");
 			for(size_t i=0; i<size; i++)

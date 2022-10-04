@@ -156,9 +156,28 @@ typedef struct fhk_bucket {
 /* ---- memory map ---------------------------------------- */
 
 /*
- * +-----+-------+------------+----------------------------+-----+--------------------------------+-------+
- * | map | ident | call stack | work stack (temporary) --> | ... | <-- solver memory (persistent) | zeros |
- * +-----+-------+------------+----------------------------+-----+--------------------------------+-------+
+ * common memory map:
+ *
+ *   +---------+ <-- memory map start
+ *   | fhk_mem |
+ *   +---------+ <-- mem_id(mem)
+ *   |  ident  | 8 * MAX_INST
+ *   +---------+ <-- mem_stack(mem)
+ *   |  stack  | MAX_STACK
+ *   +---------+ <-- mem_W(mem)
+ *   |  work   |
+ *   |   ...   |
+ *   | (head)  |
+ *   vvvvvvvvvvv
+ *
+ *   ...........
+ *
+ *   ^^^^^^^^^^^
+ *   | (tail)  |
+ *   |   ...   |
+ *   +---------+ <-- mem_zeros(mem)  mem_tail(mem)
+ *   |  zeros  | MEM_ZEROS
+ *   +---------+
  */
 typedef struct fhk_mem {
 #if FHK_WINDOWS

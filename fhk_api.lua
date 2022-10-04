@@ -228,7 +228,7 @@ local function malloc(size)
 		void *malloc(size_t);
 		void free(void *);
 	]]
-	malloc = C.malloc
+	malloc = ffi.C.malloc
 	return malloc(size)
 end
 
@@ -244,7 +244,7 @@ local function graph_prepare(graph, alloc)
 	local buf = (alloc or malloc)(size)
 	local G = graph:build(buf)
 	if not alloc then
-		ffi.gc(G, function() C.free(buf) end)
+		ffi.gc(G, function() ffi.C.free(buf) end)
 	end
 	for _,q in ipairs(graph.queries) do
 		query_prepare(graph, q, G)

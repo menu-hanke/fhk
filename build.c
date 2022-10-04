@@ -1,5 +1,6 @@
 /* graph building. */
 
+#include "api.h"
 #include "build.h"
 #include "conf.h"
 #include "debug.h"

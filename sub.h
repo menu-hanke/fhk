@@ -32,7 +32,7 @@ static inline void fhk_mem_commit_tail(fhk_mem *mem, intptr_t tail) {
 
 #else
 
-#define fhk_mem_commit_head(mem, head)
-#define fhk_mem_commit_tail(mem, tail)
+#define fhk_mem_commit_head(mem, head) do { (void)(mem); (void)(head); } while(0)
+#define fhk_mem_commit_tail(mem, tail) do { (void)(mem); (void)(tail); } while(0)
 
 #endif

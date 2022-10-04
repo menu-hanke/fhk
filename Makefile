@@ -7,15 +7,7 @@ CC             = $(CROSS)gcc
 AR             = $(CROSS)gcc-ar
 LUAJIT         = luajit
 BCLOADER       = $(LUAJIT) bcloader
-PYTHON         = python
-CYTHON         = cython
 PKGCONFIG      = pkg-config
-PYCONFIG       = python3-config
-
-# libraries
-LUAJIT_I       = $(shell $(PKGCONFIG) --cflags-only-I luajit)
-PYTHON_I       = $(shell $(PYCONFIG) --includes)
-LUAJIT_L      ?= $(shell $(PKGCONFIG) --libs luajit)
 
 # embed lua bytecode? [y]/n
 LINKLUA       ?= y
@@ -50,19 +42,17 @@ CROSS         ?=
 # host settings
 ifneq (,$(findstring Windows,$(OS)))
 HOST          ?= Windows
-HOST_CYGWIN   ?= $(findstring CYGWIN,$(shell uname -s))
+HOST_MINGW    ?= $(findstring MINGW64,$(shell uname -s))
 else
 HOST          ?= $(shell uname -s)
 endif
 
 # target settings
 ifeq (Windows,$(TARGET))
-TARGET_EXE     = .exe
 TARGET_SO      = .dll
 else
 TARGET_SO      = .so
 endif
-TARGET_PYEXT   = $(shell $(PYCONFIG) --extension-suffix 2>/dev/null)
 
 # arch settings
 ARCHTEST = $(shell $(CC) $(CCDEF) -E -dM target.h 2>/dev/null)
@@ -73,7 +63,7 @@ endif
 # disable default rules. all my homies hate default rules.
 .SUFFIXES:
 
-#--------------------------------------------------------------------------------
+#---- Compiler options ----------------------------------------------------------------------------
 
 XCFLAGS     = $(CCOPT) $(CCDEF) $(CCDEBUG) $(CCWARN)
 XLDFLAGS    =
@@ -87,7 +77,15 @@ XCFLAGS    += $(ASAN) $(UBSAN)
 XLDFLAGS   += $(ASAN) $(UBSAN)
 endif
 
-# objects
+#---- Help ----------------------------------------------------------------------------
+
+help:
+	@echo "targets:"
+	@echo "    lua          Lua shared library (fhk$(TARGET_SO))"
+	@echo "    pyx          CPython extension  (fhk$(TARGET_PYEXT))"
+
+#---- Host library common ----------------------------------------------------------------------------
+
 CORE_O      = build.o debug.o solve.o sub.o swap_$(ARCH).o
 LOADER_O    = loader.o
 PYX_O       = fhk_api.pyx.o
@@ -98,28 +96,37 @@ XLUALIB_O   = fhk_api.lua.o reflect.lua.o
 XLUAPY_O    = fhk_pyx.lua.o
 endif
 
-#--------------------------------------------------------------------------------
+LUAJIT_I    = $(shell $(PKGCONFIG) --cflags-only-I luajit)
+LUAJIT_L    = $(shell $(PKGCONFIG) --libs luajit)
 
-help:
-	@echo "targets:"
-	@echo "    lua          Lua shared library (fhk$(TARGET_SO))"
-	@echo "    pyx          CPython extension  (fhk$(TARGET_PYEXT))"
+#---- Lua host library ----------------------------------------------------------------------------
 
-.PHONY: lua pyx
-lua: fhk$(TARGET_SO)
-pyx: fhk$(TARGET_PYEXT)
-
-# Lua dynamic library
 fhk$(TARGET_SO): XCFLAGS += -fPIC
 fhk$(TARGET_SO): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUALIB_O) $(LOADER_O)
 	$(CC) -shared $^ $(XLDFLAGS) $(LDFLAGS) -o $@
 
-# Python dynamic library
+.PHONY: lua
+lua: fhk$(TARGET_SO)
+
+#---- Python host library ----------------------------------------------------------------------------
+
+PYTHON    = python
+CYTHON    = $(PYTHON) -m cython
+PYTHON_I  = -I$(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("INCLUDEPY"))' 2>/dev/null)
+ifeq (Windows,$(TARGET))
+PYTHON_L  = $(shell $(PYTHON) -c 'import sysconfig; import os; print(os.path.join(sysconfig.get_config_var("BINDIR"), "python"+sysconfig.get_config_var("py_version_nodot")+".dll"))' 2>/dev/null)
+endif # else: don't need to link libpython.
+
+TARGET_PYEXT = $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))' 2>/dev/null)
+
 fhk$(TARGET_PYEXT): XCFLAGS += -fPIC
 fhk$(TARGET_PYEXT): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
-	$(CC) -shared $^ $(XLDFLAGS) $(LUAJIT_L) $(LDFLAGS) -o $@
+	$(CC) -shared $^ $(XLDFLAGS) $(LUAJIT_L) $(PYTHON_L) $(LDFLAGS) -o $@
 
-#--------------------------------------------------------------------------------
+.PHONY: pyx
+pyx: fhk$(TARGET_PYEXT)
+
+#---- Rules ----------------------------------------------------------------------------
 
 %.a:
 	$(AR) rcs $@ $^
@@ -130,7 +137,7 @@ fhk$(TARGET_PYEXT): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
 %.o: %.S
 	$(CC) $(XCFLAGS) $(CFLAGS) -c $< -o $@
 
-%.lua.o: %.lua
+%.lua.c: %.lua
 	$(LUAJIT) -b -n $(subst _,.,$(notdir $*)) $< $@
 
 %.lua: %.lua.h
@@ -146,10 +153,14 @@ loader.c:
 	$(BCLOADER) -o $(TARGET) -n fhk -c fhk_api -L > $@
 
 CCGITHASH = $(shell HASH=$$(git rev-parse --short HEAD) && echo -DFHK_GITHASH='\"'$$HASH'\"')
-fhk_cdef.lua: LUAHDEF = -DFHK_CORO=$(CORO) $(CCGITHASH)
+fhk_cdef.lua: LUAHDEF = $(CCGITHASH)
 fhk_api.pyx.o: XCFLAGS += $(LUAJIT_I) $(PYTHON_I) $(CCGITHASH)
+ifeq (Windows,$(TARGET))
+# https://github.com/cython/cython/issues/2670#issuecomment-432212671
+fhk_api.pyx.o: XCFLAGS += -DMS_WIN64
+endif
 
-#--------------------------------------------------------------------------------
+#---- Auxiliary ----------------------------------------------------------------------------
 
 .PHONY: clean
 clean:

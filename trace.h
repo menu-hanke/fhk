@@ -2,6 +2,7 @@
 
 #include "conf.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 
 /*
@@ -65,28 +66,28 @@
 
 #if FHK_TRACEON(sub)
 #define TRACE_SETROOTM  "sub",      trace_fhk, "<- SETROOT  %s :: %s:%d"
-#define TRACE_SETROOTSS "sub",      trace_fhk, "<- SETROOT  %s :: 0x%lx"
+#define TRACE_SETROOTSS "sub",      trace_fhk, "<- SETROOT  %s :: 0x%" PRIx64
 #define TRACE_SETVALR   "sub",      trace_fhk, "<- SETVALUE %s --> %p :: %s"
-#define TRACE_SETVALI   "sub",      trace_fhk, "<- SETVALUE %s:%ld..+%ld :: %s"
-#define TRACE_SETVALD   "sub",      trace_fhk, "<- SETVALUE %s:%ld..+%ld"
+#define TRACE_SETVALI   "sub",      trace_fhk, "<- SETVALUE %s:%d..+%d :: %s"
+#define TRACE_SETVALD   "sub",      trace_fhk, "<- SETVALUE %s:%d..+%d"
 #endif
 
 #if FHK_TRACEON(solver)
 #define TRACE_JERR      "solver",   trace_fhk, "-> 0000 ERR"
 #define TRACE_JOK       "solver",   trace_fhk, "-> 0001 OK"
 #define TRACE_JMP       "solver",   trace_fhk, "-> %04d JMP %s:%d"
-#define TRACE_ENTERV    "solver",   trace_fhk, "%05ld ENTER COMPUTED  %s:%ld | beta: %g"
-#define TRACE_ENTERC    "solver",   trace_fhk, "%05ld ENTER CANDIDATE %s:%ld | beta: %g, delta: %g"
-#define TRACE_ENTERD    "solver",   trace_fhk, "%05ld ENTER DERIVE    %s:%ld | beta: %g"
-#define TRACE_PENALTY   "solver",   trace_fhk, "%05ld +++++ CHECK %03d %s:%ld -> %s~%s [+%g] [%g/%g]"
-#define TRACE_PARAM     "solver",   trace_fhk, "%05ld +++++ PARAM %03d %s:%ld -> %s~%s [+%g] [%g/%g]"
-#define TRACE_TAILP     "solver",   trace_fhk, "%05ld +++++ TAILP %03d %s:%ld -> %s~%s [+%g] [%g/%g]"
-#define TRACE_CHAINM    "solver",   trace_fhk, "%05ld CHAIN MODEL     %s:%ld | cost: %g, inv: %g"
-#define TRACE_CHAINV    "solver",   trace_fhk, "%05ld CHAIN VAR       %s:%ld [%s:%ld] | cost: %g, inv: %g"
-#define TRACE_CHAINC    "solver",   trace_fhk, "%05ld CHAIN VAR       %s:%ld [%s:%ld] | cost: %g"
-#define TRACE_BOUND     "solver",   trace_fhk, "%05ld BOUND MODEL     %s:%ld | cost: %g, beta: %g, delta: %g"
-#define TRACE_BOUNDV    "solver",   trace_fhk, "%05ld BOUND VAR       %s:%ld | cost: %g"
-#define TRACE_TOLER     "solver",   trace_fhk, "%05ld TOLERANCE       %s:%ld (+0x%x / %g)"
-#define TRACE_EVALV     "eval",     trace_fhk, "%05ld EVAL COMPUTED   %s:%ld"
-#define TRACE_EVALM     "eval",     trace_fhk, "%05ld EVAL MODEL      %s:%ld"
+#define TRACE_ENTERV    "solver",   trace_fhk, "%05" PRId64 " ENTER COMPUTED  %s:%d | beta: %g"
+#define TRACE_ENTERC    "solver",   trace_fhk, "%05" PRId64 " ENTER CANDIDATE %s:%d | beta: %g, delta: %g"
+#define TRACE_ENTERD    "solver",   trace_fhk, "%05" PRId64 " ENTER DERIVE    %s:%d | beta: %g"
+#define TRACE_PENALTY   "solver",   trace_fhk, "%05" PRId64 " +++++ CHECK %03d %s:%d -> %s~%s [+%g] [%g/%g]"
+#define TRACE_PARAM     "solver",   trace_fhk, "%05" PRId64 " +++++ PARAM %03d %s:%d -> %s~%s [+%g] [%g/%g]"
+#define TRACE_TAILP     "solver",   trace_fhk, "%05" PRId64 " +++++ TAILP %03d %s:%d -> %s~%s [+%g] [%g/%g]"
+#define TRACE_CHAINM    "solver",   trace_fhk, "%05" PRId64 " CHAIN MODEL     %s:%d | cost: %g, inv: %g"
+#define TRACE_CHAINV    "solver",   trace_fhk, "%05" PRId64 " CHAIN VAR       %s:%d [%s:%d] | cost: %g, inv: %g"
+#define TRACE_CHAINC    "solver",   trace_fhk, "%05" PRId64 " CHAIN VAR       %s:%d [%s:%d] | cost: %g"
+#define TRACE_BOUND     "solver",   trace_fhk, "%05" PRId64 " BOUND MODEL     %s:%d | cost: %g, beta: %g, delta: %g"
+#define TRACE_BOUNDV    "solver",   trace_fhk, "%05" PRId64 " BOUND VAR       %s:%d | cost: %g"
+#define TRACE_TOLER     "solver",   trace_fhk, "%05" PRId64 " TOLERANCE       %s:%d (+0x%x / %g)"
+#define TRACE_EVALV     "eval",     trace_fhk, "%05" PRId64 " EVAL COMPUTED   %s:%d"
+#define TRACE_EVALM     "eval",     trace_fhk, "%05" PRId64 " EVAL MODEL      %s:%d"
 #endif

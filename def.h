@@ -1,5 +1,6 @@
 #pragma once
 
+#include "target.h"
 #include "trace.h"
 
 #include <stddef.h>
@@ -32,10 +33,16 @@ typedef int32_t fhk_mref32;
 /* function attributes */
 #define AINLINE           __attribute__((always_inline)) inline
 #define COLD              __attribute__((cold))
-#define NOAPI             __attribute__((visibility("hidden"))) extern
 #define ERRFUNC           __attribute__((cold, noinline, noreturn))
 #define DEBUGFUNC         NOAPI __attribute__((section("fhkdbg")))
 #define NO_ASAN           __attribute__((no_sanitize_address))
+#if __ELF__
+#define API
+#define NOAPI             __attribute__((visibility("hidden"))) extern
+#elif FHK_WINDOWS
+#define API               __declspec(dllexport)
+#define NOAPI
+#endif
 
 /* ---- indexing ---------------------------------------- */
 
