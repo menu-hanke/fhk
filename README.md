@@ -56,6 +56,31 @@ local result = quick_maths()
 print(result.x5)
 ```
 
+## Building
+
+For both the Lua and Python extensions you need:
+* gcc. clang is not supported because it doesn't have global register variables.
+* A LuaJIT binary to compile bytecode with.
+
+### Lua extension
+Run `make lua` to obtain `fhk.so` or `fhk.dll` depending on your platform.
+You can use the library from Lua with `local fhk = require "fhk"`.
+
+### Python extension
+You need:
+* LuaJIT/Lua 5.1 headers (`LUAJIT_I`)
+* LuaJIT static or shared library (`LUAJIT_L`)
+* Python (`PYTHON`)
+* Cython (`CYTHON`)
+
+Run `make pyx` to obtain a CPython extension module.
+You can use the library from Python with `import fhk`.
+
+### Windows concerns
+If you're building the Lua extension, you need to link it against `lua51.dll`.
+If you're building the Python extension in MinGW to be used outside MinGW, make sure `PYTHON`
+points to a non-MinGW Python binary.
+
 ## Similar projects
 fhk resembles [GraphTik](https://github.com/pygraphkit/graphtik)/[GraphKit](https://github.com/yahoo/graphkit)
 and [schedula](https://github.com/vinci1it2000/schedula).
