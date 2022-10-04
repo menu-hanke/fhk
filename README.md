@@ -19,20 +19,20 @@ local x4
 -- fhk can read graphs from files or you can define with an inline function.
 local graph = fhk.graph(function()
 	-- x1, x2 are given double precision variables, both with constant value 2.
-	var "x1" { ctype "double", function() return 2 end }
-	var "x2" { ctype "double", function() return 2 end }
-	-- x4 is a given double precision variable that reads it value from the "x4" variable.
-	var "x4" { ctype "double", function() return x4 end }
+	var "x1" { function() return 2 end }
+	var "x2" { function() return 2 end }
+	-- x4 is a given double precision variable that reads its value from the "x4" variable.
+	var "x4" { function() return x4 end }
 	-- this model computes x4 = x1 + x2
 	model () {
 		params "x1 x2",
-		returns "x3" *as "double",
+		returns "x3",
 		function(x1, x2) return x1+x2 end
 	}
 	-- this model computes x5 = x3 - x4
 	model () {
 		params "x3 x4",
-		returns "x5" *as "double",
+		returns "x5",
 		function(x3, x4) return x3-x4 end
 	}
 end)
