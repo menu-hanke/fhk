@@ -66,7 +66,12 @@ local function dumpobj(graph, buf, handle, cobj, color)
 	end
 	buf:put(color "reset")
 	buf:putf(" %-15s ", obj and obj.name or "")
-	if bit.band(tag, cdef.mtagmask.s) ~= 0 then return end
+	if bit.band(tag, cdef.mtagmask.s) ~= 0 then
+		if bit.band(tag, cdef.mtagmask.p) == 0 and not (obj.computed or obj.impl) then
+			buf:put(color "infcost", (" "):rep(25), "missing", color "reset")
+		end
+		return
+	end
 	buf:put(" ")
 	if cobj.what == "var" or cobj.what == "model" then
 		buf:put("[")
