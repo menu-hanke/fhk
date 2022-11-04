@@ -768,6 +768,9 @@ enter_derive:
 		fhk_mem_commit_head(srefS(S)->mem, (intptr_t) (W+1));
 		wtop(W)->idx = reg(1);
 		wtop(W)->c = INFINITY;
+#if FHK_TRACEON(solver)
+		W->v_idx = wtop(W)->idx;
+#endif
 		W->v_sp = sp + inst;
 		W->link = sizeof(fhk_edgeH) + sizeof(*W);
 		W->beta = reg(B);
