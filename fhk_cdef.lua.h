@@ -9,10 +9,10 @@ ffi.cdef[[
 
 //---- build config ----------------------------------------
 local config = {
-#ifdef FHK_GITHASH
-	version = "fhk-" .. FHK_GITHASH,
+#ifdef FHK_GITVER
+	version = FHK_GITVER,
 #else
-	version = "fhk (unknown commit)",
+	version = "(unknown commit)",
 #endif
 }
 

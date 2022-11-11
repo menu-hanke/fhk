@@ -1,0 +1,125 @@
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+jobs:
+  lua_lib_windows:
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v3
+      - name: fix tags
+        run: git fetch --unshallow --force --tags --filter=tree:0
+      - uses: msys2/setup-msys2@v2
+        with:
+          release: false
+          path-type: inherit
+      - name: build luajit
+        shell: msys2 {0}
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT
+          make -C LuaJIT
+      - name: build lua library
+        shell: msys2 {0}
+        run: |
+          make lua \
+            LUAJIT="LUA_PATH='?.lua;LuaJIT/src/?.lua' LuaJIT/src/luajit.exe" \
+            LUAJIT_L=LuaJIT/src/libluajit-5.1.dll.a
+          mv *.dll fhk-$(git describe)-lua_win_x64.dll
+      - uses: actions/upload-artifact@v3
+        with:
+          name: release
+          path: "*.dll"
+
+  lua_lib_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: fix tags
+        run: git fetch --unshallow --force --tags --filter=tree:0
+      - name: build luajit
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT
+          make -C LuaJIT
+      - name: build lua library
+        run: |
+          make lua LUAJIT="LUA_PATH='?.lua;LuaJIT/src/?.lua' LuaJIT/src/luajit"
+          mv *.so fhk-$(git describe)-lua_linux_x64.so
+      - uses: actions/upload-artifact@v3
+        with:
+          name: release
+          path: "*.so"
+
+  python_wheels_windows:
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v3
+      - name: fix tags
+        run: git fetch --unshallow --force --tags --filter=tree:0
+      - uses: msys2/setup-msys2@v2
+        with:
+          release: false
+          path-type: inherit
+      - name: install pythons
+        run: |
+          nuget install python -Version 3.11.0
+          nuget install python -Version 3.10.8
+      - name: build luajit
+        shell: msys2 {0}
+        run: |
+          git clone --depth 1 https://github.com/LuaJIT/LuaJIT
+          make -C LuaJIT amalg BUILDMODE=static CFLAGS=-fPIC
+      - name: build python wheels
+        shell: msys2 {0}
+        run: |
+          for v in 3.10 3.11
+          do
+          pyexe=python.$v.*/tools/python.exe
+          make clean
+          export FHK_PY_MAKEFLAGS=$(cat<<EOF
+          LUAJIT_L=LuaJIT/src/libluajit.a
+          LUAJIT_I=-ILuaJIT/src
+          LUAJIT="LUA_PATH='?.lua;LuaJIT/src/?.lua' LuaJIT/src/luajit.exe"
+          PYTHON=$pyexe
+          EOF
+          )
+          $pyexe -m pip wheel packages/python --wheel-dir=./wheelhouse
+          done
+      - uses: actions/upload-artifact@v3
+        with:
+          name: release
+          path: wheelhouse/*.whl
+
+  python_wheels_linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: fix tags
+        run: git fetch --unshallow --force --tags --filter=tree:0
+      - uses: pypa/cibuildwheel@v2.11.2
+        with:
+          package-dir: packages/python
+        env:
+          CIBW_BUILD: cp310-manylinux_x86_64 cp311-manylinux_x86_64
+          CIBW_BEFORE_ALL: |
+            git clone --depth 1 https://github.com/LuaJIT/LuaJIT
+            make -C LuaJIT amalg CFLAGS=-fPIC
+          CIBW_ENVIRONMENT: |
+            FHK_PY_MAKEFLAGS="LUAJIT_L=LuaJIT/src/libluajit.a LUAJIT_I=-ILuaJIT/src \"LUAJIT=LUA_PATH='?.lua;LuaJIT/src/?.lua' LuaJIT/src/luajit\""
+      - uses: actions/upload-artifact@v3
+        with:
+          name: release
+          path: wheelhouse/*.whl
+
+  release:
+    needs: [lua_lib_windows, lua_lib_linux, python_wheels_windows, python_wheels_linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: release
+          path: release/
+      - uses: softprops/action-gh-release@v1
+        with:
+          files: release/*

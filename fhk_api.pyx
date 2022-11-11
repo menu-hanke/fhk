@@ -141,9 +141,9 @@ cdef extern from *:
     int subset_size(fhk_subset)
     void fhk_mem_commit_tail(fhk_mem *, intptr_t)
 
-    const char *FHK_GITHASH
+    const char *FHK_GITVER
 
-version = f"fhk-{FHK_GITHASH.decode('utf8')}"
+__version__ = FHK_GITVER.decode('utf8')
 
 class FhkError(Exception):
     pass

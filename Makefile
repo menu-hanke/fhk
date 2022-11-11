@@ -166,9 +166,9 @@ asmdef.h: asmdef.lua fhk_cdef.lua
 loader.c:
 	$(BCLOADER) -o $(TARGET) -n fhk -c fhk_api -L > $@
 
-CCGITHASH = $(shell HASH=$$(git rev-parse --short HEAD) && echo -DFHK_GITHASH='\"'$$HASH'\"')
-fhk_cdef.lua: LUAHDEF = $(CCGITHASH)
-fhk_api.pyx.o: XCFLAGS += $(LUAJIT_I) $(PYTHON_I) $(CCGITHASH)
+CCGITVER = $(shell GITVER=$$(git describe) && echo -DFHK_GITVER='\"'$$(echo $$GITVER | cut -c2- -)'\"')
+fhk_cdef.lua: LUAHDEF = $(CCGITVER)
+fhk_api.pyx.o: XCFLAGS += $(LUAJIT_I) $(PYTHON_I) $(CCGITVER)
 ifeq (Windows,$(TARGET))
 # https://github.com/cython/cython/issues/2670#issuecomment-432212671
 fhk_api.pyx.o: XCFLAGS += -DMS_WIN64
