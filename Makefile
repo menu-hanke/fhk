@@ -5,6 +5,7 @@
 # programs
 CC             = $(CROSS)gcc
 AR             = $(CROSS)gcc-ar
+STRIP          = $(CROSS)strip
 LUAJIT         = luajit
 BCLOADER       = $(LUAJIT) bcloader
 PKGCONFIG      = pkg-config
@@ -77,6 +78,14 @@ XCFLAGS    += $(ASAN) $(UBSAN)
 XLDFLAGS   += $(ASAN) $(UBSAN)
 endif
 
+ifneq (,$(CCDEBUG))
+STRIP       = :
+else
+ifeq (Windows,$(TARGET))
+STRIP      += --strip-unneeded
+endif
+endif
+
 #---- Help ----------------------------------------------------------------------------
 
 help:
@@ -102,8 +111,12 @@ LUAJIT_L    = $(shell $(PKGCONFIG) --libs luajit)
 #---- Lua host library ----------------------------------------------------------------------------
 
 fhk$(TARGET_SO): XCFLAGS += -fPIC
+ifeq (Windows,$(TARGET))
+fhk$(TARGET_SO): XLDFLAGS += $(LUAJIT_L)
+endif
 fhk$(TARGET_SO): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUALIB_O) $(LOADER_O)
 	$(CC) -shared $^ $(XLDFLAGS) $(LDFLAGS) -o $@
+	$(STRIP) $@
 
 .PHONY: lua
 lua: fhk$(TARGET_SO)
@@ -122,6 +135,7 @@ TARGET_PYEXT = $(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_confi
 fhk$(TARGET_PYEXT): XCFLAGS += -fPIC
 fhk$(TARGET_PYEXT): $(CORE_O) $(XLUACORE_O) $(XLUALANG_O) $(XLUAPY_O) $(PYX_O)
 	$(CC) -shared $^ $(XLDFLAGS) $(LUAJIT_L) $(PYTHON_L) $(LDFLAGS) -o $@
+	$(STRIP) $@
 
 .PHONY: pyx
 pyx: fhk$(TARGET_PYEXT)
