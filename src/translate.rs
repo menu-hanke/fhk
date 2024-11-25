@@ -220,7 +220,8 @@ fn ins_arith(ecx: &mut Ecx, id: InsId) {
         (ADD, I8|I16|I32|I64) => emit.fb.ins().iadd(left, right),
         (SUB, I8|I16|I32|I64) => emit.fb.ins().isub(left, right),
         (MUL, I8|I16|I32|I64) => emit.fb.ins().imul(left, right),
-        (DIV, I8|I16|I32|I64) => emit.fb.ins().sdiv(left, right), // nb. signed
+        (DIV, I8|I16|I32|I64) => emit.fb.ins().sdiv(left, right),
+        (UDIV, I8|I16|I32|I64) => emit.fb.ins().udiv(left, right),
         _ => unreachable!()
     };
     emit.values[id] = InsValue::from_value(value);
@@ -418,7 +419,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
             CONV => todo!(),
-            ADD | SUB | MUL | DIV => ins_arith(ecx, id),
+            ADD | SUB | MUL | DIV | UDIV => ins_arith(ecx, id),
             POW => ins_pow(ecx, id),
             ADDP => ins_addp(ecx, id),
             NEG => todo!(),

@@ -1025,7 +1025,8 @@ fn emitscalarbinop(
         ADD   => lcx.data.func.code.push(Ins::ADD(irt, left, right)),
         SUB   => lcx.data.func.code.push(Ins::SUB(irt, left, right)),
         MUL   => lcx.data.func.code.push(Ins::MUL(irt, left, right)),
-        DIV   => todo!(), // handle signedness
+        DIV if ty.is_unsigned() => lcx.data.func.code.push(Ins::UDIV(irt, left, right)),
+        DIV   => lcx.data.func.code.push(Ins::DIV(irt, left, right)),
         POW   => lcx.data.func.code.push(Ins::POW(irt, left, right)),
         EQ    => lcx.data.func.code.push(Ins::EQ(left, right)),
         NE    => lcx.data.func.code.push(Ins::NE(left, right)),

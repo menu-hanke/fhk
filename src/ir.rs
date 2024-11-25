@@ -300,6 +300,7 @@ define_opcodes! {
     SUB       V V;
     MUL       V V;
     DIV       V V;
+    UDIV      V V;
     POW       V V;
     NEG       V;
 
