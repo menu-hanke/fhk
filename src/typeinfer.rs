@@ -283,12 +283,14 @@ fn unify(tvar: &mut IndexSlice<TypeVar, Type>, a: TypeVar, b: Type) {
     trace!(TYPE "unify {:?}:{:?} = {:?}", a, tvar[a].unpack(), b.unpack());
     match (tvar[a].unpack(), b.unpack()) {
         (Var(i), _) if i == a => tvar[a] = b,
+        (_, Var(j)) if j == a => { /* ok */ },
         (Var(i), _) => unify(tvar, i, b),
         (Pri(_), Pri(_)) => tvar[a].0 &= b.0,
-        (Pri(_), Var(k)) if matches!(tvar[k].unpack(), Pri(_)) => {
-            tvar[k].0 &= tvar[a].0;
+        (Pri(_), Var(j)) if matches!(tvar[j].unpack(), Pri(_)) => {
+            tvar[j].0 &= tvar[a].0;
             tvar[a] = b;
         },
+        (Pri(_), Var(j)) => unify(tvar, j, Type::var(a)),
         (Pri(_), Con(Constructor::TENSOR, b0)) => {
             unify(tvar, b0, Type::var(a));
             unify(tvar, b0+1, Type::dim(0));
@@ -585,7 +587,8 @@ fn canonty(tvar: &mut IndexVec<TypeVar, Type>, tv: TypeVar) -> Type {
 
 fn canonicalize(types: &mut IndexVec<TypeVar, Type>) {
     for tv in index::iter_span(types.end()) {
-        canonty(types, tv);
+        let ty = canonty(types, tv);
+        crate::trace::trace!(TYPE "canon {:?} = {:?}", tv, ty.unpack());
     }
 }
 
