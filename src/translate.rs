@@ -165,6 +165,22 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
     ecx.data.values[id] = InsValue::from_value(value);
 }
 
+fn ins_kfp64(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let ins = emit.code[id];
+    let b: BumpRef<Unalign<f64>> = zerocopy::transmute!(ins.bc());
+    let k = ecx.intern.bump()[b].get();
+    let type_ = ins.type_();
+    let data = match type_ {
+        Type::F32 => ecx.mcode.data.intern(&(k as f32)).to_bump().cast(),
+        Type::F64 => ecx.mcode.data.intern(&k).to_bump().cast(),
+        _ => unreachable!()
+    };
+    let data = emit.fb.importdataref(data);
+    let ptr = emit.fb.dataptr(data);
+    emit.values[id] = InsValue::from_value(emit.fb.kload(type_, ptr));
+}
+
 fn ins_mov(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let value = emit.code[id].decode_V();
@@ -371,7 +387,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             UB => ins_ub(ecx),
             PHI => ins_phi(ecx, id),
             KINT | KINT64 => ins_kintx(ecx, id),
-            KFP64 => todo!(),
+            KFP64 => ins_kfp64(ecx, id),
             KSTR => todo!(),
             KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
