@@ -1,8 +1,11 @@
 //! IR -> Machine code pipeline.
 
+use core::cmp::max;
+use core::mem::take;
+
 use alloc::vec::Vec;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, AliasRegion, ExtFuncData, ExternalName, FuncRef, GlobalValue, GlobalValueData, InstBuilder, InstInserterBase, MemFlags, Signature, UserExternalName, Value};
+use cranelift_codegen::ir::{AbiParam, AliasRegion, ExtFuncData, ExternalName, FuncRef, GlobalValue, GlobalValueData, InstBuilder, InstInserterBase, MemFlags, Signature, StackSlot, StackSlotData, StackSlotKind, UserExternalName, Value};
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::Configurable;
 use cranelift_codegen::{FinalizedMachReloc, FinalizedRelocTarget};
@@ -12,40 +15,57 @@ use crate::bitmap::BitMatrix;
 use crate::bump::{self, Aligned, Bump};
 use crate::compile::{self, Ccx, Phase};
 use crate::dump::{dump_mcode, dump_schedule};
-use crate::index::{self, IndexSlice, IndexVec, InvalidValue};
+use crate::image::Image;
+use crate::index::{self, IndexVec, InvalidValue};
 use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
+use crate::lang::{Lang, LangState};
 use crate::mcode::{Label, MCode, MCodeData, MCodeOffset, Reloc};
-use crate::mem::{SizeClass, Slot};
+use crate::mem::{Cursor, Offset, SizeClass, Slot};
 use crate::schedule::{compute_schedule, BlockId, Gcm};
-use crate::support::{emitsupport, SuppRef, SupportFuncs};
+use crate::support::{emitsupport, SuppFunc, SuppRef, SupportFuncs};
 use crate::trace::trace;
 use crate::translate::translate;
 use crate::typestate::{Absent, R, RW};
 
-// workaround for cranelift types which are newtypes over u32 but don't implement zerocopy traits:
-pub unsafe trait CraneliftEntityRef32 {}
-unsafe impl CraneliftEntityRef32 for Value {}
+pub struct Frame {
+    pub slot: StackSlot,
+    size: Cursor,
+    align: Offset
+}
 
 pub struct FuncBuilder {
     pub ctx: cranelift_codegen::Context,
-    pub block: cranelift_codegen::ir::Block
+    pub block: cranelift_codegen::ir::Block,
+    frame: Option<Frame>
 }
 
-pub type Values = IndexSlice<InsId, Value/*|cl::Block*/>;
+// this is roughly the equivalent of
+//   union {
+//     pub raw: u32,
+//     pub value: cl::Value,
+//     pub block: u16,
+//     pub cl_block: cl::Block,
+//     pub cl_inst: cl::Inst
+//   }
+#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+pub struct InsValue { pub raw: u32 }
 
 pub struct Emit {
     pub isa: OwnedTargetIsa,
+    pub lang: LangState,
     pub fb: FuncBuilder,
     pub gcm: Gcm,
     pub supp: SupportFuncs,
     pub code: IndexVec<InsId, Ins>,
-    pub values: IndexVec<InsId, Value/*|cl::Block*/>,
+    pub values: IndexVec<InsId, InsValue>,
+    pub bump: Bump,
     pub blockparams: BitMatrix<BlockId, PhiId>,
     pub stack: Value,
     pub block: BlockId,
     pub fid: FuncId,
     pub idx: Value, // meaningful for bundle functions only
-    // work arrays:
+    // work arrays (TODO use ccx.tmp):
     pub tmp_val: Vec<Value>
 }
 
@@ -72,6 +92,58 @@ pub const NATIVE_CALLCONV: CallConv = {
 const NS_DATA: u32 = 0;
 const NS_FUNC: u32 = 1;
 const NS_SUPP: u32 = 2;
+
+impl InsValue {
+
+    pub fn from_value(value: Value) -> Self {
+        Self { raw: value.as_u32() }
+    }
+
+    pub fn value(self) -> Value {
+        Value::from_u32(self.raw)
+    }
+
+    pub fn from_block(block: BlockId) -> Self {
+        let block: u16 = zerocopy::transmute!(block);
+        Self { raw: block as _ }
+    }
+
+    pub fn block(self) -> BlockId {
+        zerocopy::transmute!(self.raw as u16)
+    }
+
+    pub fn from_cl_block(block: cranelift_codegen::ir::Block) -> Self {
+        Self { raw: block.as_u32() }
+    }
+
+    pub fn cl_block(self) -> cranelift_codegen::ir::Block {
+        cranelift_codegen::ir::Block::from_u32(self.raw)
+    }
+
+    pub fn from_cl_inst(inst: cranelift_codegen::ir::Inst) -> Self {
+        Self { raw: inst.as_u32() }
+    }
+
+    pub fn cl_inst(self) -> cranelift_codegen::ir::Inst {
+        cranelift_codegen::ir::Inst::from_u32(self.raw)
+    }
+
+}
+
+impl Default for InsValue {
+    fn default() -> Self {
+        Self { raw: !0 }
+    }
+}
+
+pub fn cast_values(xs: &[InsValue]) -> &[Value] {
+    unsafe {
+        core::slice::from_raw_parts(
+            xs as *const [InsValue] as *const InsValue as *const Value,
+            xs.len()
+        )
+    }
+}
 
 impl<'a> InstInserterBase<'a> for &'a mut FuncBuilder {
     fn data_flow_graph(&self) -> &cranelift_codegen::ir::DataFlowGraph {
@@ -130,6 +202,31 @@ impl FuncBuilder {
                 _ => todo!()
             }
         }
+    }
+
+    pub fn frame(&mut self) -> &mut Frame {
+        self.frame.get_or_insert_with(|| Frame {
+            slot: self.ctx.func.create_sized_stack_slot(
+                       StackSlotData::new(StackSlotKind::ExplicitSlot, 0, 0)
+                   ),
+                   size: Default::default(),
+                   align: 1
+        })
+    }
+
+    fn clear(&mut self) {
+        self.ctx.clear();
+        self.frame = None;
+    }
+
+}
+
+impl Frame {
+
+    pub fn alloc(&mut self, size: Offset, align: Offset) -> Offset {
+        let ofs = self.size.alloc(size as _, align as _);
+        self.align = max(self.align, align);
+        ofs as _
     }
 
 }
@@ -229,10 +326,6 @@ pub fn irt2cl(irt: Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-pub fn v2block(v: Value) -> BlockId {
-    zerocopy::transmute!(v.as_u32() as u16)
-}
-
 pub fn block2cl(block: BlockId) -> cranelift_codegen::ir::Block {
     let block: u16 = zerocopy::transmute!(block);
     cranelift_codegen::ir::Block::from_u32(block as _)
@@ -295,17 +388,11 @@ pub fn storeslot(
     emit.fb.ins().store(MEM_VMCTX, value, ptr, 0);
 }
 
-pub fn cast_entitrefs<T>(xs: &[u32]) -> &[T]
-    where T: CraneliftEntityRef32
-{
-    unsafe { core::slice::from_raw_parts(xs as *const [u32] as *const u32 as *const T, xs.len()) }
-}
-
-pub fn collectargs(emit: &Emit, dest: &mut Bump<u32>, mut arg: InsId) {
-    while emit.code[arg].opcode() != Opcode::KNOP {
+pub fn collectargs(emit: &Emit, dest: &mut Bump<InsValue>, mut arg: InsId) {
+    while emit.code[arg].opcode() != Opcode::NOP {
         debug_assert!(emit.code[arg].opcode() == Opcode::CARG);
         let (ap, v) = emit.code[arg].decode_CARG();
-        dest.push(emit.values[v].as_u32());
+        dest.push(emit.values[v]);
         arg = ap;
     }
 }
@@ -405,25 +492,35 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
     }
 }
 
+fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
+    let loc = mcode.code.end().offset() as MCodeOffset;
+    mcode.code.write(buf);
+    mcode.align_code();
+    if trace!(MCODE) {
+        trace!("{}", {
+            let mut sbuf = Default::default();
+            // dump mcode.code here rather than buf to also print the nop padding.
+            dump_mcode(&mut sbuf, &mcode.code.as_slice()[loc as usize..]);
+            sbuf
+        });
+    }
+    loc
+}
+
 fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
+    if let Some(frame) = &emit.fb.frame {
+        let slot = &mut emit.fb.ctx.func.sized_stack_slots[frame.slot];
+        slot.size = frame.size.ptr as _;
+        slot.align_shift = frame.align.ilog2() as _;
+    }
     if trace!(CLIF) {
         trace!("{}", emit.fb.ctx.func.display());
     }
-    let loc = mcode.code.end().offset() as MCodeOffset;
     emit.fb.ctx.compile(&*emit.isa, &mut Default::default()).unwrap();
     let code = emit.fb.ctx.compiled_code().unwrap();
-    mcode.code.write(code.code_buffer());
-    mcode.align_code();
+    let loc = emitmcode(mcode, code.code_buffer());
     for reloc in code.buffer.relocs() {
         emitreloc(mcode, emit, loc, reloc);
-    }
-    if trace!(MCODE) {
-        trace!("{}", {
-            let mut buf = Default::default();
-            dump_mcode(&mut buf, &mcode.code.as_slice()[loc as usize..]);
-            // dump_mcode(&mut buf, code.code_buffer());
-            buf
-        });
     }
     loc
 }
@@ -443,7 +540,8 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
         trace_schedule(emit, func, fid);
     }
     // TODO: sink RIGHT HERE
-    emit.fb.ctx.clear();
+    emit.fb.clear();
+    emit.bump.clear();
     let clf = &mut emit.fb.ctx.func;
     makesig(&mut clf.signature, func);
     for (id, phis) in emit.blockparams.pairs() {
@@ -478,21 +576,25 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
 }
 
 fn emitsuppfunc(ecx: &mut Ecx, supp: SuppRef) {
-    let emit = &mut *ecx.data;
-    emit.fb.ctx.clear();
-    emit.supp.signature(&mut emit.fb.ctx.func.signature, supp);
-    let entry = emit.fb.newblock();
-    // supp code uses this to get function args:
-    debug_assert!(entry == block2cl(BlockId::START));
-    for param in &emit.fb.ctx.func.stencil.signature.params {
-        emit.fb.ctx.func.stencil.dfg.append_block_param(entry, param.value_type);
-    }
-    emit.fb.block = entry;
-    emitsupport(ecx, supp);
     if trace!(CLIF) || trace!(MCODE) {
         trace!("---------- SUPP@{} ----------", supp.offset());
     }
-    let loc = compilefunc(&mut ecx.data, &mut ecx.mcode);
+    let emit = &mut *ecx.data;
+    let loc = if emit.supp[supp].sf == SuppFunc::SWAP as _ {
+        emitmcode(&mut ecx.mcode, Image::fhk_swap_bytes())
+    } else {
+        emit.fb.clear();
+        emit.supp.signature(&mut emit.fb.ctx.func.signature, supp);
+        let entry = emit.fb.newblock();
+        // supp code uses this to get function args:
+        debug_assert!(entry == block2cl(BlockId::START));
+        for param in &emit.fb.ctx.func.stencil.signature.params {
+            emit.fb.ctx.func.stencil.dfg.append_block_param(entry, param.value_type);
+        }
+        emit.fb.block = entry;
+        emitsupport(ecx, supp);
+        compilefunc(&mut ecx.data, &mut ecx.mcode)
+    };
     ecx.mcode.labels[ecx.data.supp[supp].label] = loc;
 }
 
@@ -511,7 +613,21 @@ fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
 
 impl Phase for Emit {
 
-    fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
+    fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self> {
+        let lang = LangState::new(
+            ccx,
+            ccx.ir.funcs.raw.iter()
+            .flat_map(|f| f.code.pairs())
+            .filter_map(|(_,i)|
+                if (Opcode::LOV|Opcode::LOVV|Opcode::LOVX|Opcode::LOX|Opcode::LOXX)
+                .contains(i.opcode())
+                {
+                    Some(Lang::from_u8(i.decode_L().lang))
+                } else {
+                    None
+                }
+            ).collect()
+        )?;
         let mut flag_builder = cranelift_codegen::settings::builder();
         flag_builder.set("enable_pinned_reg", "true").unwrap();
         flag_builder.set("opt_level", "speed").unwrap();
@@ -522,14 +638,17 @@ impl Phase for Emit {
             .unwrap();
         Ok(Emit {
             isa,
+            lang,
             fb: FuncBuilder {
                 ctx: cranelift_codegen::Context::new(),
-                block: cranelift_codegen::ir::Block::reserved_value()
+                block: cranelift_codegen::ir::Block::reserved_value(),
+                frame: None
             },
             gcm: Default::default(),
             supp: Default::default(),
             code: Default::default(),
             values: Default::default(),
+            bump: Default::default(),
             blockparams: Default::default(),
             stack: Value::reserved_value(),
             idx: Value::reserved_value(),
@@ -540,7 +659,8 @@ impl Phase for Emit {
     }
 
     fn run(ccx: &mut Ccx<Self>) -> compile::Result {
-        ccx.freeze_ir(emitfuncs)
+        ccx.freeze_ir(emitfuncs)?;
+        take(&mut ccx.data.lang).finish(ccx)
     }
 
 }

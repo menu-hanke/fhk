@@ -6,7 +6,7 @@ use cfg_if::cfg_if;
 
 use crate::bitmap::BitMatrix;
 use crate::bytestring::ByteString;
-use crate::emit::{self, v2block};
+use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
 use crate::ir::{Code, Func, FuncId, Ins, InsId, LangOp, Operand, PhiId, IR};
@@ -101,7 +101,7 @@ pub fn trace_objs( sequences: &Intern, objs: &Objects, start: ObjRef) {
 
 /* ---- IR ------------------------------------------------------------------ */
 
-fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&emit::Values>) {
+fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&IndexSlice<InsId, InsValue>>) {
     let opcode = ins.opcode();
     write!(
         buf,
@@ -125,7 +125,7 @@ fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&emit::Val
             Operand::V  => write!(buf, " {:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i}),
             Operand::C  => {
                 if let Some(values) = values {
-                    let block: u16 = zerocopy::transmute!(v2block(values.raw[raw as u16 as usize]));
+                    let block: u16 = zerocopy::transmute!(values.raw[raw as u16 as usize].block());
                     write!(buf, " ->{}", block)
                 } else {
                     write!(buf, " ->{:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i})
@@ -174,7 +174,7 @@ pub fn dump_schedule(
     buf: &mut ByteString,
     func: &Func,
     code: &IndexSlice<InsId, Ins>,
-    values: &emit::Values,
+    values: &IndexSlice<InsId, InsValue>,
     params: &BitMatrix<BlockId, PhiId>
 ) {
     dump_phis(buf, func);

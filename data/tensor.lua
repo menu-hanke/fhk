@@ -1,6 +1,36 @@
 local ffi = require "ffi"
 local buffer = require "string.buffer"
 
+-- ORDER PRI
+local PRI_F64 = 0
+local PRI_F32 = 1
+local PRI_I64 = 2
+local PRI_I32 = 3
+local PRI_I16 = 4
+local PRI_I8  = 5
+local PRI_U64 = 6
+local PRI_U32 = 7
+local PRI_U16 = 8
+local PRI_U8  = 9
+local PRI_B1  = 10
+local PRI_PTR = 11
+local PRI_STR = 12
+local PRI_CT = {
+	[PRI_F64] = ffi.typeof("double"),
+	[PRI_F32] = ffi.typeof("float"),
+	[PRI_I64] = ffi.typeof("int64_t"),
+	[PRI_I32] = ffi.typeof("int32_t"),
+	[PRI_I16] = ffi.typeof("int16_t"),
+	[PRI_I8]  = ffi.typeof("int8_t"),
+	[PRI_U64] = ffi.typeof("uint64_t"),
+	[PRI_U32] = ffi.typeof("uint32_t"),
+	[PRI_U16] = ffi.typeof("uint16_t"),
+	[PRI_U8]  = ffi.typeof("uint8_t"),
+	[PRI_B1]  = ffi.typeof("bool"),
+	[PRI_PTR] = ffi.typeof("void *"),
+	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
+}
+
 -- it's logically an uint32_t, but signed generates slightly better code
 local IDX_CTYPE = "int32_t"
 
@@ -120,8 +150,16 @@ local function ctkey(e, n)
 	return bit.lshift(tonumber(e), 8) + n
 end
 
+local function scalar_ctype(pri)
+	return PRI_CT[pri]
+end
+
+local function vector_ctype(e)
+	error("TODO")
+end
+
 -- struct layout here must match query memory layout.
-local function ctypeof(e, n)
+local function tensor_ctype(e, n)
 	e = ffi.typeof(e)
 	if (not n) or n == 0 then return e end
 	local ctk = ctkey(e, n)
@@ -138,5 +176,7 @@ local function ctypeof(e, n)
 end
 
 return {
-	ctypeof = ctypeof
+	scalar_ctype = scalar_ctype,
+	vector_ctype = vector_ctype,
+	tensor_ctype = tensor_ctype
 }

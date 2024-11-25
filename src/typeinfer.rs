@@ -232,6 +232,16 @@ fn createtypeobj(objs: &mut Objects, ty: TypeRepr, work: &[u32]) -> ObjRef {
 
 fn createtype(objs: &Objects, tvar: &mut IndexVec<TypeVar, Type>, idx: ObjRef) -> Type {
     match objs.get(idx) {
+        ObjectRef::TVAR(_) => {
+            // TODO: handle explicit type variables in type inference.
+            // probably the "correct" way to do this is to do two passes over objects in init:
+            //   1. collect all explicit type objects into a hashmap objref -> type.
+            //   2. set annotations for expressions and variables
+            // this also avoids re-creating all types like init currently does.
+            // note: unifyexpr() still must be called for all expressions with an explicit
+            // type annotations, because otherwise subexpressions won't be visited.
+            todo!()
+        },
         ObjectRef::TPRI(&TPRI { ty, .. }) => Type::pri(EnumSet::from_u16_truncated(1 << ty)),
         ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
             let e = createtype(objs, tvar, elem);
@@ -285,6 +295,16 @@ fn puttypeobj(ccx: &mut Ccx<TypeInfer>, idx: ObjRef) {
         |&i| hashtypeobj(ccx.objs.get(i))
     ) {
         e.insert(idx);
+    }
+}
+
+fn isconcretetype(objs: &Objects, idx: ObjRef) -> bool {
+    match objs.get(idx) {
+        ObjectRef::TVAR(_) => false,
+        ObjectRef::TPRI(_) => true,
+        ObjectRef::TTEN(&TTEN { elem, .. }) => isconcretetype(objs, elem),
+        ObjectRef::TTUP(TTUP { elems, .. }) => elems.iter().all(|&e| isconcretetype(objs, e)),
+        _ => unreachable!()
     }
 }
 
@@ -366,7 +386,8 @@ fn init(ccx: &mut Ccx<TypeInfer>) {
                 trace!(TYPE "{:?} = {:?} VAR", ann, idx);
                 ccx.objs[idx.cast::<VAR>()].ann = zerocopy::transmute!(ann);
             },
-            op if Operator::is_type_raw(op) => puttypeobj(ccx, idx),
+            op if Operator::is_type_raw(op) && isconcretetype(&ccx.objs, idx)
+                => puttypeobj(ccx, idx),
             _ => {}
         }
     }

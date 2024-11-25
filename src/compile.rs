@@ -12,7 +12,6 @@ use crate::host::HostCtx;
 use crate::image::Image;
 use crate::intern::{Intern, IRef};
 use crate::ir::IR;
-use crate::lang::LangState;
 use crate::layout::ComputeLayout;
 use crate::lex::Token;
 use crate::link::Link;
@@ -85,8 +84,6 @@ pub struct Ccx<P=Absent, O=RW, I=RW> {
     pub dynlibs: DynLibs,
     // finalizers
     pub fin: FinalizerBuilder,
-    // language-specific state
-    pub lang: LangState,
     // vmctx memory layout information
     pub layout: Layout,
     // mcode functions and data
@@ -127,7 +124,6 @@ impl Ccx {
             data: Default::default(),
             mcode: Default::default(),
             image: Default::default(),
-            lang: Default::default(),
             layout: Default::default(),
         }
     }

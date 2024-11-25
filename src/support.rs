@@ -9,7 +9,7 @@ use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 
 use crate::bump::{self, Aligned, Bump, BumpRef};
-use crate::emit::{block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
+use crate::emit::{self, block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
 use crate::hash::fxhash;
 use crate::image::Instance;
 use crate::index::InvalidValue;
@@ -92,6 +92,7 @@ macro_rules! define_suppfuncs {
 define_suppfuncs! {
     DSINIT { _pad: u8 };
     ALLOC { _pad: u8 };
+    SWAP { _pad: u8 };
     // TRAMPOLINE { pub n: u8, _pad: u16, pub args: BumpRef<[Arg]>, pub func: FuncPtr };
     // TODO: vector arithmetic, memcpy, traps, etc.
 }
@@ -172,6 +173,7 @@ impl SupportFuncs {
 
 const SIG_DSINIT: &Signature = &signature!(Fast PTR I32 I32); // (slots, num, size)
 const SIG_ALLOC: &Signature = &signature!(Fast I64 I64 -> PTR); // (bytes, align) -> mem
+const SIG_SWAP: &Signature = &signature!(emit::NATIVE_CALLCONV, PTR I64 -> I64);
 
 fn ty2param(param: &mut Vec<AbiParam>, ty: &[Type]) {
     param.extend(ty.iter().map(|&t| AbiParam::new(irt2cl(t))));
@@ -196,6 +198,7 @@ impl SupportFuncs {
         let si = match SuppFunc::from_u8(self[supp].sf) {
             DSINIT => SIG_DSINIT,
             ALLOC  => SIG_ALLOC,
+            SWAP   => SIG_SWAP
         };
         sig2cl(sig, si);
     }
@@ -315,6 +318,7 @@ pub fn emitsupport(ecx: &mut Ecx, supp: SuppRef) {
     let emit = &mut *ecx.data;
     match SuppFunc::from_u8(emit.supp[supp].sf) {
         DSINIT => supp_dsinit(ecx),
-        ALLOC  => supp_alloc(ecx)
+        ALLOC  => supp_alloc(ecx),
+        SWAP   => unreachable!() // asm function
     }
 }

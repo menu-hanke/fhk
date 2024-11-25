@@ -1,7 +1,6 @@
 //! Image and instance management.
 
 use core::arch::global_asm;
-use core::cell::Cell;
 use core::marker::PhantomPinned;
 use core::mem::offset_of;
 use core::pin::Pin;
@@ -9,6 +8,7 @@ use core::u64;
 
 use cfg_if::cfg_if;
 
+use crate::finalize::Finalizers;
 use crate::host::HostInst;
 use crate::mem::{Breakpoints, Offset};
 use crate::mmap::Mmap;
@@ -16,6 +16,7 @@ use crate::mmap::Mmap;
 pub struct Image {
     pub mem: Mmap,
     pub breakpoints: Breakpoints,
+    pub fin: Finalizers,
     pub size: Offset
 }
 
@@ -24,9 +25,11 @@ pub struct Image {
 #[repr(align(8))]
 pub struct Instance {
     pub host: HostInst,
-    sp: Cell<*const u8>,
+    sp: *mut u8, // stack pointer just before entering query
     _pin: PhantomPinned
 }
+
+/* ---- Call and exit ------------------------------------------------------- */
 
 #[cfg(all(target_arch="x86_64", unix))]
 global_asm!("
@@ -63,19 +66,19 @@ fhk_vmcall:
     pop r12
     ret
 fhk_vmexit:
-    mov rsp, [rdi+{vmctx_rsp}]          // restore stack
+    mov rsp, [r15+{vmctx_rsp}]          // restore stack
     mov eax, 1                          // status = 1
     jmp 1b
 ",
-    vmctx_rsp        = const offset_of!(Instance, sp),
+    vmctx_rsp = const offset_of!(Instance, sp),
     // vmctx_scratchpad = const offset_of!(host::State, scratchpad)
 );
 
 #[allow(improper_ctypes)]
 extern "sysv64" {
-    pub fn fhk_vmcall(vmctx: Pin<&Instance>, result: *mut u8, mcode: *const u8) -> i32;
+    pub fn fhk_vmcall(vmctx: Pin<&mut Instance>, result: *mut u8, mcode: *const u8) -> i32;
     #[cold]
-    pub fn fhk_vmexit(vmctx: Pin<&Instance>) -> !;
+    pub fn fhk_vmexit(vmctx: Pin<&mut Instance>) -> !;
 }
 
 cfg_if! {
@@ -109,6 +112,119 @@ impl Image {
                     core::ptr::write_bytes(mem.add(start), 0, end-start);
                 }
             }
+        }
+    }
+
+}
+
+/* ---- Stack swapping ------------------------------------------------------ */
+
+// NOTE: cranelift has a `stack_switch` implementation which currently only supports x64 linux.
+// eventually this whole thing should be replaced by that.
+
+#[cfg(all(target_arch="x86_64", unix))]
+global_asm!("
+.p2align 4
+.hidden fhk_swap
+.global fhk_swap
+// (coro[rdi], ret_out[rsi]) -> ret_in[rax]
+fhk_swap:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [rdi]    // rax = coro.sp
+    mov [rdi], rsp    // coro.sp = rsp
+    mov rsp, rax      // swap to coro stack
+    mov rax, rsi      // rax = return value on coro stack
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
+
+.hidden fhk_swap_exit
+.global fhk_swap_exit
+// coro[rdi] -> ret[rax]
+fhk_swap_exit:
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [rdi]        // rax = coro.sp
+    mov [rdi], rsp        // coro.sp = rsp
+    mov r15, [rax]        // r15 = vmctx
+    jmp fhk_vmexit
+
+.hidden fhk_swap_init
+.global fhk_swap_init
+// (coro[rdi], stack[rsi], func[rdx], ctx[rcx])
+fhk_swap_init:
+    sub rsi, 64
+    lea rax, [rip+1f]
+    mov [rsi+48], rax
+    mov [rdi], rsi
+    jmp fhk_swap
+    ret
+1:
+    mov rdi, rcx
+    jmp rdx
+
+.hidden fhk_swap_instance
+.global fhk_swap_instance
+// coro[rdi] -> vmctx[rax]
+fhk_swap_instance:
+    mov rax, [rdi]
+    mov rax, [rax]
+    ret
+");
+
+extern "C" {
+    // `stack` is a pointer to the address of the stack pointer.
+    // this function stores regs on the current stacks, swaps stacks, and returns `ret` on the
+    // swapped stack.
+    pub fn fhk_swap(coro: usize, ret: i64) -> i64;
+    // suspends this stack and jumps to fhk_vmexit.
+    // THIS MUST NOT BE CALLED ON THE SAME STACK THAT CALLED fhk_vmcall.
+    pub fn fhk_swap_exit(coro: usize) -> i64;
+    // initialize a coroutine.
+    pub fn fhk_swap_init(
+        coro: usize,
+        stack: usize,
+        func: unsafe extern "C" fn(*mut ()) -> !,
+        ctx: *mut ()
+    );
+    // get instance pointer from coroutine.
+    // this is safe to call **only** when the main coroutine has been swapped out via fhk_swap().
+    // this is an asm function to hide the int->ptr cast.
+    #[allow(improper_ctypes)]
+    pub fn fhk_swap_instance(coro: usize) -> *mut Instance;
+}
+
+
+impl Image {
+
+    pub fn fhk_swap_bytes() -> &'static [u8] {
+        // ideally you would write this as a constant:
+        //   pub const FHK_SWAP_BYTES: &'static [u8] = unsafe {
+        //       core::slice::from_raw_parts(
+        //           fhk_swap as *const u8,
+        //           (fhk_swap_exit as *const u8).offset_from(fhk_swap as *const u8) as usize
+        //       )
+        //   };
+        // but rust says: "`ptr_offset_from` called on pointers into different allocations".
+        // so i guess we're not writing it as a constant then.
+        unsafe {
+            core::slice::from_raw_parts(
+                fhk_swap as *const u8,
+                fhk_swap_exit as usize - fhk_swap as usize
+            )
         }
     }
 

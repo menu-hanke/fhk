@@ -9,13 +9,11 @@ use core::cmp::{max, Ordering};
 use core::ops::Range;
 
 use alloc::vec::Vec;
-use cranelift_codegen::ir::Value;
-use cranelift_entity::packed_option::ReservedValue;
 
 use crate::bitmap::{BitMatrix, Bitmap, BitmapVec};
 use crate::controlflow::{compute_controlflow, compute_dataflow, ControlMatrix};
 use crate::dataflow::{Dataflow, DataflowSystem};
-use crate::emit::{self, v2block};
+use crate::emit::InsValue;
 use crate::index::{self, index, IndexOption, IndexSlice, IndexVec, InvalidValue};
 use crate::ir::{Code, Func, Ins, InsId, Opcode, PhiId, Type};
 
@@ -220,7 +218,7 @@ fn collect(
     gcm: &mut Gcm,
     code: &Code,
     out: &mut IndexVec<InsId, Ins>,
-    values: &mut IndexVec<InsId, Value>
+    values: &mut IndexVec<InsId, InsValue>
 ) {
     // here block.tmp = number of instructions
     for block in &mut gcm.blocks.raw {
@@ -238,10 +236,9 @@ fn collect(
     // place blocks
     let nins = gcm.place.raw.len();
     out.raw.resize(nins, Ins::NOP_FX);
-    values.raw.resize(nins, Value::reserved_value());
+    values.raw.resize(nins, Default::default());
     for (id, block) in gcm.blocks.pairs_mut() {
-        let id: u16 = zerocopy::transmute!(id);
-        values[zerocopy::transmute!(block.tmp-1)] = Value::from_u32(id as _);
+        values[zerocopy::transmute!(block.tmp-1)] = InsValue::from_block(id);
         block.ctr = zerocopy::transmute!(block.tmp-1);
     }
     // compute placements and insert dummy instructions.
@@ -299,7 +296,7 @@ fn computeparams(
     func: &Func,
     code: &IndexSlice<InsId, Ins>,
     cfg: &Dataflow<BlockId>,
-    values: &emit::Values,
+    values: &IndexSlice<InsId, InsValue>,
     solver: &mut DataflowSystem<BlockId>,
     phis: &mut BitMatrix<BlockId, PhiId>,
     work: &mut BitmapVec
@@ -318,18 +315,18 @@ fn computeparams(
         match ins.opcode() {
             Opcode::JMP => {
                 let (_, _, phi) = ins.decode_JMP();
-                let block = v2block(values[id]);
+                let block = values[id].block();
                 blocks[block].tmp = zerocopy::transmute!(phi);
             },
             Opcode::PHI => {
                 let (ctr, phi) = ins.decode_PHI();
-                let block = v2block(values[ctr]);
+                let block = values[ctr].block();
                 phis[block].set(phi);
             },
             // TODO: this should be done for user funcs because they return values in RET, but not
             // for bundles and queries
             // Opcode::RET => {
-            //     let block = v2block(values[id]);
+            //     let block = values[id].block();
             //     for r in index::iter_range(func.returns()) {
             //         phis[block].set(r);
             //     }
@@ -386,7 +383,7 @@ pub fn compute_schedule(
     gcm: &mut Gcm,
     func: &Func,
     out: &mut IndexVec<InsId, Ins>,
-    values: &mut IndexVec<InsId, Value>,
+    values: &mut IndexVec<InsId, InsValue>,
     blockparams: &mut BitMatrix<BlockId, PhiId>
 ) -> BlockId {
     gcmclear(gcm);

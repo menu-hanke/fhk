@@ -137,7 +137,7 @@ fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
     let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
         else { return langerr(pcx) };
     next(pcx)?; // skip name
-    lang.parse_callx(pcx, n)
+    lang.parse(pcx, n)
 }
 
 // ORDER BINOP

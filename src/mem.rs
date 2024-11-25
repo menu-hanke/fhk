@@ -2,6 +2,7 @@
 
 use crate::bitmap::bitmap_array;
 use crate::index::{index, IndexArray};
+use crate::ir::Type;
 use crate::obj::{ObjRef, TAB};
 
 pub type Offset = u32;
@@ -131,6 +132,33 @@ impl SizeClass {
 
     pub fn is_dynamic(self) -> bool {
         (self.0 as i32) < 0
+    }
+
+}
+
+// utility for allocating memory slots
+#[derive(Clone, Copy, Default)]
+pub struct Cursor { pub ptr: usize }
+
+impl Cursor {
+
+    pub fn align(&mut self, align: usize) -> usize {
+        if align > 0 {
+            debug_assert!(align.is_power_of_two());
+            self.ptr = (self.ptr + align - 1) & !(align - 1);
+        }
+        self.ptr
+    }
+
+    pub fn alloc(&mut self, size: usize, align: usize) -> usize {
+        let ptr = self.align(align);
+        self.ptr += size;
+        ptr
+    }
+
+    pub fn alloc_type(&mut self, type_: Type) -> usize {
+        let size = type_.size();
+        self.alloc(size, size)
     }
 
 }

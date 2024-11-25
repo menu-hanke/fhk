@@ -316,6 +316,7 @@ define_ops! {
     VSET        { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     NIL         {};
     // types
+    TVAR        {};
     TPRI.ty     {};
     TTEN.dim    { elem: ObjRef/*TY*/ };
     TTUP        {} elems: [ObjRef/*TY*/];
@@ -325,6 +326,7 @@ define_ops! {
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
     KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
+    NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
     DIM.axis    { ann: ObjRef/*TY*/ };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
@@ -366,8 +368,8 @@ impl Operator {
     }
 
     pub fn is_type_raw(op: u8) -> bool {
-        ((1 << Self::TPRI as u8) | (1 << Self::TTEN as u8) | (1 << Self::TTUP as u8))
-            & (1 << op) != 0
+        use Operator::*;
+        (TVAR|TPRI|TTEN|TTUP).as_u64_truncated() & (1 << op) != 0
     }
 
     // depends on ORDER NAMEDOBJ
@@ -531,6 +533,7 @@ impl Objects {
         use ObjectRef::*;
         // note: this only does types and expressions. add other objects if needed.
         match (self.get(a.erase()), self.get(b.erase())) {
+            (TVAR(_),  TVAR(_))   => false,
             (TPRI(a),  TPRI(b))   => a.ty == b.ty,
             (TTEN(a),  TTEN(b))   => a.dim == b.dim && self.equal(a.elem, b.elem),
             (TTUP(a),  TTUP(b))   => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
@@ -538,6 +541,7 @@ impl Objects {
             (KINT64(a),KINT64(b)) => a.k == b.k,
             (KFP64(a), KFP64(b))  => a.k == b.k,
             (KSTR(a),  KSTR(b))   => a.k == b.k,
+            (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (DIM(a),   DIM(b))    => a.axis == b.axis,
             (TUPLE(a), TUPLE(b))  => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
             (VGET(a),  VGET(b))   => a.var == b.var

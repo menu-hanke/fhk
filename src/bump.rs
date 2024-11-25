@@ -6,6 +6,7 @@ use core::cmp::{max, Ordering};
 use core::fmt::Debug;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, Range, RangeFrom};
 use core::ptr::NonNull;
 
@@ -250,6 +251,12 @@ impl<W> Bump<W> {
         }
     }
 
+    pub fn copy_of(data: &BumpPtr) -> Self {
+        let mut bump = Self::new();
+        bump.write(data.as_slice::<u8>());
+        bump
+    }
+
 }
 
 impl<W> Default for Bump<W> {
@@ -357,6 +364,22 @@ impl<W: Aligned> Bump<W> {
         (BumpRef(ptr / T::ALIGN as u32, PhantomData), r)
     }
 
+    pub fn reserve_slice_init<T>(&mut self, len: usize, init: T) -> (BumpRef<[T]>, &mut [T])
+        where T: Clone + Copy
+    {
+        let ptr = self.reserve_aligned::<T>((len*size_of::<T>()) as u32);
+        let uninit: &mut [MaybeUninit<T>] = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.ptr.as_ptr().add(ptr as _) as _,
+                len
+            )
+        };
+        uninit.fill(MaybeUninit::new(init));
+        // XXX: replace this with MaybeUninit::slice_assume_init_mut when it stabilizes
+        let r = unsafe { core::slice::from_raw_parts_mut( uninit.as_mut_ptr() as _, len) };
+        (BumpRef(ptr / T::ALIGN as u32, PhantomData), r)
+    }
+
     pub fn write<T>(&mut self, value: &T) -> BumpRef<T>
         where T: ?Sized + Aligned + IntoBytes
     {
@@ -433,6 +456,10 @@ impl Bump {
         let len = end.offset() as u32;
         assert!(len <= self.len);
         self.len = len;
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
 
 }
@@ -763,6 +790,10 @@ impl<T> BumpArray<T> {
 
     pub fn len(self) -> u32 {
         self.raw.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
     }
 
     pub fn base(self) -> BumpRef<T> {

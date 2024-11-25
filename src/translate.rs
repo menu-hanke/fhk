@@ -9,7 +9,7 @@ use crate::lang::Lang;
 use crate::mem::SizeClass;
 use crate::support::{ALLOC, DSINIT};
 use crate::compile;
-use crate::emit::{block2cl, irt2cl, loadslot, storeslot, v2block, Ecx, Emit, MEM_RESULT};
+use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::schedule::BlockId;
 
@@ -39,7 +39,7 @@ fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
 //       because the passed value necessarily dominates the JMP.
 fn emitjump(ecx: &mut Ecx, target: InsId, phi: Option<(PhiId, Value)>) {
     let emit = &mut *ecx.data;
-    let target = v2block(emit.values[target]);
+    let target = emit.values[target].block();
     emit.tmp_val.clear();
     ctrargs(emit, target, phi);
     emit.fb.ins().jump(block2cl(target), &emit.tmp_val);
@@ -63,12 +63,12 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
                     FuncKind::Query(Query { offsets, .. }) => {
                         let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
                         let ofs = ecx.perm[offsets.add_size(phi as _)];
-                        emit.fb.ins().store(MEM_RESULT, emit.values[value], res, ofs as i32);
+                        emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
                     },
                     FuncKind::Bundle(Bundle { scl, slots, .. }) => {
                         let vmctx = emit.fb.vmctx();
                         let slot = ecx.perm[slots.add_size(phi as _)];
-                        storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value]);
+                        storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
                     }
                 }
             }
@@ -76,7 +76,7 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
             return;
         }
     }
-    emitjump(ecx, target, Some((phi, ecx.data.values[value])));
+    emitjump(ecx, target, Some((phi, ecx.data.values[value].value())));
 }
 
 fn ins_goto(ecx: &mut Ecx, id: InsId) {
@@ -87,9 +87,9 @@ fn ins_goto(ecx: &mut Ecx, id: InsId) {
 fn ins_if(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (cond, tru, fal) = emit.code[id].decode_IF();
-    let cond = emit.values[cond];
-    let tru = v2block(emit.values[tru]);
-    let fal = v2block(emit.values[fal]);
+    let cond = emit.values[cond].value();
+    let tru = emit.values[tru].block();
+    let fal = emit.values[fal].block();
     emit.tmp_val.clear();
     ctrargs(emit, tru, None);
     let boundary = emit.tmp_val.len();
@@ -119,11 +119,18 @@ fn ins_ub(ecx: &mut Ecx) {
 fn ins_phi(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
-    if ins.type_() == Type::FX { return }
+    if ins.type_() == Type::FX {
+        // TODO: handle this properly:
+        //   * remove tmp_val
+        //   * use InsValue instead of Value in ctrargs and emitjump
+        emit.values[id] = InsValue { raw: !0 - 1 };
+        return;
+    }
     let (ctr, phi) = ins.decode_PHI();
     let idx = emit.blockparams[emit.block].popcount_leading(phi);
-    emit.values[id] = emit.fb.ctx.func.dfg.block_params(
-        block2cl(v2block(emit.values[ctr])))[idx as usize];
+    emit.values[id] = InsValue::from_value(
+        emit.fb.ctx.func.dfg.block_params(emit.values[ctr].cl_block())[idx as usize]
+    );
 }
 
 fn ins_kintx(ecx: &mut Ecx, id: InsId) {
@@ -152,7 +159,7 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
         },
         FX | LSV => unreachable!()
     };
-    ecx.data.values[id] = value;
+    ecx.data.values[id] = InsValue::from_value(value);
 }
 
 fn ins_mov(ecx: &mut Ecx, id: InsId) {
@@ -168,8 +175,8 @@ fn ins_arith(ecx: &mut Ecx, id: InsId) {
     let (left, right) = ins.decode_VV();
     debug_assert!(emit.code[left].type_() == ins.type_());
     debug_assert!(emit.code[right].type_() == ins.type_());
-    let left = emit.values[left];
-    let right = emit.values[right];
+    let left = emit.values[left].value();
+    let right = emit.values[right].value();
     let value = match (ins.opcode(), ins.type_()) {
         (ADD, F32|F64) => emit.fb.ins().fadd(left, right),
         (SUB, F32|F64) => emit.fb.ins().fsub(left, right),
@@ -181,14 +188,14 @@ fn ins_arith(ecx: &mut Ecx, id: InsId) {
         (DIV, I8|I16|I32|I64) => emit.fb.ins().sdiv(left, right), // nb. signed
         _ => unreachable!()
     };
-    emit.values[id] = value;
+    emit.values[id] = InsValue::from_value(value);
 }
 
 fn ins_addp(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (left, right) = emit.code[id].decode_VV();
-    let right = emit.fb.coerce(emit.values[right], Type::I64);
-    emit.values[id] = emit.fb.ins().iadd(emit.values[left], right);
+    let right = emit.fb.coerce(emit.values[right].value(), Type::I64);
+    emit.values[id] = InsValue::from_value(emit.fb.ins().iadd(emit.values[left].value(), right));
 }
 
 fn ins_cmp(ecx: &mut Ecx, id: InsId) {
@@ -199,8 +206,8 @@ fn ins_cmp(ecx: &mut Ecx, id: InsId) {
     let ty = emit.code[left].type_();
     debug_assert!(emit.code[right].type_() == ty);
     debug_assert!(ins.type_() == Type::B1);
-    let left = emit.values[left];
-    let right = emit.values[right];
+    let left = emit.values[left].value();
+    let right = emit.values[right].value();
     let opcode = ins.opcode();
     let value = match ty {
         F32 | F64 => {
@@ -229,7 +236,7 @@ fn ins_cmp(ecx: &mut Ecx, id: InsId) {
         },
         _ => unreachable!()
     };
-    emit.values[id] = value;
+    emit.values[id] = InsValue::from_value(value);
 }
 
 // TODO: separate escaping and non-escaping allocs
@@ -249,17 +256,17 @@ fn ins_alloc(ecx: &mut Ecx, id: InsId) {
     let (size, align) = emit.code[id].decode_VV();
     let alloc = emit.supp.instantiate(&mut ecx.mcode, &ALLOC::new());
     let alloc = emit.fb.importsupp(&emit.supp, alloc.cast());
-    let size = emit.fb.coerce(emit.values[size], Type::I64);
-    let align = emit.fb.coerce(emit.values[align], Type::I64);
+    let size = emit.fb.coerce(emit.values[size].value(), Type::I64);
+    let align = emit.fb.coerce(emit.values[align].value(), Type::I64);
     let call = emit.fb.ins().call(alloc, &[size, align]);
-    emit.values[id] = emit.fb.ctx.func.dfg.inst_results(call)[0];
+    emit.values[id] = InsValue::from_value(emit.fb.ctx.func.dfg.inst_results(call)[0]);
 }
 
 fn ins_store(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
     let (ptr, value) = ins.decode_VV();
-    emit.fb.ins().store(MemFlags::trusted(), emit.values[value], emit.values[ptr], 0);
+    emit.fb.ins().store(MemFlags::trusted(), emit.values[value].value(), emit.values[ptr].value(), 0);
 }
 
 fn ins_load(ecx: &mut Ecx, id: InsId) {
@@ -267,7 +274,20 @@ fn ins_load(ecx: &mut Ecx, id: InsId) {
     let ins = emit.code[id];
     let ptr = ins.decode_V();
     let ty = irt2cl(ins.type_());
-    emit.values[id] = emit.fb.ins().load(ty, MemFlags::trusted(), emit.values[ptr], 0);
+    emit.values[id] = InsValue::from_value(
+        emit.fb.ins().load(ty, MemFlags::trusted(), emit.values[ptr].value(), 0)
+    );
+}
+
+fn ins_box(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let value = emit.code[id].decode_V();
+    let ty = emit.code[value].type_();
+    let frame = emit.fb.frame();
+    let ofs = frame.alloc(ty.size() as _, ty.size() as _);
+    let slot = frame.slot;
+    emit.fb.ins().stack_store(emit.values[value].value(), slot, ofs as i32);
+    emit.values[id] = InsValue { raw: ofs };
 }
 
 fn ins_callb(ecx: &mut Ecx, id: InsId) {
@@ -276,14 +296,14 @@ fn ins_callb(ecx: &mut Ecx, id: InsId) {
     let FuncKind::Bundle(Bundle { scl, check, .. }) = ecx.ir.funcs[bundle].kind
         else { unreachable!() };
     let vmctx = emit.fb.vmctx();
-    let bit = loadslot(emit, vmctx, emit.values[idx], scl, check, Type::B1);
+    let bit = loadslot(emit, vmctx, emit.values[idx].value(), scl, check, Type::B1);
     let merge_block = emit.fb.newblock();
     let call_block = emit.fb.newblock();
     emit.fb.ctx.func.layout.set_cold(call_block);
     emit.fb.ins().brif(bit, merge_block, &[], call_block, &[]);
     emit.fb.block = call_block;
     let funcref = emit.fb.importfunc(&ecx.ir, bundle);
-    let args = [emit.values[idx]];
+    let args = [emit.values[idx].value()];
     emit.fb.ins().call(funcref, match scl { SizeClass::GLOBAL => &[], _ => &args });
     emit.fb.ins().jump(merge_block, &[]);
     emit.fb.block = merge_block;
@@ -304,11 +324,11 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
             debug_assert!(ecx.ir.funcs[bundle].phis.at(phi).type_ == ty);
             let vmctx = emit.fb.vmctx();
             let phi: usize = phi.into();
-            loadslot(emit, vmctx, emit.values[idx], scl, ecx.perm[slots.add_size(phi as _)], ty)
+            loadslot(emit, vmctx, emit.values[idx].value(), scl, ecx.perm[slots.add_size(phi as _)], ty)
         },
         _ => unreachable!()
     };
-    ecx.data.values[id] = value;
+    ecx.data.values[id] = InsValue::from_value(value);
 }
 
 fn ins_binit(ecx: &mut Ecx, id: InsId) {
@@ -324,7 +344,7 @@ fn ins_binit(ecx: &mut Ecx, id: InsId) {
     let nret: usize = func.ret.into();
     // bitmap + one for each return
     let num = emit.fb.ins().iconst(irt2cl(Type::I32), (1 + nret) as i64);
-    emit.fb.ins().call(dsinit, &[tab, num, emit.values[size]]);
+    emit.fb.ins().call(dsinit, &[tab, num, emit.values[size].value()]);
 }
 
 fn ins_lop(ecx: &mut Ecx, id: InsId) -> compile::Result {
@@ -336,7 +356,8 @@ fn ins_lop(ecx: &mut Ecx, id: InsId) -> compile::Result {
 pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
     use Opcode::*;
     let ins = ecx.data.code[id];
-    if ins.type_() != Type::LSV {
+    // hack: translate box here
+    if ins.type_() != Type::LSV || ins.opcode() == BOX {
         match ins.opcode() {
             NOP => { /* NOP */ },
             JMP => ins_jmp(ecx, id),
@@ -346,10 +367,10 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             TRET => todo!(),
             UB => ins_ub(ecx),
             PHI => ins_phi(ecx, id),
-            KNOP => { /* NOP */ },
             KINT | KINT64 => ins_kintx(ecx, id),
             KFP64 => todo!(),
             KSTR => todo!(),
+            KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
             CONV => todo!(),
             ADD | SUB | MUL | DIV => ins_arith(ecx, id),
@@ -360,13 +381,13 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             ALLOC => ins_alloc(ecx, id),
             STORE => ins_store(ecx, id),
             LOAD => ins_load(ecx, id),
-            BOX => todo!(),
+            BOX => ins_box(ecx, id),
             CALL => todo!(),
             CALLB | CALLBI => ins_callb(ecx, id),
             CARG => { /* NOP */ },
             RES => ins_res(ecx, id),
             BINIT => ins_binit(ecx, id),
-            LOV | LOVV | LOX | LOXX => ins_lop(ecx, id)?
+            LO | LOV | LOVV | LOVX | LOX | LOXX => ins_lop(ecx, id)?
         }
     }
     Ok(())

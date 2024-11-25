@@ -9,7 +9,7 @@ use enumset::EnumSetType;
 use crate::bitmap::BitmapWord;
 use crate::bump::{BumpPtr, BumpRef, BumpVec};
 use crate::compile::{self, Ccx};
-use crate::emit::{cast_entitrefs, collectargs, irt2cl, Ecx, NATIVE_CALLCONV};
+use crate::emit::{cast_values, collectargs, irt2cl, Ecx, InsValue, NATIVE_CALLCONV};
 use crate::index::InvalidValue;
 use crate::intern::IRef;
 use crate::ir::{Func, Ins, InsId, LangOp, Type};
@@ -322,7 +322,7 @@ fn parse_out(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     let idx = match pcx.data.token {
         Token::LParen => {
             next(pcx)?;
-            check(pcx, Token::Int)?;
+            require(pcx, Token::Int)?;
             let idx = pcx.data.tdata as _;
             if !ps.need.test(idx) {
                 // TODO: report error (don't want this out parameter)
@@ -700,7 +700,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
         outputs: outputs.cast(),
         alloc
     };
-    let mut args = func.code.push(Ins::KNOP());
+    let mut args = func.code.push(Ins::NOP(Type::LSV));
     for store in &lcx.perm[call.stores..call.stores.add_size(call.nstore as _)] {
         let value = lower_value(&lower, &lcx.tmp, func, store.value);
         let ofs = func.code.push(Ins::KINT(Type::I64, store.ofs as _));
@@ -723,7 +723,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
 
 /* ---- Emitting ------------------------------------------------------------ */
 
-fn emit_call(ecx: &mut Ecx, id: InsId) -> cranelift_codegen::ir::Value {
+fn emit_call(ecx: &mut Ecx, id: InsId) -> InsValue {
     let emit = &mut *ecx.data;
     let (mut args, cf) = emit.code[id].decode_VV();
     let func: &CFunc = &ecx.intern[zerocopy::transmute!(emit.code[cf].bc())];
@@ -746,25 +746,26 @@ fn emit_call(ecx: &mut Ecx, id: InsId) -> cranelift_codegen::ir::Value {
     );
     sig.returns.push(AbiParam::new(irt2cl(func.ret.to_ir())));
     let sig = emit.fb.ctx.func.import_signature(sig);
-    let argv = ecx.tmp.align_for::<u32>();
+    let argv = ecx.tmp.align_for::<InsValue>();
     let argbase = argv.end();
     collectargs(emit, argv, args);
-    let call = emit.fb.ins().call_indirect(sig, emit.values[ptr], cast_entitrefs(&argv[argbase..]));
-    cranelift_codegen::ir::Value::from_u32(call.as_u32())
+    InsValue::from_cl_inst(
+        emit.fb.ins().call_indirect(sig, emit.values[ptr].value(), cast_values(&argv[argbase..]))
+    )
 }
 
-fn emit_res(ecx: &mut Ecx, id: InsId) -> cranelift_codegen::ir::Value {
+fn emit_res(ecx: &mut Ecx, id: InsId) -> InsValue {
     let emit = &mut *ecx.data;
     let call = emit.code[id].decode_V();
-    let inst = cranelift_codegen::ir::Inst::from_u32(emit.values[call].as_u32());
-    emit.fb.ctx.func.dfg.inst_results(inst)[0]
+    let inst = emit.values[call].cl_inst();
+    InsValue::from_value(emit.fb.ctx.func.dfg.inst_results(inst)[0])
 }
 
 /* -------------------------------------------------------------------------- */
 
 impl Language for C {
 
-    fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
         let base = pcx.tmp.end();
         let (outputs, _) = pcx.tmp.reserve_dst::<[Output]>(n);
         let mut ps = ParseState {
@@ -792,7 +793,7 @@ impl Language for C {
         Ok(obj)
     }
 
-    fn lower_callx(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+    fn lower(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
         let base = lcx.tmp.end();
         let res = lower_call(lcx, obj, func, inputs);
         lcx.tmp.truncate(base);
@@ -803,7 +804,7 @@ impl Language for C {
         Ok(Default::default())
     }
 
-    fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<cranelift_codegen::ir::Value> {
+    fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<InsValue> {
         Ok(match lop {
             LOP_CCALL => emit_call(ecx, id),
             LOP_CRES  => emit_res(ecx, id),

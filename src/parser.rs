@@ -663,17 +663,18 @@ pub fn check(pcx: &mut Pcx, token: Token) -> compile::Result<bool> {
     })
 }
 
-pub fn require(pcx: &mut Pcx, token: Token) -> compile::Result {
+pub fn require(pcx: &mut Pcx, token: Token) -> compile::Result<u32> {
     if pcx.data.token == token {
-        Ok(())
+        Ok(pcx.data.tdata)
     } else {
         tokenerr(pcx, token)
     }
 }
 
-pub fn consume(pcx: &mut Pcx, token: Token) -> compile::Result {
-    require(pcx, token)?;
-    next(pcx)
+pub fn consume(pcx: &mut Pcx, token: Token) -> compile::Result<u32> {
+    let data = require(pcx, token)?;
+    next(pcx)?;
+    Ok(data)
 }
 
 pub fn save(pcx: &mut Pcx) {

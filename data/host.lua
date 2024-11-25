@@ -172,36 +172,6 @@ local FT_NAME = 3
 local FT_VLIT = 4
 local FT_VREF = 5
 
--- ORDER PRI
-local PRI_F64 = 0
-local PRI_F32 = 1
-local PRI_I64 = 2
-local PRI_I32 = 3
-local PRI_I16 = 4
-local PRI_I8  = 5
-local PRI_U64 = 6
-local PRI_U32 = 7
-local PRI_U16 = 8
-local PRI_U8  = 9
-local PRI_B1  = 10
-local PRI_PTR = 11
-local PRI_STR = 12
-local PRI_CT = {
-	[PRI_F64] = ffi.typeof("double"),
-	[PRI_F32] = ffi.typeof("float"),
-	[PRI_I64] = ffi.typeof("int64_t"),
-	[PRI_I32] = ffi.typeof("int32_t"),
-	[PRI_I16] = ffi.typeof("int16_t"),
-	[PRI_I8]  = ffi.typeof("int8_t"),
-	[PRI_U64] = ffi.typeof("uint64_t"),
-	[PRI_U32] = ffi.typeof("uint32_t"),
-	[PRI_U16] = ffi.typeof("uint16_t"),
-	[PRI_U8]  = ffi.typeof("uint8_t"),
-	[PRI_B1]  = ffi.typeof("bool"),
-	[PRI_PTR] = ffi.typeof("void *"),
-	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
-}
-
 local function isvalidobj(graph, i)
 	if i < graph.num then
 		return true
@@ -432,9 +402,9 @@ local function ann2ct(obj)
 		obj = obj.ann
 	end
 	if obj.op == "TPRI" then
-		return PRI_CT[obj.ty]
+		return tensor.scalar_ctype(obj.ty)
 	elseif obj.op == "TTEN" then
-		return tensor.ctypeof(ann2ct(obj.elem), obj.dim)
+		return tensor.tensor_ctype(ann2ct(obj.elem), obj.dim)
 	else
 		error("bad type annotation")
 	end
@@ -470,19 +440,25 @@ local function queryctype(query)
 	)
 end
 
+local fhk_vmcall = API.fhk_vmcall
+local function vmcall(inst, ret, mcode)
+	local r = fhk_vmcall(inst, ret, mcode)
+	if r ~= 0 then
+		error(ffi.string(API.fhk_vmerr(inst)), 2)
+	end
+	return r
+end
+
 local function queryfunc(ctype, mcode)
-	-- TODO:
-	-- * index parameter
-	-- * proper error handling
+	-- TODO: index parameter
 	return load(string.format([[
-		local ctype, fhk_vmcall = ...
+		local ctype, vmcall = ...
 		return function(instance, res)
 			local ret = res or ctype()
-			local r = fhk_vmcall(instance, ret, %s)
-			assert(r == 0)
+			vmcall(instance, ret, %s)
 			return ret
 		end
-	]], ffi.cast("uintptr_t", mcode)))(ctype, API.fhk_vmcall)
+	]], ffi.cast("uintptr_t", mcode)))(ctype, vmcall)
 end
 
 local function compilequery(query, image)

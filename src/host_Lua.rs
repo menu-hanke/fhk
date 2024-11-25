@@ -12,7 +12,7 @@ use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::IRef;
-use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, RESET, TAB};
+use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, RESET, TAB};
 use crate::parse::{parse_def, parse_expand_tab, parse_expand_var, parse_expr, parse_template, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
@@ -43,13 +43,22 @@ pub struct HostCtx {
 
 pub struct HostInst {
     alloc: fhk_Alloc,
-    udata: *mut c_void
+    udata: *mut c_void,
+    err: *const c_char
 }
 
 impl HostInst {
 
     pub fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         unsafe { (self.alloc)(self.udata, size, align) }
+    }
+
+    pub fn set_error(&mut self, err: &[u8]) {
+        let ptr = self.alloc(err.len()+1, 1);
+        let data: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(ptr, err.len()+1) };
+        data[..err.len()].copy_from_slice(err);
+        data[err.len()] = 0;
+        self.err = ptr as _;
     }
 
 }
@@ -208,6 +217,10 @@ extern "C" fn fhk_mcode(image: &fhk_Image) -> *const u8 {
     image.mem.base()
 }
 
+extern "C" fn fhk_vmerr(instance: &fhk_Instance) -> *const c_char {
+    instance.host.err as _
+}
+
 unsafe extern "C" fn fhk_newinstance(
     image: &fhk_Image,
     alloc: fhk_Alloc,
@@ -224,7 +237,7 @@ unsafe extern "C" fn fhk_newinstance(
     // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
     image.reset(mem, reset);
     let mem = mem as *mut Instance;
-    (*mem).host = HostInst { alloc, udata };
+    (*mem).host = HostInst { alloc, udata, err: core::ptr::null() };
     Pin::new_unchecked(&mut *mem)
 }
 
@@ -276,6 +289,7 @@ define_api! {
     void *(*fhk_mcode)(fhk_Image *);
     fhk_Instance *(*fhk_newinstance)(fhk_Image *, fhk_Alloc *, void *, fhk_Instance *, uint64_t);
     int32_t (*fhk_vmcall)(fhk_Instance *, void *, uintptr_t);
+    char *(*fhk_vmerr)(fhk_Instance *);
 }
 
 #[no_mangle]

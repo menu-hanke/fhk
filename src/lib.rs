@@ -58,7 +58,7 @@ macro_rules! foreach_lang {
         $mac! {
             $($($extra)*)?
             #[cfg(feature="lang-C")] lang_C::C;
-//            #[cfg(feature="lang-Lua")] lang_Lua::Lua;
+            #[cfg(feature="lang-Lua")] lang_Lua::Lua;
 //            #[cfg(feature="lang-R")] lang_R::R;
         }
     };

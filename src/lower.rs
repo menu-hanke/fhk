@@ -18,7 +18,7 @@ use crate::intrinsics::Intrinsic;
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, FieldType, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::Primitive;
@@ -110,7 +110,30 @@ pub fn decomposition_size(objs: &Objects, idx: ObjRef) -> usize {
     }
 }
 
-fn pushdeco(objs: &Objects, idx: ObjRef, deco: &mut Vec<Type>) {
+fn pushdeco<'o,'d>(objs: &'o Objects, idx: ObjRef, deco: &'d mut [Type]) -> &'d mut [Type] {
+    match objs.get(objs.totype(idx)) {
+        ObjectRef::TPRI(&TPRI { ty, ..  }) => {
+            deco[0] = Primitive::from_u8(ty).to_ir();
+            &mut deco[1..]
+        },
+        ObjectRef::TTEN(&TTEN { dim, elem, .. }) => {
+            let decos = decomposition_size(objs, elem);
+            deco[..decos].fill(Type::PTR);
+            deco[decos..decos+dim as usize].fill(IRT_IDX);
+            &mut deco[decos+dim as usize..]
+        },
+        ObjectRef::TTUP(TTUP { elems, .. }) => {
+            let mut d = deco;
+            for &e in elems {
+                d = pushdeco(objs, e, d);
+            }
+            d
+        },
+        _ => unreachable!()
+    }
+}
+
+fn pushdeco__old(objs: &Objects, idx: ObjRef, deco: &mut Vec<Type>) {
     match objs.get(objs.totype(idx)) {
         ObjectRef::TPRI(&TPRI { ty, ..  }) => {
             deco.push(Primitive::from_u8(ty).to_ir());
@@ -121,20 +144,31 @@ fn pushdeco(objs: &Objects, idx: ObjRef, deco: &mut Vec<Type>) {
         },
         ObjectRef::TTUP(TTUP { elems, .. }) => {
             for &e in elems {
-                pushdeco(objs, e, deco);
+                pushdeco__old(objs, e, deco);
             }
         },
         _ => unreachable!()
     }
 }
 
-fn decomposition<'objs, 'work>(
+pub fn decomposition<'objs, 'bump>(
+    objs: &'objs Objects,
+    idx: ObjRef,
+    bump: &'bump mut Bump
+) -> &'bump mut [Type] {
+    let decos = decomposition_size(objs, idx);
+    let (_, deco) = bump.reserve_slice_init(decos, Type::FX);
+    pushdeco(objs, idx, deco);
+    deco
+}
+
+fn decomposition__old<'objs, 'work>(
     objs: &'objs Objects,
     idx: ObjRef,
     work: &'work mut Vec<Type>
 ) -> &'work [Type] {
     work.clear();
-    pushdeco(objs, idx, work);
+    pushdeco__old(objs, idx, work);
     &*work
 }
 
@@ -185,7 +219,7 @@ pub struct Lower<O=RW, F=RW> {
 pub type Lcx<'a, 'b, 'c> = Ccx<Lower<R<'a>, R<'b>>, R<'c>>;
 
 // for callx (&mut Lcx -> &mut CLcx is ok because &mut T -> &mut UnsafeCell<T> is ok).
-// the point of this is to tell the compiler that lower_callx won't replace the current phase data.
+// the point of this is to tell the compiler that emitcallx won't replace the current phase data.
 pub type CLcx<'a, 'b, 'c> = Ccx<Access<Lower, R<'a>>, R<'b>, R<'c>>;
 
 // integer type used for indexing
@@ -290,7 +324,7 @@ fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
     {
         let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
         let mut sig = func.build_signature();
-        for &ty in decomposition(&ctx.objs, var.ann, &mut lower.tmp_ty) {
+        for &ty in decomposition__old(&ctx.objs, var.ann, &mut lower.tmp_ty) {
             sig = sig.add_return(ty);
         }
         maybeidxarg(sig.finish_returns(), scl).finish_args();
@@ -381,7 +415,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
             let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
             let mut sig = func.build_signature();
             for vset in &lower.bump[model].value {
-                for &ty in decomposition(
+                for &ty in decomposition__old(
                     &ctx.objs,
                     ctx.objs[vset.obj].value.erase(),
                     &mut lower.tmp_ty
@@ -457,7 +491,7 @@ fn emitarg(func: &Func, idx: usize) -> InsId {
     func.code.push(Ins::PHI(func.phis.at(phi).type_, InsId::START, phi))
 }
 
-fn reserve(func: &Func, num: usize) -> InsId {
+pub fn reserve(func: &Func, num: usize) -> InsId {
     // FIXME repeat_n stabilizes in 1.82.0
     func.code.extend((0..num).map(|_| Ins::NOP_FX))
 }
@@ -471,7 +505,7 @@ fn emitjumpifnot(func: &Func, ctr: &mut InsId, cond: InsId, target: InsId) -> In
 
 fn emitcallvm(func: &Func, idx: InsId, node: FuncId, inline: bool) -> InsId {
     let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
-    let knop = func.code.push(Ins::KNOP());
+    let knop = func.code.push(Ins::NOP(Type::FX));
     let callinit = func.code.push(Ins::CALLB(zero, knop, node+1));
     let init = func.code.push(Ins::RES(Type::FX, callinit, 0.into()));
     let opcode = match inline {
@@ -692,7 +726,7 @@ fn sametab(objs: &Objects, bump: &BumpPtr, a: BumpRef<Tab>, b: BumpRef<Tab>) -> 
 
 fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
     let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
-    let init = func.code.push(Ins::KNOP());
+    let init = func.code.push(Ins::NOP(Type::FX));
     func.code.push(Ins::CALLB(zero, init, tabf))
 }
 
@@ -1071,7 +1105,7 @@ fn emitcallx(lcx: &mut Lcx, ctr: &mut InsId, callx: ObjRef<CALLX>) -> InsId {
         //   &mut Ccx<Lower> -> &mut Ccx<UnsafeCell<Lower>>
         let lcx: &mut CLcx = unsafe { core::mem::transmute(&mut *lcx) };
         let lower = Access::borrow(&lcx.data);
-        lang.lower_callx(lcx, callx, &lower.func, &lower.tmp_ins[base..])
+        lang.lower(lcx, callx, &lower.func, &lower.tmp_ins[base..])
     };
     lcx.data.tmp_ins.truncate(base);
     value
@@ -1145,7 +1179,7 @@ fn materializecollect(
     // narrowing impossible in the future.
     let ptrs = reserve(&lower.func, ds);
     let esizes = reserve(&lower.func, ds);
-    for (i, ty) in decomposition(&lcx.objs, cty.elem, &mut lower.tmp_ty).iter().enumerate() {
+    for (i, ty) in decomposition__old(&lcx.objs, cty.elem, &mut lower.tmp_ty).iter().enumerate() {
         lower.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
         let size = lower.func.code.push(Ins::MUL(IRT_IDX, len, esizes + i as isize));
         lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize));
@@ -1153,7 +1187,7 @@ fn materializecollect(
     // FIXME repeat_n stabilizes in 1.82.0
     let l_phis = lower.func.phis.extend((0..ds).map(|_| Phi::new(Type::FX)));
     let r_phis = lower.func.phis.extend((0..ds).map(|_| Phi::new(Type::FX)));
-    let inits = lower.func.code.extend((0..ds).map(|_| Ins::KNOP()));
+    let inits = lower.func.code.extend((0..ds).map(|_| Ins::NOP(Type::FX)));
     let p_phis = lower.func.phis.extend((0..ds).map(|_| Phi::new(Type::PTR)));
     let mut reduce = newreduce(&lower.func, *ctr, l_phis, r_phis, inits, ds as _);
     for i in 0..ds as isize {
@@ -1204,7 +1238,7 @@ fn emitfwdvget(lcx: &mut Lcx, vget: &VGET) -> IndexOption<InsId> {
     let base = lower.func.code.end();
     // scalar load of vector variable is handled separately:
     debug_assert!(vget.ann != lcx.objs[vget.var].ann);
-    for (i, &ty) in decomposition(&lcx.objs, lcx.objs[vset.obj].value.erase(), &mut lower.tmp_ty)
+    for (i, &ty) in decomposition__old(&lcx.objs, lcx.objs[vset.obj].value.erase(), &mut lower.tmp_ty)
         .iter()
         .enumerate()
     {
@@ -1547,7 +1581,7 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
     let bump = Access::borrow(&lcx.data.bump);
     let var = &bump[var];
     lcx.data.tmp_vty.clear();
-    pushdeco(&lcx.objs, var.obj.erase(), &mut lcx.data.tmp_vty);
+    pushdeco__old(&lcx.objs, var.obj.erase(), &mut lcx.data.tmp_vty);
     let ds = decomposition_size(&lcx.objs, var.obj.erase());
     let vardim = bump[var.tab].n as usize;
     let armcall = emitcallvm1(&lcx.data.func, INS_FLATIDX, var.base + Var::SUB_ARM);
@@ -1614,7 +1648,7 @@ fn emitvarload(lcx: &mut Lcx, var: BumpRef<Var>, idx: InsId, inline: bool) -> In
     let Var { base, obj, .. } = lower.bump[var];
     let call = emitcallvm(&lower.func, idx, base + Var::SUB_VALUE, inline);
     lower.func.code.extend(
-        decomposition(&lcx.objs, obj.erase(), &mut lower.tmp_ty)
+        decomposition__old(&lcx.objs, obj.erase(), &mut lower.tmp_ty)
         .iter()
         .enumerate()
         .map(|(i,&ty)| Ins::RES(ty, call, i.into()))
@@ -1808,7 +1842,7 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                     //     struct { ... } valueM;
                     //   }
                     cursor = (cursor + align - 1) & !(align - 1);
-                    for &ty in decomposition(&lcx.objs, ann, &mut lcx.data.tmp_ty) {
+                    for &ty in decomposition__old(&lcx.objs, ann, &mut lcx.data.tmp_ty) {
                         debug_assert!(cursor & (ty.size() - 1) == 0);
                         putofs.push(cursor as Offset);
                         sig = sig.add_return(ty);

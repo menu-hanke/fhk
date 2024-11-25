@@ -7,8 +7,8 @@ use core::slice;
 use enumset::EnumSetType;
 
 use crate::bump::BumpRef;
+use crate::foreach_lang;
 use crate::index::{index, IndexValueVec, IndexVec};
-use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::mcode::MCodeData;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
@@ -71,7 +71,6 @@ macro_rules! define_types {
 //     with STORE -> MOVF -> LOAD. any instruction using an FX value must *not* care about the
 //     instruction sequence that produced the FX value. (but it of course can assume that whatever
 //     "something happens" represented by the FX value has happened).
-//     (TODO: CARG and RES are not "dumb" currently. they should be changed to use LSV instead.)
 //   * lsv is the only type that is *not* a dumb value. it's *not* ok to replace lsv instruction
 //     sequences with eg. MOVs. the instruction consuming an lsv value *can* look at the
 //     instruction sequence that produced the lsv. however, lsv instructions, like any other
@@ -111,7 +110,7 @@ impl Type {
 
 /* ---- Opcodes ------------------------------------------------------------- */
 
-#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[derive(Clone, Copy, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 pub struct LangOp {
     pub lang: u8,
@@ -120,11 +119,28 @@ pub struct LangOp {
 
 impl LangOp {
 
+    // XXX: consider making op an enum as well and have it be an associated type in trait Language.
+    // this makes it easy to have op names for debug dumps.
     pub fn new(lang: Lang, op: u8) -> Self {
         Self { lang: lang as _, op }
     }
 
 }
+
+macro_rules! langop_constructor {
+    ( $($(#[$($meta:tt)*])? $module:ident::$name:ident;)* ) => {
+        impl LangOp {
+            $(
+                $(#[$($meta)*])?
+                pub fn $name(op: u8) -> Self {
+                    Self::new($crate::lang::Lang::$name, op)
+                }
+            )*
+        }
+    };
+}
+
+foreach_lang!(langop_constructor);
 
 macro_rules! define_operands {
     ($(
@@ -268,11 +284,11 @@ define_opcodes! {
 
     PHI       C P,   decode_PHI;  // control id
 
-    KNOP.FX;
     KINT      XX;
     KINT64    XX;
     KFP64     XX;
     KSTR      XX;
+    KREF.LSV  XX;
 
     MOV       V;
     MOVB      V;
@@ -298,18 +314,20 @@ define_opcodes! {
     ALLOC.PTR V V;                     // size align
     STORE.FX  V V;                     // ptr value
     LOAD      V;                       // ptr
-    BOX.PTR   V;                       // value (b=offset after layout)
+    BOX.LSV   V;                       // value (c=offset after layout)
 
     CALL.FX   V F,   decode_CALL;      // args func
     CALLB.FX  V V F, decode_CALLB;     // idx fx bundle  (NOT inlineable)
     CALLBI.FX V V F;                   // idx fx bundle  (inlineable)
-    CARG.FX   V V,   decode_CARG;      // arg next
+    CARG.LSV  V V,   decode_CARG;      // arg next
     RES       V P,   decode_RES;       // call phi
 
     BINIT.FX  V F,   decode_BINIT;     // size bundle
 
+    LO;
     LOV       V L,   decode_LOV;
     LOVV      V V L, decode_LOVV;
+    LOVX      V X L, decode_LOVX;
     LOX       L X,   decode_LOX;
     LOXX      L XX,  decode_LOXX;
 
@@ -391,6 +409,10 @@ impl Ins {
 
     pub const fn opcode(self) -> Opcode {
         unsafe { transmute(self.0 as u8) }
+    }
+
+    pub const fn set_opcode(self, opcode: Opcode) -> Self {
+        Self((self.0 & !0xff) | (opcode as u64))
     }
 
     pub const fn type_(self) -> Type {
@@ -505,11 +527,12 @@ impl Ins {
 
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {
+        use Opcode::*;
         match self.opcode() {
-            Opcode::LOV => zerocopy::transmute!(self.b()),
-            Opcode::LOVV => zerocopy::transmute!(self.c()),
-            _ /* LOX | LOXX */ => {
-                debug_assert!((Opcode::LOX|Opcode::LOXX).contains(self.opcode()));
+            LOV => zerocopy::transmute!(self.b()),
+            LOVV | LOVX => zerocopy::transmute!(self.c()),
+            _ /* LO | LOX | LOXX */ => {
+                debug_assert!((LO|LOX|LOXX).contains(self.opcode()));
                 zerocopy::transmute!(self.a())
             }
         }
