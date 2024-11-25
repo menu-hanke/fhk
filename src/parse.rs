@@ -12,43 +12,12 @@ use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
 use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, langerr, next, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
+use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
-pub const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
+const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
     Token::Model | Token::Table | Token::Func | Token::Macro | Token::Eof
 );
-
-fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
-    let base = pcx.tmp.end();
-    save(pcx);
-    if check(pcx, Token::Scope)? { save(pcx); }
-    consume(pcx, Token::Ident)?;
-    if pcx.data.token == Token::Apostrophe {
-        save(pcx);
-        next(pcx)?;
-        // canonicalize subscripted names to curly brackets, no matter whether brackets are used
-        // or what kind.
-        pcx.tmp.push(Token::LCurly as u8);
-        if (Token::LParen | Token::LBracket | Token::LCurly).contains(pcx.data.token) {
-            let mut parens = ParenCounter::default();
-            parens.token(pcx.data.token);
-            loop {
-                next(pcx)?;
-                parens.token(pcx.data.token);
-                if parens.balanced() { break; }
-                save(pcx);
-            }
-        } else {
-            save(pcx);
-        }
-        next(pcx)?; // skip subscript token or closing parenthesis
-        pcx.tmp.push(Token::RCurly as u8);
-    }
-    let name = pcx.intern.intern(&pcx.tmp[base..]);
-    pcx.tmp.truncate(base);
-    Ok(name)
-}
 
 fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(IRef<[u8]>, IRef<[u8]>)> {
     let name = parse_name(pcx)?;
@@ -396,7 +365,7 @@ fn parse_macro_body_rec(
     pcx: &mut Pcx,
     stop: EnumSet<Token>,
     template: bool
-) -> compile::Result<u8> {
+) -> compile::Result {
     let mut nextcap = 0;
     let mut parens = ParenCounter::default();
     while !(stop.contains(pcx.data.token) && parens.balanced()) {
@@ -497,10 +466,10 @@ fn parse_macro_body_rec(
         }
         next(pcx)?;
     }
-    Ok(nextcap)
+    Ok(())
 }
 
-fn parse_macro_body(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> compile::Result<u8> {
+fn parse_macro_body(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> compile::Result {
     pcx.data.rec = true;
     let r = parse_macro_body_rec(pcx, stop, template);
     pcx.data.rec = false;
@@ -520,7 +489,32 @@ fn parse_macro_func(pcx: &mut Pcx) -> compile::Result {
 }
 
 fn parse_snippet(pcx: &mut Pcx) -> compile::Result {
-    todo!()
+    pcx.data.marg.clear();
+    let name = parse_name_pattern(pcx)?;
+    let stop = if (Token::LParen | Token::LBracket | Token::LCurly).contains(pcx.data.token) {
+        let stop = match pcx.data.token {
+            Token::LParen   => Token::RParen,
+            Token::LBracket => Token::RBracket,
+            _               => Token::RCurly
+        };
+        next(pcx)?;
+        Some(stop)
+    } else {
+        None
+    };
+    let base = pcx.tmp.end();
+    parse_macro_body(
+        pcx,
+        match stop { Some(stop) => stop.into(), None => TOPLEVEL_KEYWORDS},
+        false
+    )?;
+    let body = pcx.intern.intern(&pcx.tmp[base..]);
+    pcx.tmp.truncate(base);
+    defmacro(pcx, Namespace::Snippet, IRef::EMPTY, name, body);
+    if let Some(stop) = stop {
+        consume(pcx, stop)?;
+    }
+    Ok(())
 }
 
 fn parse_toplevel(pcx: &mut Pcx) -> compile::Result {

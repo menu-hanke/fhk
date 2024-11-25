@@ -1,11 +1,12 @@
 //! Parser and macro engine.
 
 use core::fmt::Write;
-use core::mem::{transmute, ManuallyDrop};
+use core::mem::{replace, transmute, ManuallyDrop};
 use core::ops::Range;
 
 use alloc::vec::Vec;
 use enumset::EnumSet;
+use hashbrown::hash_map::Entry;
 use logos::Logos;
 
 use crate::bytestring::ByteString;
@@ -312,6 +313,35 @@ pub fn langerr<T>(pcx: &mut Pcx) -> compile::Result<T> {
     Err(())
 }
 
+fn splitstem(mut name: &[u8]) -> IRef<[u8]> {
+    if name[0] == Token::Scope as _ {
+        name = &name[5..];
+    }
+    debug_assert!(name[0] == Token::Ident as _);
+    let stem: [u8; TK_DATALEN] = name[1..5].try_into().unwrap();
+    zerocopy::transmute!(stem)
+}
+
+pub fn defmacro(
+    pcx: &mut Pcx,
+    ns: Namespace,
+    table_pattern: IRef<[u8]>,
+    name_pattern: IRef<[u8]>,
+    body: IRef<[u8]>
+) {
+    let parser = &mut *pcx.data;
+    let id = parser.macros.end();
+    let stem = splitstem(pcx.intern.get_slice(name_pattern));
+    let next = match parser.chain.entry((stem, ns)) {
+        Entry::Occupied(mut e) => Some(replace(&mut e.get_mut().1, id)),
+        Entry::Vacant(e) => {
+            e.insert((id, id));
+            None
+        }
+    }.into();
+    parser.macros.push(Macro { table_pattern, name_pattern, body, next });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParenCounter(i64);
 
@@ -448,11 +478,6 @@ pub fn try_match(
     }
 }
 
-fn splitstem(name: &[u8]) -> IRef<[u8]> {
-    debug_assert!(name[0] == Token::Ident as _);
-    let stem: [u8; TK_DATALEN] = name[1..5].try_into().unwrap();
-    zerocopy::transmute!(stem)
-}
 
 fn pushmacro<'a, 'input>(
     pcx: &'a mut Pcx<'input>,
@@ -460,7 +485,7 @@ fn pushmacro<'a, 'input>(
     table: IRef<[u8]>,
     name: IRef<[u8]>
 ) -> Option<&'a mut Frame> {
-    let stem = splitstem(pcx.intern.get_slice(name.cast()));
+    let stem = splitstem(pcx.intern.get_slice(name));
     let parser = &mut *pcx.data;
     let mut id = parser.chain.get(&(stem, ns))?.0;
     let base = parser.captures.len() as _;
@@ -470,14 +495,14 @@ fn pushmacro<'a, 'input>(
             &mut parser.captures,
             &pcx.intern,
             table,
-            pcx.intern.get_slice(macro_.table_pattern.cast()),
+            pcx.intern.get_slice(macro_.table_pattern)
         ) && try_match(
             &mut parser.captures,
             &pcx.intern,
             name,
-            pcx.intern.get_slice(macro_.name_pattern.cast())
+            pcx.intern.get_slice(macro_.name_pattern)
         ) {
-            let body = pcx.intern.get_range(macro_.body.cast());
+            let body = pcx.intern.get_range(macro_.body);
             parser.stack.push(Frame {
                 base,
                 cursor: body.start as _,
@@ -516,37 +541,43 @@ pub fn pushtemplate(pcx: &mut Pcx, template: IRef<[u8]>, cap: &[IRef<[u8]>]) -> 
     next(pcx)
 }
 
-fn snipname(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
-    let parser = &mut *pcx.data;
-    let base = parser.snippet.len();
-    if parser.token == Token::Scope {
-        parser.snippet.push(Token::Scope as _);
-        parser.snippet.extend_from_slice(&parser.tdata.to_ne_bytes());
+fn parse_name_seq(pcx: &mut Pcx, sty: SequenceType) -> compile::Result<IRef<[u8]>> {
+    let base = pcx.tmp.end();
+    save(pcx);
+    if check(pcx, Token::Scope)? { save(pcx); }
+    consume(pcx, Token::Ident)?;
+    if pcx.data.token == Token::Apostrophe {
+        save(pcx);
         next(pcx)?;
-    }
-    require(pcx, Token::Ident)?;
-    let parser = &mut *pcx.data;
-    parser.snippet.push(Token::Ident as _);
-    parser.snippet.extend_from_slice(&parser.tdata.to_ne_bytes());
-    next(pcx)?;
-    let mut token = pcx.data.token;
-    if token == Token::LCurly {
-        let mut parens = ParenCounter::default();
-        loop {
-            parens.token(token);
-            pcx.data.snippet.push(token as _);
-            if token.has_data() {
-                let parser = &mut *pcx.data;
-                parser.snippet.extend_from_slice(&parser.tdata.to_ne_bytes());
+        // canonicalize subscripted names to curly brackets, no matter whether brackets are used
+        // or what kind.
+        pcx.tmp.push(Token::LCurly as u8);
+        if (Token::LParen | Token::LBracket | Token::LCurly).contains(pcx.data.token) {
+            let mut parens = ParenCounter::default();
+            parens.token(pcx.data.token);
+            loop {
+                next(pcx)?;
+                parens.token(pcx.data.token);
+                if parens.balanced() { break; }
+                savemaybecap(pcx, sty)?;
             }
-            next(pcx)?;
-            if token == Token::RCurly && parens.balanced() { break; }
-            token = pcx.data.token;
+        } else {
+            savemaybecap(pcx, sty)?;
         }
+        next(pcx)?; // skip subscript token or closing parenthesis
+        pcx.tmp.push(Token::RCurly as u8);
     }
-    let id = pcx.intern.intern(&pcx.data.snippet[base..]).cast();
-    pcx.data.snippet.truncate(base);
-    Ok(id)
+    let name = pcx.intern.intern(&pcx.tmp[base..]);
+    pcx.tmp.truncate(base);
+    Ok(name)
+}
+
+pub fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+    parse_name_seq(pcx, SequenceType::Body)
+}
+
+pub fn parse_name_pattern(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+    parse_name_seq(pcx, SequenceType::Pattern)
 }
 
 fn expandnext(pcx: &mut Pcx) -> Option<Token> {
@@ -636,7 +667,7 @@ pub fn next(pcx: &mut Pcx) -> compile::Result {
     match nexttoken(pcx)? {
         Token::Tilde if !pcx.data.rec => {
             next(pcx)?;
-            let name = snipname(pcx)?;
+            let name = parse_name(pcx)?;
             let Parser { token, tdata: data, .. } = *pcx.data;
             match pushmacro(pcx, Namespace::Snippet, IRef::EMPTY, name) {
                 Some(frame) => {
@@ -683,6 +714,22 @@ pub fn save(pcx: &mut Pcx) {
         // don't push `tdata` directly here, this write must be unaligned
         pcx.tmp.push(pcx.data.tdata.to_ne_bytes());
     }
+}
+
+fn savemaybecap(pcx: &mut Pcx, sty: SequenceType) -> compile::Result {
+    match (pcx.data.token, sty) {
+        (Token::CapName, SequenceType::Pattern) => {
+            pcx.tmp.push(Token::OpInsert as u8);
+            let parser = &mut *pcx.data;
+            parser.marg.push(zerocopy::transmute!(parser.tdata));
+        },
+        (Token::CapPos|Token::Dollar, SequenceType::Pattern) => {
+            // TODO: report error (only named captures are allowed here)
+            todo!()
+        },
+        _ => save(pcx)
+    }
+    Ok(())
 }
 
 pub fn parse<'a,F,R>(ccx: &'a mut Ccx<Parser>, input: &'a [u8], func: F) -> compile::Result<R>
