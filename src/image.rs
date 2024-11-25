@@ -5,6 +5,7 @@ use core::cell::Cell;
 use core::marker::PhantomPinned;
 use core::mem::offset_of;
 use core::pin::Pin;
+use core::u64;
 
 use cfg_if::cfg_if;
 
@@ -86,4 +87,29 @@ cfg_if! {
     } else {
         pub use fhk_vmcall as fhk_vmcall_native;
     }
+}
+
+impl Image {
+
+    pub unsafe fn reset(&self, mem: *mut u8, reset: u64) {
+        // special case 0 and -1 to avoid shift by 64.
+        match reset {
+            0 => {},
+            u64::MAX => core::ptr::write_bytes(mem, 0, self.size as _),
+            mut mask => {
+                let mut idx = 0;
+                while mask != 0 {
+                    let num0 = mask.trailing_zeros() as usize;
+                    mask >>= num0;
+                    let num1 = mask.trailing_ones() as usize;
+                    mask >>= num1;
+                    let start = *self.breakpoints.raw.get_unchecked(idx+num0) as usize;
+                    let end = *self.breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
+                    idx += num0+num1;
+                    core::ptr::write_bytes(mem.add(start), 0, end-start);
+                }
+            }
+        }
+    }
+
 }

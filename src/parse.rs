@@ -46,18 +46,6 @@ fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
     Ok(name)
 }
 
-fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
-    let mut name = parse_name(pcx)?;
-    let table = if check(pcx, Token::Dot)? {
-        let tab = pcx.objs.tab(name).get_or_create();
-        name = parse_name(pcx)?;
-        tab
-    } else {
-        pcx.data.tab
-    };
-    Ok(pcx.objs.var(table, name).get_or_create())
-}
-
 fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
     const IDENT: u8 = Token::Ident as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
@@ -532,6 +520,18 @@ pub fn parse_def(pcx: &mut Pcx) -> compile::Result {
 
 pub fn parse_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     parse_binop(pcx, 0)
+}
+
+pub fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
+    let mut name = parse_name(pcx)?;
+    let table = if check(pcx, Token::Dot)? {
+        let tab = pcx.objs.tab(name).get_or_create();
+        name = parse_name(pcx)?;
+        tab
+    } else {
+        pcx.data.tab
+    };
+    Ok(pcx.objs.var(table, name).get_or_create())
 }
 
 pub fn parse_template(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {

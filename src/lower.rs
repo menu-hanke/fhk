@@ -7,16 +7,18 @@ use core::mem::swap;
 use alloc::vec::Vec;
 use enumset::{EnumSet, EnumSetType};
 
+use crate::bitmap::BitMatrix;
 use crate::bump::{self, Bump, BumpPtr, BumpRef};
 use crate::compile::{self, Ccx, Phase};
+use crate::dataflow::{Dataflow, DataflowSystem};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
 use crate::intrinsics::Intrinsic;
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
-use crate::mem::{Offset, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, FieldType, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::Primitive;
@@ -170,6 +172,7 @@ pub struct Lower<O=RW, F=RW> {
     bump: Access<Bump<u32>, O>,
     objs: Access<HashMap<ObjRef, BumpRef<()>>, O>,
     expr: HashMap<ObjRef<EXPR>, InsId>,
+    // TODO: remove the following tmp_* fields and use ccx.tmp instead:
     tmp_ins: Vec<InsId>, // public for lower_callx
     tmp_vty: Vec<Type>, // for emitvarvalue
     tmp_ty: Vec<Type>, // for expressions
@@ -1815,14 +1818,86 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                 sig.finish_returns().add_arg(IRT_IDX).finish_args();
                 let func = lcx.ir.funcs.push(func);
                 emittemplate(lcx, func, Template::Query(obj.cast()));
-
             },
             Obj::FUNC => todo!(),
             _ => unreachable!()
         }
-        // TODO: compute resets for each bundle based on IR:
-        // * initialize based on CALLN and LOAD
-        // * propagate based on CALLB(I) until fixpoint
+    }
+}
+
+// construct and solve the dataflow equations:
+//   for each function F, let R(F) denote its reset set.
+//   for each explicit reset r and func F:
+//     (1) r ∈ R(F) if node(F) ∈ r,   where node(F) is the node F was generated from.
+//   for each pair of functions F, G:
+//     (2) R(G) ⊂  R(F) if F calls G
+fn computereset(ccx: &mut Ccx<Lower, R>) {
+    let mut mat: BitMatrix<FuncId, ResetId> = Default::default();
+    mat.resize(ccx.ir.funcs.end(), ResetId::MAXNUM.into());
+    // mark explicit resets
+    for (_, o) in ccx.objs.pairs() {
+        if let ObjectRef::RESET(&RESET { id, ref objs, .. }) = o {
+            let id: ResetId = zerocopy::transmute!(id);
+            for &obj in objs {
+                let ptr = ccx.data.objs[&obj];
+                let base = match ccx.objs[obj].op {
+                    Obj::VAR => {
+                        // var: reset the variable
+                        ccx.data.bump[ptr.cast::<Var>()].base
+                    },
+                    _ /* MOD */ => {
+                        let model = &ccx.data.bump[ccx.data.objs[&obj].cast::<Mod>()];
+                        match model.mt {
+                            Mod::SIMPLE => {
+                                // simple model: reset the variable
+                                ccx.data.bump[model.value[0].var].base
+                            },
+                            _ /* COMPLEX */ => {
+                                // complex model: reset the model
+                                model.base
+                            }
+                        }
+                    }
+                };
+                mat[base].set(id); // reset value
+                mat[base+2].set(id); // reset arm (var) or avail (complex mod)
+            }
+        }
+    }
+    // construct call graph
+    let mut df: Dataflow<FuncId> = Default::default();
+    for (f, func) in ccx.ir.funcs.pairs() {
+        df.push();
+        for (_, ins) in func.code.pairs() {
+            if (Opcode::CALLB|Opcode::CALLBI).contains(ins.opcode()) {
+                let (_, _, g) = ins.decode_CALLB();
+                if f != g {
+                    df.raw_inputs().push(g);
+                }
+            }
+        }
+    }
+    // we won't be calling compute_uses() so push the dummy end node manually
+    df.push();
+    // solve the system
+    let mut solver: DataflowSystem<FuncId> = Default::default();
+    solver.resize(ccx.ir.funcs.end());
+    solver.queue_all(ccx.ir.funcs.end());
+    while let Some(f) = solver.poll() {
+        for &g in df.inputs(f) {
+            let [fr, gr] = mat.get_rows_mut([f,g]);
+            if !gr.is_subset(fr) {
+                fr.union(gr);
+                solver.queue(f);
+            }
+        }
+    }
+    // update ir
+    for (id, func) in ccx.ir.funcs.pairs_mut() {
+        if let FuncKind::Bundle(bundle) = &mut func.kind {
+            let reset: ResetSet = mat[id].try_into().unwrap();
+            bundle.reset = reset | ResetId::GLOBAL;
+        }
     }
 }
 
@@ -1844,6 +1919,7 @@ impl Phase for Lower {
     fn run(ccx: &mut Ccx<Lower>) -> compile::Result {
         collectobjs(ccx);
         emitobjs(unsafe { core::mem::transmute(&mut *ccx) });
+        ccx.freeze_graph(computereset);
         if trace!(LOWER) {
             trace!("{}", {
                 let mut tmp = Default::default();

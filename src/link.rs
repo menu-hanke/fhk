@@ -1,7 +1,5 @@
 //! Machine code linking.
 
-use core::mem::take;
-
 use crate::compile::{self, Ccx, Phase};
 use crate::image::Image;
 use crate::mcode::{MCode, Reloc, Sym};

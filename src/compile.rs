@@ -18,7 +18,7 @@ use crate::lex::Token;
 use crate::link::Link;
 use crate::lower::Lower;
 use crate::mcode::MCode;
-use crate::mem::{Layout, Resets};
+use crate::mem::{Layout, ResetSeq};
 use crate::obj::Objects;
 use crate::optimize::Optimize;
 use crate::parser::Parser;
@@ -68,8 +68,8 @@ pub struct Ccx<P=Absent, O=RW, I=RW> {
     pub objs: Access<Objects, O>,
     // IR
     pub ir: Access<IR, I>,
-    // reset map and reset id alloc state
-    pub resets: Resets,
+    // reset id allocation
+    pub resets: ResetSeq,
     // memory for miscellaneous allocs that must live until the end of the compilation
     pub perm: Bump,
     // memory for temporary function-local allocs

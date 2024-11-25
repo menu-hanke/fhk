@@ -1,6 +1,8 @@
 //! Bit maps.
 
 use core::cmp::max;
+use core::fmt::{Debug, Write};
+use core::iter::zip;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut, Range, RangeTo};
@@ -76,6 +78,10 @@ fn union(bitmap: &mut [Word], other: &[Word]) {
     }
 }
 
+fn is_subset(a: &[Word], b: &[Word]) -> bool {
+    zip(a, b).all(|(&aw,&bw)| aw & bw == aw)
+}
+
 fn popcount(bitmap: &[Word]) -> u32 {
     bitmap.iter().map(|w| w.count_ones()).sum()
 }
@@ -109,6 +115,7 @@ impl<I: Index> Bitmap<I> {
     #[inline(always)] pub fn set_all(&mut self) { self.raw.fill(!0); }
     #[inline(always)] pub fn test_and_set(&mut self, idx: I) -> bool { test_and_set(&mut self.raw, idx.into()) }
     #[inline(always)] pub fn intersect(&mut self, other: &Bitmap<I>) { intersect(&mut self.raw, &other.raw) }
+    #[inline(always)] pub fn is_subset(&self, other: &Bitmap<I>) -> bool { is_subset(&self.raw, &other.raw) }
     #[inline(always)] pub fn union(&mut self, other: &Bitmap<I>) { union(&mut self.raw, &other.raw) }
     #[inline(always)] pub fn popcount(&self) -> u32 { popcount(&self.raw) }
     #[inline(always)] pub fn popcount_leading(&self, end: I) -> u32 { popcount_leading(&self.raw, end.into()) }
@@ -223,6 +230,12 @@ impl<'a, I: Index> IntoIterator for &'a Bitmap<I> {
     fn into_iter(self) -> Self::IntoIter { self.ones() }
 }
 
+impl<I: Index> Debug for Bitmap<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.ones().map(Into::into)).finish()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct BitmapArray<const W: usize, I: Index = usize> {
@@ -269,8 +282,24 @@ impl<const W: usize, I: Index> core::ops::BitOr<I> for BitmapArray<W, I> {
     }
 }
 
+impl<'a, const W: usize, I: Index> TryFrom<&'a Bitmap<I>> for BitmapArray<W, I> {
+    type Error = <[Word; W] as TryFrom<&'a [Word]>>::Error;
+    fn try_from(value: &'a Bitmap<I>) -> Result<Self, Self::Error> {
+        Ok(Self {
+            _marker: PhantomData,
+            raw: value.raw.try_into()?
+        })
+    }
+}
+
 impl<const W: usize, I: Index> Default for BitmapArray<W, I> {
     fn default() -> Self { Self { _marker: PhantomData, raw: [0; W] } }
+}
+
+impl<const W: usize, I: Index> Debug for BitmapArray<W, I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Bitmap::fmt(self, f)
+    }
 }
 
 pub struct BitmapVec<I: Index = usize> {
@@ -306,6 +335,12 @@ impl<I: Index> Deref for BitmapVec<I> {
 impl<I: Index> DerefMut for BitmapVec<I> {
     fn deref_mut(&mut self) -> &mut Bitmap<I> {
         Bitmap::from_raw_mut(&mut self.data)
+    }
+}
+
+impl<I: Index> Debug for BitmapVec<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Bitmap::fmt(self, f)
     }
 }
 
@@ -387,5 +422,18 @@ impl<I: Index, J: Index> core::ops::IndexMut<I> for BitMatrix<I, J> {
     fn index_mut(&mut self, row: I) -> &mut Bitmap<J> {
         let row: usize = row.into();
         Bitmap::from_raw_mut(&mut self.data[row*self.width..(row+1)*self.width])
+    }
+}
+
+impl<I: Index, J: Index> Debug for BitMatrix<I, J> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("[\n")?;
+        for (id, row) in self.pairs() {
+            let id: usize = id.into();
+            write!(f, "  {:-4} ", id)?;
+            row.fmt(f)?;
+            f.write_char('\n')?;
+        }
+        f.write_char(']')
     }
 }

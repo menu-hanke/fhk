@@ -35,14 +35,17 @@ local function equal(a, b, tol)
 	return true
 end
 
-local function prettyprint(tab)
+local function prettyprint(x)
+	if type(x) ~= "table" then
+		return tostring(x)
+	end
 	local buf = buffer.new()
 	buf:put("[")
-	for i=1, #tab do
-		local v = tab[i]
+	for i=1, #x do
+		local v = x[i]
 		buf:put(" ")
 		if type(v) == "table" then
-			puttab(buf, v)
+			buf:put(prettyprint(v))
 		else
 			buf:put(v)
 		end
@@ -89,16 +92,8 @@ local function test_result(T, results)
 	table.insert(T.results, {query=test_query(T, "global", unpack(exprs)), true_=values})
 end
 
-local function test_flush(T)
-	if #T.buf > 0 then
-		T.G:define(T.buf)
-		T.buf:reset()
-	end
-end
-
 local function test_compile(T)
 	if not T.image then
-		test_flush(T)
 		if dump:match("o") then
 			-- XXX move this after compile when the compiler actually works
 			io.stderr:write(T.G:dump(dump), "\n")
@@ -137,9 +132,7 @@ local function testnew()
 	local env = setmetatable({
 		allocs  = {},
 		results = {},
-		buf     = buffer.new(),
 		G       = fhk.newgraph(),
-		near    = near,
 		check   = check
 	}, {__index=_G})
 	env.query = bind(env, test_query)
@@ -157,17 +150,41 @@ local function testfree(T)
 	T.alloc:free()
 end
 
+local function flush(T, buf, what)
+	-- print(string.format("---- FLUSH (%s) ----", what))
+	-- print(buf)
+	if what == "directive" then
+		assert(load(buf, nil, nil, T))()
+	elseif what == "src" then
+		T.G:define(buf)
+	end
+	buf:reset()
+end
+
 local function testrun(T, fname)
 	local fp = assert(io.open(fname))
+	local buf = buffer.new()
+	local what
 	for line in fp:lines() do
+		local linewhat
 		if line:sub(1,3) == "###" then
-			test_flush(T)
-			assert(load(line:sub(4), nil, nil, T))()
-		elseif not line:match("^%s*$") then
-			T.buf:put(line, "\n")
+			linewhat = "directive"
+			line = line:sub(4)
+		else
+			linewhat = "src"
 		end
+		if linewhat ~= what then
+			if #buf > 0 then
+				flush(T, buf, what)
+			end
+			what = linewhat
+		end
+		buf:put(line, "\n")
 	end
 	fp:close()
+	if #buf > 0 then
+		flush(T, buf, what)
+	end
 	if #T.results > 0 then
 		test_checkresults(T)
 	end

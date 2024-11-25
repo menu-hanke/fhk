@@ -8,6 +8,7 @@ use crate::image::Instance;
 use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::ir::{Bundle, FuncKind, Type};
 use crate::mem::{BreakpointId, Offset, ResetSet, SizeClass, Slot};
+use crate::obj::{Obj, ObjRef, RESET};
 use crate::support::DynSlot;
 use crate::trace::trace;
 use crate::typestate::{Absent, R, RW};
@@ -166,10 +167,23 @@ fn makemasks(ctx: &mut Ctx, breakpoints: &mut IndexVec<BreakpointId, (ResetSet, 
         // probably just recursively merge smallest?
         todo!()
     }
+    // any non-assigned breakpoint gets layout.size
+    // this makes any bit pattern for masks valid.
+    ctx.layout.breakpoints.raw.fill(ctx.layout.size);
     for (i, &(reset, offset)) in breakpoints.pairs() {
         ctx.layout.breakpoints[i] = offset;
         for j in &*reset {
             ctx.layout.reset[j].set(i);
+        }
+    }
+    let mut idx = ObjRef::NIL;
+    while let Some(i) = ctx.objs.next(idx) {
+        idx = i;
+        if ctx.objs[idx].op == Obj::RESET {
+            let reset: &mut RESET = &mut ctx.objs[idx.cast()];
+            let mask: u64 = zerocopy::transmute!(ctx.layout.reset[zerocopy::transmute!(reset.id)]);
+            reset.mlo = mask as u32;
+            reset.mhi = (mask >> 32) as u32;
         }
     }
 }

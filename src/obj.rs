@@ -311,6 +311,7 @@ define_ops! {
     FUNC        { name: Name, value: ObjRef<EXPR> };
     // non-named objects.
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
+    RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
     VSET        { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     NIL         {};

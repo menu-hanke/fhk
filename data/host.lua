@@ -276,6 +276,14 @@ local function setbuf(graph, xs)
 	return graph.buf, #xs
 end
 
+local function setbufo(graph, os)
+	local xs = table.new(#os, 0)
+	for i,o in ipairs(os) do
+		xs[i] = o.i
+	end
+	return setbuf(graph, xs)
+end
+
 local function checkres(graph, x)
 	if x == -1 then
 		return nil, getstrbuf(graph)
@@ -287,7 +295,8 @@ end
 -- must match host_Lua.rs
 local PARSE_DEF = 0
 local PARSE_EXPR = 1
-local PARSE_TEMPLATE = 2
+local PARSE_VREF = 2
+local PARSE_TEMPLATE = 3
 
 local function checkparse(graph, what, src, ...)
 	local res
@@ -376,7 +385,7 @@ local query_mt = {
 }
 query_mt.__index = query_mt
 
-local function graph_newquery(graph, tab)
+local function graph_newquery(graph, tab, ...)
 	local query = setmetatable({
 		graph  = graph,
 		tab    = graph_tab(graph, tab),
@@ -384,6 +393,9 @@ local function graph_newquery(graph, tab)
 		vnum   = 0
 	}, query_mt)
 	table.insert(graph.queries, query)
+	for _,v in ipairs({...}) do
+		query_add(query, v)
+	end
 	return query
 end
 
@@ -453,24 +465,43 @@ end
 
 ---- Resets --------------------------------------------------------------------
 
-local reset_mt = {
+local function reset_add(reset, obj)
+	if not isobj(obj) then
+		obj = reset.graph.objs[checkparse(reset.graph, PARSE_VREF, obj)]
+	end
+	assert(obj.op == "VAR" or obj.op == "MOD", "only variables or models can be reset")
+	table.insert(reset.objs, obj)
+end
 
+local reset_mt = {
+	add = reset_add
 }
 reset_mt.__index = reset_mt
 
-local function graph_newreset(graph)
+local function graph_newreset(graph, ...)
 	local reset = setmetatable({
 		graph = graph,
-		nodes = {}
+		objs  = {}
 	}, reset_mt)
 	table.insert(graph.resets, reset)
+	for _,e in ipairs({...}) do
+		reset_add(reset, e)
+	end
 	return reset
+end
+
+local function computemask(reset)
+	if reset.obj.mhi == 0 then
+		reset.mask = reset.obj.mlo
+	else
+		reset.mask = bit.bor(0ull+reset.obj.mlo, bit.lshift(0ull+reset.obj.mhi, 32))
+	end
 end
 
 ---- Instances -----------------------------------------------------------------
 
 local function image_newinstance(image, alloc, udata, prev, mask)
-	return API.fhk_newinstance(image, alloc, udata or nil, prev or nil, mask or 1)
+	return API.fhk_newinstance(image, alloc, udata or nil, prev or nil, mask or -1ull)
 end
 
 local image_mt = {
@@ -483,13 +514,11 @@ ffi.metatype("fhk_Image", image_mt)
 ---- Compilation ---------------------------------------------------------------
 
 local function graph_compile(graph)
-	local values = {}
 	for _,query in ipairs(graph.queries) do
-		table.clear(values)
-		for i,v in ipairs(query.values) do
-			values[i] = v.i
-		end
-		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbuf(graph, values))]
+		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbufo(graph, query.values))]
+	end
+	for _,reset in ipairs(graph.resets) do
+		reset.obj = graph.objs[API.fhk_newreset(graph.G, setbufo(graph, reset.objs))]
 	end
 	local image = ffi.new("fhk_Image *[1]");
 	assert(checkres(graph, API.fhk_compile(graph.G, image)))
@@ -497,6 +526,9 @@ local function graph_compile(graph)
 	local base = API.fhk_mcode(ptr)
 	for _,query in ipairs(graph.queries) do
 		compilequery(query, base)
+	end
+	for _,reset in ipairs(graph.resets) do
+		computemask(reset)
 	end
 	return ffi.gc(ptr, API.fhk_destroyimage)
 end

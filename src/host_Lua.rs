@@ -2,6 +2,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 use core::pin::Pin;
+use core::u64;
 
 use alloc::boxed::Box;
 
@@ -11,9 +12,8 @@ use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::IRef;
-use crate::mem::applyreset;
-use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, TAB};
-use crate::parse::{parse_def, parse_expr, parse_template};
+use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, RESET, TAB};
+use crate::parse::{parse_def, parse_expr, parse_template, parse_vref};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
 use crate::image::fhk_vmcall_native as fhk_vmcall;
@@ -104,18 +104,21 @@ enum Source<'a> {
 // options here must match host.lua
 const PARSE_DEF: c_int = 0;
 const PARSE_EXPR: c_int = 1;
-const PARSE_TEMPLATE: c_int = 2;
+const PARSE_VREF: c_int = 2;
+const PARSE_TEMPLATE: c_int = 3;
 fn doparse(G: &mut fhk_Graph, source: Source, what: c_int) -> fhk_Result {
     parse(
         G,
         match source { Source::String(s) => s, Source::Template(..) => &[] },
         |pcx| {
+            pcx.data.tab = ObjRef::GLOBAL;
             if let Source::Template(template, captures) = source {
                 pushtemplate(pcx, template, captures)?;
             }
             match what {
                 PARSE_DEF => parse_def(pcx).map(|_| 0),
                 PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
+                PARSE_VREF => parse_vref(pcx).map(|o| zerocopy::transmute!(o)),
                 PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
                 _ => unreachable!()
             }
@@ -175,16 +178,6 @@ extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
     );
 }
 
-// extern "C" fn fhk_new(
-//     G: &mut fhk_Graph,
-//     op: fhk_Operator,
-//     args: *mut fhk_ObjRef,
-//     narg: usize
-// ) -> fhk_ObjRef {
-//     // new constant etc?
-//     todo!()
-// }
-
 unsafe extern "C" fn fhk_newquery(
     G: &mut fhk_Graph,
     tab: fhk_ObjRef<TAB>,
@@ -194,10 +187,16 @@ unsafe extern "C" fn fhk_newquery(
     G.objs.push_args(QUERY::new(tab, 0), slice_from_raw_parts(values, num))
 }
 
-// extern "C" fn fhk_args(G: &mut fhk_Graph, node: fhk_ObjRef, ptr: *mut *mut fhk_ObjRef) -> fhk_Result {
-//     // put ref in ptr, return size
-//     todo!()
-// }
+unsafe extern "C" fn fhk_newreset(
+    G: &mut fhk_Graph,
+    objs: *const fhk_ObjRef,
+    num: usize
+) -> fhk_ObjRef<RESET> {
+    G.objs.push_args(
+        RESET::new(zerocopy::transmute!(G.resets.next()), 0, 0),
+        slice_from_raw_parts(objs, num)
+    )
+}
 
 extern "C" fn fhk_dumpobjs(G: &mut fhk_Graph) {
     G.host.buf.clear();
@@ -228,10 +227,12 @@ unsafe extern "C" fn fhk_newinstance(
 ) -> Pin<&mut fhk_Instance> {
     let mem = alloc(udata, image.size as _, align_of::<Instance>());
     if !prev.is_null() {
-        // copy?
-        todo!()
+        // should this go in image.rs as well?
+        core::ptr::copy_nonoverlapping(prev as *const u8, mem, image.size as _);
     }
-    applyreset(mem, &image.breakpoints, reset);
+    // TODO: only reset if this query depends on the reset mask (save mask for queries too)
+    // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
+    image.reset(mem, reset);
     let mem = mem as *mut Instance;
     (*mem).host = HostInst { alloc, udata };
     Pin::new_unchecked(&mut *mem)
@@ -282,7 +283,7 @@ define_api! {
     int32_t (*fhk_getvar)(fhk_Graph *, int32_t, int32_t, bool);
     void (*fhk_getstr)(fhk_Graph *, uint32_t);
     int32_t (*fhk_newquery)(fhk_Graph *, int32_t, int32_t *, size_t);
-    // int32_t (*fhk_args)(fhk_Graph *, int32_t, int32_t *, size_t);
+    int32_t (*fhk_newreset)(fhk_Graph *, int32_t *, size_t);
     void (*fhk_dumpobjs)(fhk_Graph *);
     int32_t (*fhk_compile)(fhk_Graph *, fhk_Image **);
     void *(*fhk_mcode)(fhk_Image *);

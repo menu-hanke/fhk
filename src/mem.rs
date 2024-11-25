@@ -1,9 +1,6 @@
 //! Memory layout and representation.
 
-use zerocopy::Unalign;
-
 use crate::bitmap::bitmap_array;
-use crate::hash::HashMap;
 use crate::index::{index, IndexArray};
 use crate::obj::{ObjRef, TAB};
 
@@ -37,13 +34,6 @@ impl BreakpointId {
 // bitmap of reset ids
 pub type ResetSet = bitmap_array![ResetId; ResetId::MAXNUM];
 
-// map of object -> reset ids (ie. when user code issues any of the resets, it should reset the
-// object.)
-#[derive(Default)]
-pub struct ResetMap {
-    pub raw: HashMap<ObjRef/*VAR|MOD*/, Unalign<ResetSet>>
-}
-
 // bitmap of breakpoints (intervals)
 pub type ResetMask = bitmap_array![BreakpointId; BreakpointId::MAXNUM];
 
@@ -53,6 +43,33 @@ pub type Breakpoints = IndexArray<BreakpointId, Offset, {BreakpointId::MAXNUM+1}
 // reset -> bitmap of breakpoints (intervals). multiple resets can be issued at once by OR'ing the
 // masks.
 pub type ResetAssignment = IndexArray<ResetId, ResetMask, {ResetId::MAXNUM}>;
+
+// generator for new reset ids. recycles ids after ResetId::MAXNUM but never hands out
+// ResetId::GLOBAL.
+pub struct ResetSeq {
+    next: u8
+}
+
+impl ResetSeq {
+
+    pub fn next(&mut self) -> ResetId {
+        debug_assert!(ResetId::MAXNUM.is_power_of_two());
+        let this = self.next;
+        let mut next = this+1;
+        if next == ResetId::MAXNUM as _ {
+            next = 1;
+        }
+        self.next = next;
+        zerocopy::transmute!(this)
+    }
+
+}
+
+impl Default for ResetSeq {
+    fn default() -> Self {
+        Self { next: 1 }
+    }
+}
 
 // offset + bit
 #[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
@@ -116,42 +133,4 @@ impl SizeClass {
         (self.0 as i32) < 0
     }
 
-}
-
-pub struct Resets {
-    next: ResetId,
-    defs: ResetMap,
-}
-
-impl Resets {
-
-    pub fn newid(&mut self) -> ResetId {
-        let id = self.next;
-        self.next.0 = (self.next.0 + 1) & 0x3f;
-        id
-    }
-
-}
-
-impl Default for Resets {
-    fn default() -> Self {
-        Self {
-            next: ResetId(1),  // zero is the global reset, user resets start from 1
-            defs: Default::default()
-        }
-    }
-}
-
-pub unsafe fn applyreset(mem: *mut u8, breakpoints: &Breakpoints, mut reset: u64) {
-    let mut idx = 0;
-    while reset != 0 {
-        let num0 = reset.trailing_zeros() as usize;
-        reset >>= num0;
-        let num1 = reset.trailing_ones() as usize;
-        reset >>= num1;
-        let start = *breakpoints.raw.get_unchecked(idx+num0) as usize;
-        let end = *breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
-        idx += num0+num1;
-        core::ptr::write_bytes(mem.add(start), 0, end-start);
-    }
 }
