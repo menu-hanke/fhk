@@ -1,6 +1,7 @@
 local ffi = require "ffi"
 local buffer = require "string.buffer"
 require "table.new"
+local type, typeof = type, ffi.typeof
 
 -- it's logically an uint32_t, but signed generates slightly better code
 local IDX_CTYPE = "int32_t"
@@ -22,18 +23,18 @@ local PRI_B1  = 10
 local PRI_PTR = 11
 local PRI_STR = 12
 local PRI_CT = {
-	[PRI_F64] = ffi.typeof("double"),
-	[PRI_F32] = ffi.typeof("float"),
-	[PRI_I64] = ffi.typeof("int64_t"),
-	[PRI_I32] = ffi.typeof("int32_t"),
-	[PRI_I16] = ffi.typeof("int16_t"),
-	[PRI_I8]  = ffi.typeof("int8_t"),
-	[PRI_U64] = ffi.typeof("uint64_t"),
-	[PRI_U32] = ffi.typeof("uint32_t"),
-	[PRI_U16] = ffi.typeof("uint16_t"),
-	[PRI_U8]  = ffi.typeof("uint8_t"),
-	[PRI_B1]  = ffi.typeof("bool"),
-	[PRI_PTR] = ffi.typeof("void *"),
+	[PRI_F64] = typeof("double"),
+	[PRI_F32] = typeof("float"),
+	[PRI_I64] = typeof("int64_t"),
+	[PRI_I32] = typeof("int32_t"),
+	[PRI_I16] = typeof("int16_t"),
+	[PRI_I8]  = typeof("int8_t"),
+	[PRI_U64] = typeof("uint64_t"),
+	[PRI_U32] = typeof("uint32_t"),
+	[PRI_U16] = typeof("uint16_t"),
+	[PRI_U8]  = typeof("uint8_t"),
+	[PRI_B1]  = typeof("bool"),
+	[PRI_PTR] = typeof("void *"),
 	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
 }
 
@@ -82,11 +83,11 @@ local vec_mt = {
 }
 
 local function vector_ctype(e)
-	e = ffi.typeof(e)
+	e = typeof(e)
 	local ctid = tonumber(e)
 	local ct = VEC_CTYPES[ctid]
 	if ct then return ct end
-	ct = ffi.metatype(ffi.typeof("struct { $ *e; int32_t n; }", e), vec_mt)
+	ct = ffi.metatype(typeof("struct { $ *e; int32_t n; }", e), vec_mt)
 	VEC_CTYPES[ctid] = ct
 	return ct
 end
@@ -181,9 +182,10 @@ local function newmetatype(e, n)
 	local shape = makeshape(n)
 	local mt = {
 		__index = {
-			get     = makegetter(e, n),
-			totable = maketotab(n),
-			shape   = shape
+			["fhk$tensor"] = true,
+			get            = makegetter(e, n),
+			totable        = maketotab(n),
+			shape          = shape
 		},
 		__len      = shape,
 		__tostring = tensor__tostring,
@@ -197,7 +199,7 @@ end
 
 -- struct layout here must match query memory layout.
 local function tensor_ctype(e, n)
-	e = ffi.typeof(e)
+	e = typeof(e)
 	if (not n) or n == 0 then return e end
 	local ctk = ctkey(e, n)
 	local ct = CTYPES[ctk]
@@ -206,10 +208,18 @@ local function tensor_ctype(e, n)
 	buf:put("struct {\n")
 	putflatrepr(e, buf, 1)
 	buf:putf("%s n[%d];\n}", IDX_CTYPE, n)
-	ct = ffi.typeof(tostring(buf), e)
+	ct = typeof(tostring(buf), e)
 	METADATA[tonumber(ct)] = {e=e, n=n}
 	CTYPES[ctk] = ct
 	return ffi.metatype(ct, newmetatype(e, n))
+end
+
+local function istensorx(x)
+	return x["fhk$tensor"]
+end
+
+local function istensor(x)
+	return type(x) == "cdata" and pcall(istensorx, typeof(x))
 end
 
 --------------------------------------------------------------------------------
@@ -217,5 +227,6 @@ end
 return {
 	scalar_ctype = scalar_ctype,
 	vector_ctype = vector_ctype,
-	tensor_ctype = tensor_ctype
+	tensor_ctype = tensor_ctype,
+	istensor     = istensor
 }

@@ -569,5 +569,6 @@ end
 
 return {
 	newgraph = newgraph,
-	refs     = obj_refs
+	refs     = obj_refs,
+	istensor = tensor.istensor
 }
