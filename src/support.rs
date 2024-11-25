@@ -1,117 +1,16 @@
 //! Runtime support functions.
 
-use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, TrapCode};
 use cranelift_codegen::isa::CallConv;
 use enumset::EnumSetType;
-use hashbrown::hash_table::Entry;
-use hashbrown::HashTable;
 
-use crate::bump::{self, Aligned, Bump, BumpRef};
-use crate::emit::{self, block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
-use crate::hash::fxhash;
+use crate::emit::{block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
 use crate::image::{fhk_vmexit, Instance};
-use crate::index::InvalidValue;
 use crate::ir::Type;
-use crate::mcode::{Label, MCode};
 use crate::schedule::BlockId;
 
-// type or vmctx
-#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(transparent)]
-pub struct Arg(u8);
-
-impl Arg {
-
-    pub const VMCTX: Self = Self(!0);
-
-    pub fn param(type_: Type) -> Self {
-        Self(type_ as _)
-    }
-
-}
-
-// see https://github.com/google/zerocopy/issues/170
-// (this can be replaced with a raw pointer when the above issue is resolved)
-pub type FuncPtr = usize;
-
-// marker for type bounds
-pub trait SuppFuncType: Aligned + bump::FromBytes + bump::IntoBytes + bump::Immutable {}
-
-#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C,align(4))]
-pub struct Supp {
-    pub label: Label,
-    pub sf: u8, // enum SuppFunc
-    _pad: u8,
-    // data follows
-}
-
-impl SuppFuncType for Supp {}
-
-macro_rules! define_suppfuncs {
-    (@new ($($args:tt)*) ($($body:tt)*)) => {
-        pub fn new($($args)*) -> Self {
-            Self { label: Label::INVALID.into(), $($body)* }
-        }
-    };
-    (@new ($($args:tt)*) ($($body:tt)*) pub $field:ident: $type:ty $(,$($rest:tt)*)?) => {
-        define_suppfuncs!(@new ($($args)* $field: $type,) ($($body)* $field,) $($($rest)*)? );
-    };
-    (@new ($($args:tt)*) ($($body:tt)*) $field:ident: $type:ty $(,$($rest:tt)*)?) => {
-        define_suppfuncs!(@new ($($args)*) ($($body)* $field: Default::default(),) $($($rest)*)?);
-    };
-    (@struct $name:ident $($fields:tt)*) => {
-        #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-        #[repr(C,align(4))]
-        pub struct $name {
-            pub label: Label,
-            pub sf: u8,
-            $($fields)*
-        }
-        impl SuppFuncType for $name {}
-    };
-    ($($name:ident { $($fields:tt)* };)*) => {
-        #[derive(EnumSetType)]
-        pub enum SuppFunc {
-            $( $name ),*
-        }
-        // impl Supp {
-        //     $( pub const $name: u8 = SuppFunc::$name as _; )*
-        // }
-        $(
-            define_suppfuncs!(@struct $name $($fields)*);
-            impl $name {
-                define_suppfuncs!(@new () (sf: SuppFunc::$name as _,) $($fields)*);
-            }
-        )*
-    };
-}
-
-define_suppfuncs! {
-    DSINIT { _pad: u8 };
-    ALLOC { _pad: u8 };
-    ABORT { _pad: u8 };
-    SWAP { _pad: u8 };
-    // TRAMPOLINE { pub n: u8, _pad: u16, pub args: BumpRef<[Arg]>, pub func: FuncPtr };
-    // TODO: vector arithmetic, memcpy, traps, etc.
-}
-
-impl SuppFunc {
-
-    pub fn from_u8(raw: u8) -> Self {
-        // FIXME replace with core::mem::variant_count when it stabilizes
-        assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
-        unsafe { core::mem::transmute(raw) }
-    }
-
-}
-
-// marker for bumpref in supp.bump
-pub type SuppRef<T=Supp> = BumpRef<T>;
-
-struct Signature<T: ?Sized = [Type]> {
+struct Signature<T: ?Sized=[Type]> {
     cc: CallConv,
     ret: u8,
     sig: T
@@ -133,50 +32,6 @@ macro_rules! signature {
     };
 }
 
-#[derive(Default)]
-pub struct SupportFuncs {
-    bump: Bump<u32>,
-    hash: HashTable<SuppRef>,
-    pub work: VecDeque<SuppRef>,
-}
-
-fn suppbytes<T>(supp: &T) -> &[u8]
-    where T: SuppFuncType
-{
-    // first two bytes are label, which does not affect hash or equality
-    let bytes = unsafe {
-        core::slice::from_raw_parts(supp as *const T as *const u8, size_of_val(supp))
-    };
-    &bytes[2..]
-}
-
-impl SupportFuncs {
-
-    pub fn instantiate<T: SuppFuncType>(&mut self, mcode: &mut MCode, supp: &T) -> SuppRef<T> {
-        let bytes = suppbytes(supp);
-        match self.hash.entry(
-            fxhash(bytes),
-            |&s| suppbytes(&self.bump[s]) == bytes,
-            |&s| fxhash(suppbytes(&self.bump[s]))
-        ) {
-            Entry::Occupied(e) => e.get().cast(),
-            Entry::Vacant(e) => {
-                let sr = self.bump.write(supp);
-                self.bump[sr.cast::<Supp>()].label = mcode.labels.push(0);
-                self.work.push_back(sr.cast());
-                e.insert(sr.cast());
-                sr
-            }
-        }
-    }
-
-}
-
-const SIG_DSINIT: &Signature = &signature!(Fast PTR I32 I32); // (slots, num, size)
-const SIG_ALLOC: &Signature = &signature!(Fast I64 I64 -> PTR); // (bytes, align) -> mem
-const SIG_ABORT: &Signature = &signature!(NATIVE_CALLCONV,);
-const SIG_SWAP: &Signature = &signature!(NATIVE_CALLCONV, PTR I64 -> I64);
-
 fn ty2param(param: &mut Vec<AbiParam>, ty: &[Type]) {
     param.extend(ty.iter().map(|&t| AbiParam::new(irt2cl(t))));
 }
@@ -187,41 +42,115 @@ fn sig2cl(sig: &mut cranelift_codegen::ir::Signature, si: &Signature) {
     ty2param(&mut sig.params, &si.sig[si.ret as usize..]);
 }
 
-fn newsig(si: &Signature) -> cranelift_codegen::ir::Signature {
-    let mut sig = cranelift_codegen::ir::Signature::new(CallConv::Fast);
-    sig2cl(&mut sig, si);
-    sig
+macro_rules! define_suppfuncs {
+    ($(
+        $name:ident
+        $(($cc:expr))?
+        $($arg:ident)*
+        $(-> $ret:ident)?
+        ;
+    )*) => {
+        #[derive(EnumSetType, Debug)]
+        pub enum SuppFunc {
+            $($name),*
+        }
+
+        const SUPPFUNC_SIGNATURE: &[&Signature] = &[
+            $(
+                &signature!(
+                    [$($cc,)? cranelift_codegen::isa::CallConv::Fast][0],
+                    $($arg)*
+                    $(-> $ret)?
+                )
+            ),*
+        ];
+    };
 }
 
-impl SupportFuncs {
+macro_rules! define_nativefuncs {
+    ($(
+        $name:ident
+        [$fp:expr]
+        $($arg:ident)*
+        $(-> $ret:ident)?
+        ;
+    )*) => {
+        #[derive(EnumSetType)]
+        pub enum NativeFunc {
+            $($name),*
+        }
 
-    pub fn signature(&self, sig: &mut cranelift_codegen::ir::Signature, supp: SuppRef) {
-        use SuppFunc::*;
-        let si = match SuppFunc::from_u8(self[supp].sf) {
-            DSINIT => SIG_DSINIT,
-            ALLOC  => SIG_ALLOC,
-            ABORT  => SIG_ABORT,
-            SWAP   => SIG_SWAP
-        };
-        sig2cl(sig, si);
+        const NATIVEFUNC_PTR: &[*const ()] = &[
+            $($fp as _),*
+        ];
+
+        const NATIVEFUNC_SIGNATURE: &[&Signature] = &[
+            $( &signature!(NATIVE_CALLCONV, $($arg)* $(-> $ret)?)),*
+        ];
+    };
+}
+
+// note: all native functions must be defined before emitted functions.
+define_suppfuncs! {
+    INIT  PTR I32 I32;
+    ALLOC I64 I64 -> PTR;
+    ABORT;
+    SWAP  (NATIVE_CALLCONV) PTR I64 -> I64;
+}
+
+define_nativefuncs! {
+    POWF64[pow]     F64 F64 -> F64;
+    EXPF64[exp]     F64 -> F64;
+    LOGF64[log]     F64 -> F64;
+    INIT[rt_init]   PTR PTR I32 I32;
+    ALLOC[rt_alloc] PTR I64 I64 -> PTR;
+    ABORT[rt_abort] PTR;
+}
+
+impl SuppFunc {
+
+    // FIXME replace with core::mem::variant_count when it stabilizes
+    pub const COUNT: usize = <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _;
+
+    pub fn from_u8(raw: u8) -> Self {
+        assert!(raw < Self::COUNT as _);
+        unsafe { core::mem::transmute(raw) }
+    }
+
+    pub fn signature(self, sig: &mut cranelift_codegen::ir::Signature) {
+        sig2cl(sig, &SUPPFUNC_SIGNATURE[self as usize])
     }
 
 }
 
-impl<T: SuppFuncType> core::ops::Index<SuppRef<T>> for SupportFuncs {
-    type Output = T;
-    fn index(&self, index: SuppRef<T>) -> &T {
-        &self.bump[index]
+impl NativeFunc {
+
+    pub fn from_u8(raw: u8) -> Self {
+        // FIXME replace with core::mem::variant_count when it stabilizes
+        assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
+        unsafe { core::mem::transmute(raw) }
     }
+
+    pub fn ptr(self) -> *const () {
+        NATIVEFUNC_PTR[self as usize]
+    }
+
+    pub fn signature(self, sig: &mut cranelift_codegen::ir::Signature) {
+        sig2cl(sig, &NATIVEFUNC_SIGNATURE[self as usize])
+    }
+
 }
 
-impl<T: SuppFuncType> core::ops::IndexMut<SuppRef<T>> for SupportFuncs {
-    fn index_mut(&mut self, index: SuppRef<T>) -> &mut T {
-        &mut self.bump[index]
-    }
+/* ---- Math ---------------------------------------------------------------- */
+
+#[link(name="m")]
+extern "C" {
+    fn pow(x: f64, y: f64) -> f64;
+    fn exp(x: f64) -> f64;
+    fn log(x: f64) -> f64;
 }
 
-/* ---- DSINIT -------------------------------------------------------------- */
+/* ---- Init ---------------------------------------------------------------- */
 
 /*
  * +--------+------+------+
@@ -258,8 +187,7 @@ impl DynSlot {
 
 }
 
-const SIG_DSINIT_FF: &Signature = &signature!(NATIVE_CALLCONV, PTR PTR I32 I32);
-unsafe extern "C" fn sfunc_dsinit(
+unsafe extern "C" fn rt_init(
     vmctx: &mut Instance,
     slots: *const DynSlot,
     num: u32,
@@ -280,25 +208,23 @@ unsafe extern "C" fn sfunc_dsinit(
     }
 }
 
-fn supp_dsinit(ecx: &mut Ecx) {
+fn supp_init(ecx: &mut Ecx) {
     let emit = &mut *ecx.data;
     let &[slots, num, size] = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))
         else { unreachable!() };
-    let sigref = emit.fb.ctx.func.import_signature(newsig(SIG_DSINIT_FF));
-    let fptr = emit.fb.ins().iconst(irt2cl(Type::PTR), sfunc_dsinit as i64);
     let vmctx = emit.fb.vmctx();
+    let init = emit.fb.importnative(NativeFunc::INIT);
     // would be nice if this could be a tail call, but i don't think cranelift can tail call native
     // functions
-    emit.fb.ins().call_indirect(sigref, fptr, &[vmctx, slots, num, size]);
+    emit.fb.ins().call(init, &[vmctx, slots, num, size]);
     emit.fb.ins().return_(&[]);
 }
 
-/* ---- ALLOC --------------------------------------------------------------- */
+/* ---- Alloc --------------------------------------------------------------- */
 
 // TODO: host should compile this function
 
-const SIG_ALLOC_FF: &Signature = &signature!(NATIVE_CALLCONV, PTR I64 I64 -> PTR);
-unsafe extern "C" fn sfunc_alloc(vmctx: &mut Instance, size: usize, align: usize) -> *mut u8 {
+unsafe extern "C" fn rt_alloc(vmctx: &mut Instance, size: usize, align: usize) -> *mut u8 {
     vmctx.host.alloc(size, align)
 }
 
@@ -306,39 +232,35 @@ fn supp_alloc(ecx: &mut Ecx) {
     let emit = &mut *ecx.data;
     let &[size, align] = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))
         else { unreachable!() };
-    let sigref = emit.fb.ctx.func.import_signature(newsig(SIG_ALLOC_FF));
-    let fptr = emit.fb.ins().iconst(irt2cl(Type::PTR), sfunc_alloc as i64);
+    let alloc = emit.fb.importnative(NativeFunc::ALLOC);
     let vmctx = emit.fb.vmctx();
-    let call = emit.fb.ins().call_indirect(sigref, fptr, &[vmctx, size, align]);
+    let call = emit.fb.ins().call(alloc, &[vmctx, size, align]);
     let ptr = emit.fb.ctx.func.dfg.inst_results(call)[0];
     emit.fb.ins().return_(&[ptr]);
 }
 
-/* ---- ABORT --------------------------------------------------------------- */
+/* ---- Abort --------------------------------------------------------------- */
 
-const SIG_ABORT_FF: &Signature = &signature!(NATIVE_CALLCONV, PTR);
-unsafe extern "C" fn sfunc_abort(vmctx: &mut Instance) -> ! {
+unsafe extern "C" fn rt_abort(vmctx: &mut Instance) -> ! {
     vmctx.host.set_error(b"query aborted (no suitable model)");
     fhk_vmexit(vmctx)
 }
 
 fn supp_abort(ecx: &mut Ecx) {
     let emit = &mut *ecx.data;
-    let sigref = emit.fb.ctx.func.import_signature(newsig(SIG_ABORT_FF));
-    let fptr = emit.fb.ins().iconst(irt2cl(Type::PTR), sfunc_abort as i64);
+    let abort = emit.fb.importnative(NativeFunc::ABORT);
     let vmctx = emit.fb.vmctx();
-    emit.fb.ins().call_indirect(sigref, fptr, &[vmctx]);
+    emit.fb.ins().call(abort, &[vmctx]);
     // the call_indirect doesn't return. this trap is here just to satisfy cranelift.
     emit.fb.ins().trap(TrapCode::User(0));
 }
 
 /* -------------------------------------------------------------------------- */
 
-pub fn emitsupport(ecx: &mut Ecx, supp: SuppRef) {
+pub fn emitsupport(ecx: &mut Ecx, supp: SuppFunc) {
     use SuppFunc::*;
-    let emit = &mut *ecx.data;
-    match SuppFunc::from_u8(emit.supp[supp].sf) {
-        DSINIT => supp_dsinit(ecx),
+    match supp {
+        INIT   => supp_init(ecx),
         ALLOC  => supp_alloc(ecx),
         ABORT  => supp_abort(ecx),
         SWAP   => unreachable!() // asm function

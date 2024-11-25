@@ -6,6 +6,7 @@ use crate::compile::{self, Ccx, Phase};
 use crate::image::Image;
 use crate::mcode::{MCode, Reloc, Sym};
 use crate::mmap::{mmap, Mmap};
+use crate::support::NativeFunc;
 use crate::trace::trace;
 use crate::typestate::Absent;
 
@@ -40,14 +41,15 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
     let mem = mem.as_mut_ptr();
     for &Reloc { at, add, kind, sym, which } in &mcode.relocs {
         let base = match sym {
-            Sym::Data => code.len() as u32 + which,
-            Sym::Label => mcode.labels[zerocopy::transmute!(which as u16)]
+            Sym::Data   => unsafe { mem.add(code.len() + which as usize) },
+            Sym::Label  => unsafe { mem.add(mcode.labels[zerocopy::transmute!(which)] as usize) },
+            Sym::Native => NativeFunc::from_u8(which as _).ptr().cast()
         };
         unsafe {
             doreloc(
                 kind,
                 mem.add(at as _),
-                mem.add(base as _).offset(add as _)
+                base.offset(add as _)
             )
         }
     }

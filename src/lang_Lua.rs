@@ -22,7 +22,7 @@ use crate::mmap::{mmap, Mmap};
 use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP, TVAR};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
-use crate::support::SWAP;
+use crate::support::SuppFunc;
 
 #[cfg(all(unix, not(feature="host-Lua")))]
 const LJ_LIBNAME: &'static [u8] = b"libluajit.so\0libluajit-5.1.so\0";
@@ -498,8 +498,7 @@ fn emitcall(ecx: &mut Ecx, id: InsId) -> InsValue {
         }
         args = next;
     }
-    let swap = emit.supp.instantiate(&mut ecx.mcode, &SWAP::new());
-    let swap = emit.fb.importsupp(&emit.supp, swap.cast());
+    let swap = emit.fb.importsupp(&ecx.ir, SuppFunc::SWAP);
     let jump = emit.fb.ins().iconst(irt2cl(Type::I64), jump as i64);
     emit.fb.ins().call(swap, &[base, jump]); // base+0 = coro
     unsafe { lib.lua_getfield(L, -2, c"returns".as_ptr()); }

@@ -10,6 +10,7 @@ use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::Configurable;
 use cranelift_codegen::{FinalizedMachReloc, FinalizedRelocTarget};
 use cranelift_entity::packed_option::ReservedValue;
+use enumset::EnumSet;
 
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Aligned, Bump};
@@ -19,10 +20,10 @@ use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
 use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
-use crate::mcode::{Label, MCode, MCodeData, MCodeOffset, Reloc};
+use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
 use crate::mem::{Cursor, Offset, SizeClass, Slot};
 use crate::schedule::{compute_schedule, BlockId, Gcm};
-use crate::support::{emitsupport, SuppFunc, SuppRef, SupportFuncs};
+use crate::support::{emitsupport, NativeFunc, SuppFunc};
 use crate::trace::trace;
 use crate::translate::translate;
 use crate::typestate::{Absent, R, RW};
@@ -36,6 +37,7 @@ pub struct Frame {
 pub struct FuncBuilder {
     pub ctx: cranelift_codegen::Context,
     pub block: cranelift_codegen::ir::Block,
+    pub supp: EnumSet<SuppFunc>, // stored here for borrowing reasons
     frame: Option<Frame>
 }
 
@@ -56,7 +58,6 @@ pub struct Emit {
     pub lang: LangState,
     pub fb: FuncBuilder,
     pub gcm: Gcm,
-    pub supp: SupportFuncs,
     pub code: IndexVec<InsId, Ins>,
     pub values: IndexVec<InsId, InsValue>,
     pub bump: Bump,
@@ -88,10 +89,6 @@ pub const NATIVE_CALLCONV: CallConv = {
         CallConv::SystemV
     }
 };
-
-const NS_DATA: u32 = 0;
-const NS_FUNC: u32 = 1;
-const NS_SUPP: u32 = 2;
 
 impl InsValue {
 
@@ -253,23 +250,11 @@ fn makesig(signature: &mut Signature, func: &Func) {
     }
 }
 
-fn funcref(func: FuncId) -> UserExternalName {
-    let func: u16 = zerocopy::transmute!(func);
-    UserExternalName::new(NS_FUNC, func as _)
-}
-
-fn dataref(data: MCodeData) -> UserExternalName {
-    UserExternalName::new(NS_DATA, zerocopy::transmute!(data))
-}
-
-fn suppref(supp: SuppRef) -> UserExternalName {
-    UserExternalName::new(NS_SUPP, zerocopy::transmute!(supp))
-}
-
 impl FuncBuilder {
 
     pub fn importdataref(&mut self, ptr: MCodeData) -> GlobalValue {
-        let nameref = self.ctx.func.declare_imported_user_function(dataref(ptr.cast()));
+        let nameref = self.ctx.func.declare_imported_user_function(
+            UserExternalName::new(Sym::Data as _, zerocopy::transmute!(ptr)));
         self.ctx.func.create_global_value(GlobalValueData::Symbol {
             name: ExternalName::user(nameref),
             offset: 0.into(),
@@ -284,28 +269,41 @@ impl FuncBuilder {
         self.importdataref(mcode.data.intern(value).to_bump_sized(size_of_val(value)).cast())
     }
 
-    pub fn importfunc(&mut self, ir: &IR, fid: FuncId) -> FuncRef {
-        let mut sig = Signature::new(CallConv::Fast);
-        makesig(&mut sig, &ir.funcs[fid]);
-        let sig = self.ctx.func.import_signature(sig);
-        let funcref = self.ctx.func.declare_imported_user_function(funcref(fid));
+    fn importfuncref(
+        &mut self,
+        sig: Signature,
+        name: UserExternalName,
+        colocated: bool
+    ) -> FuncRef {
+        let signature = self.ctx.func.import_signature(sig);
+        let funcref = self.ctx.func.declare_imported_user_function(name);
         self.ctx.func.import_function(ExtFuncData {
-            name: ExternalName::user(funcref),
-            signature: sig,
-            colocated: true
+            name: ExternalName::User(funcref),
+            signature,
+            colocated
         })
     }
 
-    pub fn importsupp(&mut self, sf: &SupportFuncs, supp: SuppRef) -> FuncRef {
+    pub fn importfunc(&mut self, ir: &IR, fid: FuncId) -> FuncRef {
         let mut sig = Signature::new(CallConv::Fast);
-        sf.signature(&mut sig, supp);
-        let sig = self.ctx.func.import_signature(sig);
-        let funcref = self.ctx.func.declare_imported_user_function(suppref(supp));
-        self.ctx.func.import_function(ExtFuncData {
-            name: ExternalName::User(funcref),
-            signature: sig,
-            colocated: true
-        })
+        makesig(&mut sig, &ir.funcs[fid]);
+        let name = UserExternalName::new(Sym::Label as _,
+            {let fid: u16 = zerocopy::transmute!(fid); fid as _});
+        self.importfuncref(sig, name, true)
+    }
+
+    pub fn importsupp(&mut self, ir: &IR, supp: SuppFunc) -> FuncRef {
+        self.supp |= supp;
+        let mut sig = Signature::new(CallConv::Fast);
+        supp.signature(&mut sig);
+        let name = UserExternalName::new(Sym::Label as _, ir.funcs.raw.len() as u32 + supp as u32);
+        self.importfuncref(sig, name, true)
+    }
+
+    pub fn importnative(&mut self, func: NativeFunc) -> FuncRef {
+        let mut sig = Signature::new(NATIVE_CALLCONV);
+        func.signature(&mut sig);
+        self.importfuncref(sig, UserExternalName::new(Sym::Native as _, func as _), false)
     }
 
 }
@@ -449,43 +447,26 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
     let &FinalizedMachReloc { offset, kind, ref target, addend } = reloc;
     match target {
         &FinalizedRelocTarget::Func(ofs) =>
-            mcode.relocs.push(Reloc::code(
-                    base + offset,
-                    addend as i32 + ofs as i32,
-                    kind,
-                    Label::func(emit.fid)
-            )),
+            mcode.relocs.push(Reloc {
+                at: base + offset,
+                add: addend as i32 + ofs as i32,
+                kind,
+                sym: Sym::Label,
+                which: {let fid: u16 = zerocopy::transmute!(emit.fid); fid as _}
+            }),
         &FinalizedRelocTarget::ExternalName(ExternalName::User(name)) => {
-            match emit.fb.ctx.func.params.user_named_funcs()[name] {
-                UserExternalName { namespace: NS_DATA, index } =>
-                    mcode.relocs.push(Reloc::data(
-                            base + offset,
-                            addend as i32,
-                            kind,
-                            zerocopy::transmute!(index))
-                    ),
-                UserExternalName { namespace: NS_FUNC, index } =>
-                    mcode.relocs.push(Reloc::code(
-                            base + offset,
-                            addend as i32,
-                            kind,
-                            Label::func(zerocopy::transmute!(index as u16))
-                    )),
-                UserExternalName { namespace: NS_SUPP, index } =>
-                    mcode.relocs.push(Reloc::code(
-                            base + offset,
-                            addend as i32,
-                            kind,
-                            emit.supp[{
-                                let supp: SuppRef = zerocopy::transmute!(index);
-                                supp
-                            }].label
-                    )),
-                _ => unreachable!()
-            }
+            let UserExternalName { namespace, index }
+                = emit.fb.ctx.func.params.user_named_funcs()[name];
+            mcode.relocs.push(Reloc {
+                at: base + offset,
+                add: addend as i32,
+                kind,
+                sym: Sym::from_u8(namespace as _),
+                which: index
+            });
         },
-        &FinalizedRelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
-            // TODO: patch it right here right now.
+        &FinalizedRelocTarget::ExternalName(ExternalName::LibCall(_)) => {
+            // TODO: translate it to nativefunc (?)
             todo!()
         },
         _ => unreachable!()
@@ -568,44 +549,46 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
         }
     }
     let loc = compilefunc(&mut ecx.data, &mut ecx.mcode);
-    ecx.mcode.labels[Label::func(fid)] = loc;
+    let label = zerocopy::transmute!({let fid: u16 = zerocopy::transmute!(fid); fid as u32});
+    ecx.mcode.labels[label] = loc;
     if let FuncKind::Query(Query { obj, .. }) = ecx.ir.funcs[fid].kind {
         ecx.objs[obj].mcode = loc;
     }
     Ok(())
 }
 
-fn emitsuppfunc(ecx: &mut Ecx, supp: SuppRef) {
+fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
     if trace!(CLIF) || trace!(MCODE) {
-        trace!("---------- SUPP@{} ----------", supp.offset());
+        trace!("---------- SUPP {:?} ----------", supp);
     }
-    let emit = &mut *ecx.data;
-    let loc = if emit.supp[supp].sf == SuppFunc::SWAP as _ {
-        emitmcode(&mut ecx.mcode, Image::fhk_swap_bytes())
-    } else {
-        emit.fb.clear();
-        emit.supp.signature(&mut emit.fb.ctx.func.signature, supp);
-        let entry = emit.fb.newblock();
-        // supp code uses this to get function args:
-        debug_assert!(entry == block2cl(BlockId::START));
-        for param in &emit.fb.ctx.func.stencil.signature.params {
-            emit.fb.ctx.func.stencil.dfg.append_block_param(entry, param.value_type);
+    let loc = match supp {
+        SuppFunc::SWAP => emitmcode(&mut ecx.mcode, Image::fhk_swap_bytes()),
+        _ => {
+            let emit = &mut *ecx.data;
+            emit.fb.clear();
+            supp.signature(&mut emit.fb.ctx.func.signature);
+            let entry = emit.fb.newblock();
+            // supp code uses this to get function args:
+            debug_assert!(entry == block2cl(BlockId::START));
+            for param in &emit.fb.ctx.func.stencil.signature.params {
+                emit.fb.ctx.func.stencil.dfg.append_block_param(entry, param.value_type);
+            }
+            emit.fb.block = entry;
+            emitsupport(ecx, supp);
+            compilefunc(&mut ecx.data, &mut ecx.mcode)
         }
-        emit.fb.block = entry;
-        emitsupport(ecx, supp);
-        compilefunc(&mut ecx.data, &mut ecx.mcode)
     };
-    ecx.mcode.labels[ecx.data.supp[supp].label] = loc;
+    let label = zerocopy::transmute!(ecx.ir.funcs.raw.len() as u32 + supp as u32);
+    ecx.mcode.labels[label] = loc;
 }
 
 fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
-    debug_assert!(ecx.mcode.labels.is_empty());
-    <MCodeOffset as zerocopy::FromZeros>::extend_vec_zeroed(&mut ecx.mcode.labels.raw,
-        ecx.ir.funcs.raw.len()).unwrap();
     for id in index::iter_span(ecx.ir.funcs.end()) {
         emitirfunc(ecx, id)?;
     }
-    while let Some(supp) = ecx.data.supp.work.pop_front() {
+    let mut havesupp: EnumSet<SuppFunc> = EnumSet::empty();
+    while let Some(supp) = ecx.data.fb.supp.difference(havesupp).iter().next() {
+        havesupp |= supp;
         emitsuppfunc(ecx, supp);
     }
     Ok(())
@@ -642,10 +625,10 @@ impl Phase for Emit {
             fb: FuncBuilder {
                 ctx: cranelift_codegen::Context::new(),
                 block: cranelift_codegen::ir::Block::reserved_value(),
+                supp: Default::default(),
                 frame: None
             },
             gcm: Default::default(),
-            supp: Default::default(),
             code: Default::default(),
             values: Default::default(),
             bump: Default::default(),
@@ -659,6 +642,7 @@ impl Phase for Emit {
     }
 
     fn run(ccx: &mut Ccx<Self>) -> compile::Result {
+        ccx.mcode.labels.raw.resize(ccx.ir.funcs.raw.len() + SuppFunc::COUNT, 0);
         ccx.freeze_ir(emitfuncs)?;
         take(&mut ccx.data.lang).finish(ccx)
     }

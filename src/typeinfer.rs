@@ -805,7 +805,10 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
                 ADD | SUB | MUL | DIV => {
                     Type::var(le)
                 },
-                POW => todo!(),
+                POW => {
+                    unifyvar(&mut tcx.data.sub, le, Type::pri(Primitive::F64));
+                    Type::pri(Primitive::F64)
+                }
             };
             Some(newcontype(&mut tcx.data.sub, Constructor::Tensor, &[res, Type::var(td)]))
         },

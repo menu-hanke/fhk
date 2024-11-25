@@ -7,11 +7,11 @@ use zerocopy::Unalign;
 use crate::bump::BumpRef;
 use crate::lang::Lang;
 use crate::mem::SizeClass;
-use crate::support::{ABORT, ALLOC, DSINIT};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::schedule::BlockId;
+use crate::support::{NativeFunc, SuppFunc};
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
     let mut src = emit.blockparams[emit.block]
@@ -127,8 +127,7 @@ fn ins_ub(ecx: &mut Ecx) {
 fn ins_abort(ecx: &mut Ecx) {
     let emit = &mut *ecx.data;
     coldblock(emit);
-    let abort = emit.supp.instantiate(&mut ecx.mcode, &ABORT::new());
-    let abort = emit.fb.importsupp(&emit.supp, abort.cast());
+    let abort = emit.fb.importsupp(&ecx.ir, SuppFunc::ABORT);
     emit.fb.ins().call(abort, &[]);
     // the call above doesn't return. this trap is here just to satisfy cranelift.
     emit.fb.ins().trap(TrapCode::User(0));
@@ -227,6 +226,17 @@ fn ins_arith(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = InsValue::from_value(value);
 }
 
+fn ins_pow(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let ins = emit.code[id];
+    let (left, right) = ins.decode_VV();
+    let left = emit.values[left].value();
+    let right = emit.values[right].value();
+    let func = emit.fb.importnative(NativeFunc::POWF64);
+    let call = emit.fb.ins().call(func, &[left, right]);
+    emit.values[id] = InsValue::from_value(emit.fb.ctx.func.dfg.inst_results(call)[0]);
+}
+
 fn ins_addp(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (left, right) = emit.code[id].decode_VV();
@@ -290,8 +300,7 @@ fn ins_cmp(ecx: &mut Ecx, id: InsId) {
 fn ins_alloc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (size, align) = emit.code[id].decode_VV();
-    let alloc = emit.supp.instantiate(&mut ecx.mcode, &ALLOC::new());
-    let alloc = emit.fb.importsupp(&emit.supp, alloc.cast());
+    let alloc = emit.fb.importsupp(&ecx.ir, SuppFunc::ALLOC);
     let size = emit.fb.coerce(emit.values[size].value(), Type::I64);
     let align = emit.fb.coerce(emit.values[align].value(), Type::I64);
     let call = emit.fb.ins().call(alloc, &[size, align]);
@@ -373,8 +382,7 @@ fn ins_binit(ecx: &mut Ecx, id: InsId) {
     let func = &ecx.ir.funcs[bundle];
     let FuncKind::Bundle(bundle) = &func.kind else { unreachable!() };
     if !bundle.scl.is_dynamic() { /* NOP */ return }
-    let dsinit = emit.supp.instantiate(&mut ecx.mcode, &DSINIT::new());
-    let dsinit = emit.fb.importsupp(&emit.supp, dsinit.cast());
+    let dsinit = emit.fb.importsupp(&ecx.ir, SuppFunc::INIT);
     let tab = emit.fb.importdataref(bundle.dynslots.cast());
     let tab = emit.fb.dataptr(tab);
     let nret: usize = func.ret.into();
@@ -411,8 +419,8 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             MOV | MOVB | MOVF => ins_mov(ecx, id),
             CONV => todo!(),
             ADD | SUB | MUL | DIV => ins_arith(ecx, id),
+            POW => ins_pow(ecx, id),
             ADDP => ins_addp(ecx, id),
-            POW => todo!(),
             NEG => todo!(),
             EQ | NE | LT | LE | ULT | ULE => ins_cmp(ecx, id),
             ALLOC => ins_alloc(ecx, id),

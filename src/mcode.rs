@@ -1,11 +1,12 @@
 //! Machine code & relocs.
 
 use alloc::vec::Vec;
+use enumset::EnumSetType;
 
 use crate::bump::{Bump, BumpRef};
 use crate::index::{index, IndexVec};
 use crate::intern::Intern;
-use crate::ir::FuncId;
+use crate::support::NativeFunc;
 
 // cranelift uses:
 //   x64        32
@@ -14,17 +15,20 @@ use crate::ir::FuncId;
 //   s390x       4
 const FUNC_ALIGN: u32 = 32;
 
-index!(pub struct Label(u16) invalid(!0));
+index!(pub struct Label(u32) invalid(!0));
 
 pub type MCodeOffset = u32;
 
 // marker for BumpRef in mcode.data
 pub type MCodeData<T=[u8]> = BumpRef<T>;
 
-#[derive(Clone, Copy)]
+// FIXME this only derives EnumSetType for VARIANT_COUNT
+// remove this when (if) core::mem::variant_count stabilizes
+#[derive(EnumSetType)]
 pub enum Sym {
     Data,   // which = offset from mcode.data
     Label,  // which = Label
+    Native, // which = NativeFunc
 }
 
 pub struct Reloc {
@@ -43,10 +47,12 @@ pub struct MCode {
     pub labels: IndexVec<Label, MCodeOffset>
 }
 
-impl Label {
+impl Sym {
 
-    pub fn func(func: FuncId) -> Self {
-        zerocopy::transmute!(func)
+    pub fn from_u8(raw: u8) -> Self {
+        // FIXME replace with core::mem::variant_count when it stabilizes
+        assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
+        unsafe { core::mem::transmute(raw) }
     }
 
 }
@@ -68,19 +74,33 @@ impl Reloc {
         }
     }
 
-    pub fn code(
+    pub fn label(
         at: MCodeOffset,
         add: i32,
         kind: cranelift_codegen::binemit::Reloc,
         label: Label
     ) -> Self {
-        let label: u16 = zerocopy::transmute!(label);
         Self {
             at,
             add,
             kind,
             sym: Sym::Label,
-            which: label as _
+            which: zerocopy::transmute!(label)
+        }
+    }
+
+    pub fn native(
+        at: MCodeOffset,
+        add: i32,
+        kind: cranelift_codegen::binemit::Reloc,
+        func: NativeFunc
+    ) -> Self {
+        Self {
+            at,
+            add,
+            kind,
+            sym: Sym::Native,
+            which: func as _
         }
     }
 
