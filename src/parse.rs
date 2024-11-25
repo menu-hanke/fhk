@@ -11,8 +11,8 @@ use crate::intern::IRef;
 use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
+use crate::obj::{cast_args, LookupEntry, Obj, ObjRef, ObjectRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, pushmacro, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
 const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
@@ -35,13 +35,49 @@ fn implicittab(pcx: &mut Pcx) -> compile::Result<ObjRef<TAB>> {
     Ok(tab)
 }
 
+fn newundef(pcx: &mut Pcx, id: ObjRef) -> ObjRef {
+    pcx.objs[id].mark = 1;
+    pcx.data.undef.push(id);
+    id
+}
+
+fn reftab(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<TAB> {
+    let id = match pcx.objs.tab(name) {
+        LookupEntry::Occupied(id) => return id,
+        LookupEntry::Vacant(e) => e.create()
+    };
+    newundef(pcx, id.erase()).cast()
+}
+
+fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: IRef<[u8]>) -> ObjRef<VAR> {
+    let id = match pcx.objs.var(tab, name) {
+        LookupEntry::Occupied(id) => return id,
+        LookupEntry::Vacant(e) => e.create()
+    };
+    newundef(pcx, id.erase()).cast()
+}
+
 fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
-    let (tab, var) = parse_dotname(pcx)?;
+    if pcx.data.token == Token::OpThis {
+        match pcx.objs[pcx.data.this].op {
+            Obj::VAR => {
+                next(pcx)?;
+                return Ok(pcx.data.this.cast());
+            },
+            Obj::TAB => {
+                next(pcx)?;
+                // TODO: `$$.var` where $$ is the this of a macro table.
+                todo!()
+            },
+            _ => {}
+        }
+    }
+    let (tab, name) = parse_dotname(pcx)?;
     let tab = match tab == IRef::EMPTY {
         true  => implicittab(pcx)?,
-        false => pcx.objs.tab(tab).get_or_create()
+        false => reftab(pcx, tab)
     };
-    Ok(pcx.objs.var(tab, var).get_or_create())
+    Ok(refvar(pcx, tab, name))
 }
 
 fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
@@ -129,16 +165,16 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
                 Token::LParen => parse_call(pcx, name),
                 Token::Dot => {
                     next(pcx)?;
-                    let tab = pcx.objs.tab(name).get_or_create();
+                    let tab = reftab(pcx, name);
                     let name = parse_name(pcx)?;
-                    let var = pcx.objs.var(tab, name).get_or_create();
+                    let var = refvar(pcx, tab, name);
                     parse_vget(pcx, var)
                 },
                 _ => match pcx.data.bindings.iter().find(|b| b.name == name) {
                     Some(v) => Ok(v.value),
                     None => {
                         let tab = implicittab(pcx)?;
-                        let var = pcx.objs.var(tab, name).get_or_create();
+                        let var = refvar(pcx, tab, name);
                         parse_vget(pcx, var)
                     }
                 }
@@ -250,6 +286,7 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     if !pcx.objs[tab].shape.is_nil() {
         return redeferr(pcx, Namespace::Table, name);
     }
+    pcx.objs[tab].mark = 0;
     let base = pcx.tmp.end();
     if check(pcx, Token::LBracket)? {
         pcx.data.tab = ObjRef::GLOBAL;
@@ -288,6 +325,7 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
     let base = pcx.tmp.end();
     loop {
         let var = parse_vref(pcx)?;
+        pcx.objs[var].mark = 0;
         if check(pcx, Token::LBracket)? {
             todo!(); // TODO: parse subset
             consume(pcx, Token::RBracket)?;
@@ -323,8 +361,24 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
 
 fn parse_model(pcx: &mut Pcx) -> compile::Result {
     next(pcx)?; // skip `model`
-    let table = parse_name(pcx)?;
-    pcx.data.tab = pcx.objs.tab(table).get_or_create();
+    let tab = match pcx.data.token {
+        Token::OpThis => match pcx.objs[pcx.data.this].op {
+            Obj::VAR => {
+                // do not consume the token here, it's going to also be used for the var itself.
+                pcx.objs[pcx.data.this.cast::<VAR>()].tab
+            },
+            Obj::TAB => {
+                next(pcx)?;
+                pcx.data.this.cast()
+            },
+            _ => return tokenerr(pcx, Token::Ident)
+        },
+        _ => {
+            let name = parse_name(pcx)?;
+            reftab(pcx, name)
+        }
+    };
+    pcx.data.tab = tab;
     debug_assert!(pcx.data.bindings.is_empty());
     if check(pcx, Token::LBracket)? {
         let mut axis = -1isize;
@@ -476,6 +530,38 @@ fn parse_macro_body(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> comp
     r
 }
 
+fn checkopenparen(pcx: &mut Pcx) -> compile::Result<Option<Token>> {
+    let close = match pcx.data.token {
+        Token::LParen   => Token::RParen,
+        Token::LBracket => Token::RBracket,
+        Token::LCurly   => Token::RCurly,
+        _ => return Ok(None)
+    };
+    next(pcx)?;
+    Ok(Some(close))
+}
+
+fn parse_macro_var(pcx: &mut Pcx) -> compile::Result {
+    next(pcx)?; // skip `var`
+    pcx.data.undef_base = 0;
+    pcx.data.marg.clear();
+    let table_pattern = parse_name_pattern(pcx)?;
+    let name_pattern = parse_name_pattern(pcx)?;
+    let base = pcx.tmp.end();
+    if let Some(stop) = checkopenparen(pcx)? {
+        parse_macro_body(pcx, stop.into(), false)?;
+        consume(pcx, stop)?;
+    } else {
+        pcx.tmp.push(Token::Model as u8);
+        pcx.tmp.push(Token::OpThis as u8);
+        parse_macro_body(pcx, TOPLEVEL_KEYWORDS, false)?;
+    }
+    let body = pcx.intern.intern(&pcx.tmp[base..]);
+    pcx.tmp.truncate(base);
+    defmacro(pcx, Namespace::Var, table_pattern, name_pattern, body);
+    Ok(())
+}
+
 fn parse_macro_table(pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
@@ -491,17 +577,7 @@ fn parse_macro_func(pcx: &mut Pcx) -> compile::Result {
 fn parse_snippet(pcx: &mut Pcx) -> compile::Result {
     pcx.data.marg.clear();
     let name = parse_name_pattern(pcx)?;
-    let stop = if (Token::LParen | Token::LBracket | Token::LCurly).contains(pcx.data.token) {
-        let stop = match pcx.data.token {
-            Token::LParen   => Token::RParen,
-            Token::LBracket => Token::RBracket,
-            _               => Token::RCurly
-        };
-        next(pcx)?;
-        Some(stop)
-    } else {
-        None
-    };
+    let stop = checkopenparen(pcx)?;
     let base = pcx.tmp.end();
     parse_macro_body(
         pcx,
@@ -527,6 +603,7 @@ fn parse_toplevel(pcx: &mut Pcx) -> compile::Result {
             Token::Macro => {
                 next(pcx)?;
                 match pcx.data.token {
+                    Token::Var   => parse_macro_var(pcx),
                     Token::Table => parse_macro_table(pcx),
                     Token::Model => parse_macro_model(pcx),
                     Token::Func  => parse_macro_func(pcx),
@@ -539,6 +616,43 @@ fn parse_toplevel(pcx: &mut Pcx) -> compile::Result {
     }
 }
 
+fn parse_toplevel_objdef(pcx: &mut Pcx, o: ObjRef) -> compile::Result {
+    pcx.data.this = o;
+    debug_assert!(pcx.objs[o].mark == 1);
+    next(pcx)?;
+    parse_toplevel(pcx)?;
+    if pcx.objs[o].mark != 0 {
+        // TODO: report error (macro didn't define object)
+        todo!()
+    }
+    Ok(())
+}
+
+fn expandobjs(pcx: &mut Pcx) -> compile::Result {
+    loop {
+        let i = pcx.data.undef_base;
+        let Some(&o) = pcx.data.undef.get(i) else { return Ok(()) };
+        if pcx.objs[o].mark != 0 {
+            let (ns, table, name) = match pcx.objs.get(o) {
+                ObjectRef::VAR(&VAR { tab, name, .. }) => (Namespace::Var, pcx.objs[tab].name, name),
+                ObjectRef::TAB(&TAB { name, .. }) => (Namespace::Table, IRef::EMPTY, name),
+                ObjectRef::FUNC(_) => todo!(),
+                _ => unreachable!()
+            };
+            match pushmacro(&mut pcx.data, &pcx.intern, ns, table, name) {
+                Some(_) => {
+                    parse_toplevel_objdef(pcx, o)?;
+                },
+                None => {
+                    pcx.data.undef_base = i+1;
+                    continue;
+                }
+            }
+        }
+        pcx.data.undef.swap_remove(i);
+    }
+}
+
 /* ---- Expanded object refs ------------------------------------------------ */
 
 pub enum ExpandResult<O,N> {
@@ -547,11 +661,22 @@ pub enum ExpandResult<O,N> {
 }
 
 fn expandtab(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
-    if let Some(tab) = pcx.objs.tab(name).get() {
-        return Ok(ExpandResult::Defined(tab));
-    }
-    // TODO: pushmacro+expand here
-    Ok(ExpandResult::Undefined(name))
+    let id = match pcx.objs.tab(name) {
+        LookupEntry::Occupied(id) => return Ok(ExpandResult::Defined(id)),
+        LookupEntry::Vacant(e) => match pushmacro(
+            &mut pcx.data,
+            &pcx.intern,
+            Namespace::Table,
+            IRef::EMPTY,
+            name
+        ) {
+            Some(_) => e.create(),
+            None => return Ok(ExpandResult::Undefined(name))
+        }
+    };
+    pcx.objs[id].mark = 1;
+    parse_toplevel_objdef(pcx, id.erase())?;
+    Ok(ExpandResult::Defined(id))
 }
 
 fn expandvar(
@@ -559,11 +684,23 @@ fn expandvar(
     tab: ObjRef<TAB>,
     name: IRef<[u8]>
 ) -> compile::Result<ExpandResult<VAR, (IRef<[u8]>, IRef<[u8]>)>> {
-    if let Some(var) = pcx.objs.var(tab, name).get() {
-        return Ok(ExpandResult::Defined(var));
-    }
-    // TODO: pushmacro+expand here
-    Ok(ExpandResult::Undefined((pcx.objs[tab].name, name)))
+    let tabname = pcx.objs[tab].name;
+    let id = match pcx.objs.var(tab, name) {
+        LookupEntry::Occupied(id) => return Ok(ExpandResult::Defined(id)),
+        LookupEntry::Vacant(e) => match pushmacro(
+            &mut pcx.data,
+            &pcx.intern,
+            Namespace::Var,
+            tabname,
+            name
+        ) {
+            Some(_) => e.create(),
+            None => return Ok(ExpandResult::Undefined((tabname, name)))
+        }
+    };
+    pcx.objs[id].mark = 1;
+    parse_toplevel_objdef(pcx, id.erase())?;
+    Ok(ExpandResult::Defined(id))
 }
 
 pub fn parse_expand_tab(pcx: &mut Pcx) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
@@ -587,12 +724,20 @@ pub fn parse_expand_var(
 
 /* -------------------------------------------------------------------------- */
 
-pub fn parse_def(pcx: &mut Pcx) -> compile::Result {
-    parse_toplevel(pcx)
+pub fn parse_toplevel_def(pcx: &mut Pcx) -> compile::Result {
+    parse_toplevel(pcx)?;
+    expandobjs(pcx)?;
+    Ok(())
 }
 
 pub fn parse_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     parse_binop(pcx, 0)
+}
+
+pub fn parse_toplevel_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
+    let expr = parse_expr(pcx)?;
+    expandobjs(pcx)?;
+    Ok(expr)
 }
 
 pub fn parse_template(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {

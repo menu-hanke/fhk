@@ -13,7 +13,7 @@ use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::IRef;
 use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, RESET, TAB};
-use crate::parse::{parse_def, parse_expand_tab, parse_expand_var, parse_expr, parse_template, ExpandResult};
+use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_toplevel_def, parse_toplevel_expr, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
 use crate::image::fhk_vmcall_native as fhk_vmcall;
@@ -123,8 +123,8 @@ fn doparse(G: &mut fhk_Graph, tab: fhk_ObjRef<TAB>, source: Source, what: c_int)
                 pushtemplate(pcx, template, captures)?;
             }
             match what&0x7 {
-                PARSE_DEF => parse_def(pcx).map(|_| 0),
-                PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
+                PARSE_DEF => parse_toplevel_def(pcx).map(|_| 0),
+                PARSE_EXPR => parse_toplevel_expr(pcx).map(|o| zerocopy::transmute!(o)),
                 PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
                 PARSE_TAB => Ok(match parse_expand_tab(pcx)? {
                     ExpandResult::Defined(o) => zerocopy::transmute!(o),

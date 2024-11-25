@@ -1727,6 +1727,7 @@ fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
 
 /* ---- Queries ------------------------------------------------------------- */
 
+// TODO: need to emit availability check here too.
 fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
     let mut ctr = InsId::START;
     let mut ret: PhiId = 0.into();

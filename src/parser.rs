@@ -35,7 +35,6 @@ struct Macro {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Namespace {
-    Model,
     Var,
     Func,
     Table,
@@ -47,7 +46,7 @@ pub enum Namespace {
 
 pub type TokenData = u32;
 
-struct Frame {
+pub struct Frame {
     base: u32,   // index of first capture
     cursor: u32, // byte offset in pcx.intern
     end: u32,    // byte offset in pcx.intern
@@ -71,6 +70,9 @@ pub struct Parser<L=Absent> {
     pub bindings: Vec<Binding>,
     pub tab: ObjRef<TAB>,
     pub marg: Vec<IRef<[u8]>>,
+    pub undef: Vec<ObjRef>,
+    pub undef_base: usize,
+    pub this: ObjRef,
     pub rec: bool,
     macros: IndexVec<MacroId, Macro>,
     chain: HashMap<(IRef<[u8]>, Namespace), (MacroId, MacroId)>, // stem -> (head, tail)
@@ -187,7 +189,6 @@ pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: Sequen
 fn nsname(ns: Namespace) -> &'static str {
     use Namespace::*;
     match ns {
-        Model    => "model",
         Var      => "var",
         Func     => "func",
         Table    => "table",
@@ -203,7 +204,7 @@ fn traceback(pcx: &mut Pcx) {
         pcx.host.buf.push_str(nsname(frame.ns));
         pcx.host.buf.push(' ');
         match frame.ns {
-            Model | Var | Func | Table | Snippet => {
+            Var | Func | Table | Snippet => {
                 let macro_ = &pcx.data.macros[zerocopy::transmute!(frame.this)];
                 if macro_.table_pattern != IRef::EMPTY {
                     stringify(
@@ -330,16 +331,22 @@ pub fn defmacro(
     body: IRef<[u8]>
 ) {
     let parser = &mut *pcx.data;
-    let id = parser.macros.end();
+    let id = parser.macros.push(Macro {
+        table_pattern,
+        name_pattern,
+        body,
+        next: None.into()
+    });
     let stem = splitstem(pcx.intern.get_slice(name_pattern));
-    let next = match parser.chain.entry((stem, ns)) {
-        Entry::Occupied(mut e) => Some(replace(&mut e.get_mut().1, id)),
+    match parser.chain.entry((stem, ns)) {
+        Entry::Occupied(mut e) => {
+            let tail = replace(&mut e.get_mut().1, id);
+            parser.macros[tail].next = Some(id).into();
+        },
         Entry::Vacant(e) => {
             e.insert((id, id));
-            None
         }
-    }.into();
-    parser.macros.push(Macro { table_pattern, name_pattern, body, next });
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -479,30 +486,30 @@ pub fn try_match(
 }
 
 
-fn pushmacro<'a, 'input>(
-    pcx: &'a mut Pcx<'input>,
+pub fn pushmacro<'a, 'input>(
+    parser: &'a mut Parser<logos::Lexer<'input, Token>>,
+    intern: &Intern,
     ns: Namespace,
     table: IRef<[u8]>,
     name: IRef<[u8]>
 ) -> Option<&'a mut Frame> {
-    let stem = splitstem(pcx.intern.get_slice(name));
-    let parser = &mut *pcx.data;
+    let stem = splitstem(intern.get_slice(name));
     let mut id = parser.chain.get(&(stem, ns))?.0;
     let base = parser.captures.len() as _;
     loop {
         let macro_ = &parser.macros[id];
         if try_match(
             &mut parser.captures,
-            &pcx.intern,
+            intern,
             table,
-            pcx.intern.get_slice(macro_.table_pattern)
+            intern.get_slice(macro_.table_pattern)
         ) && try_match(
             &mut parser.captures,
-            &pcx.intern,
+            intern,
             name,
-            pcx.intern.get_slice(macro_.name_pattern)
+            intern.get_slice(macro_.name_pattern)
         ) {
-            let body = pcx.intern.get_range(macro_.body);
+            let body = intern.get_range(macro_.body);
             parser.stack.push(Frame {
                 base,
                 cursor: body.start as _,
@@ -669,7 +676,7 @@ pub fn next(pcx: &mut Pcx) -> compile::Result {
             next(pcx)?;
             let name = parse_name(pcx)?;
             let Parser { token, tdata: data, .. } = *pcx.data;
-            match pushmacro(pcx, Namespace::Snippet, IRef::EMPTY, name) {
+            match pushmacro(&mut pcx.data, &pcx.intern, Namespace::Snippet, IRef::EMPTY, name) {
                 Some(frame) => {
                     frame.lookahead = Some(token);
                     frame.lookahead_data = data;
@@ -772,6 +779,9 @@ impl Phase for Parser {
             marg: Default::default(),
             macros: Default::default(),
             chain: Default::default(),
+            undef: Default::default(),
+            undef_base: Default::default(),
+            this: ObjRef::NIL,
             stack: Default::default(),
             captures: Default::default(),
             snippet: Default::default(),
