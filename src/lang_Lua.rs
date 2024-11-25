@@ -209,11 +209,15 @@ fn parse_luavalue(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
                 if !check(pcx, Token::Comma)? || pcx.data.token == Token::RBracket { break }
             }
             consume(pcx, Token::RBracket)?;
-            let ty = pcx.objs.push(TVAR::new());
-            let new = pcx.objs.push_args::<NEW>(NEW::new(ty.erase()), &pcx.tmp[base.cast_up()..]);
+            let shape: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
+            let tv = pcx.objs.push(TVAR::new());
+            let ty = pcx.objs.push(TTEN::new(shape.len() as _, tv.erase()));
+            let new = pcx.objs.push_args::<NEW>(NEW::new(ty.erase()), shape);
             pcx.tmp.truncate(base);
-            pcx.perm[ps.lf].out[idx] = !ps.inputs.len() as _;
+            let input = ps.inputs.len();
+            pcx.perm[ps.lf].out[idx] = !input as _;
             ps.inputs.push(&mut pcx.tmp, new.cast());
+            ps.template.push(&mut pcx.tmp, 0x80 | input as u8);
         },
         _ => {
             let input = parse_expr(pcx)?;
@@ -259,7 +263,9 @@ fn collect_call(pcx: &mut Pcx, ps: &ParseState, n: usize) -> ObjRef<CALLX> {
     }
     // if there were any explicit out parameters, create a type annotation
     let inputs = ps.inputs.as_slice(&pcx.tmp);
-    let ann = if ps.need.popcount() < n as _ {
+    let ann = if ps.need.is_empty() && n == 1 {
+        pcx.objs[inputs[!lf.out[0] as usize]].ann
+    } else if ps.need.popcount() < n as _ {
         let (ann, tup) = pcx.objs.push_reserve_dst::<TTUP>(n);
         tup.op = Obj::TTUP;
         tup.elems.fill(ObjRef::NIL);
@@ -361,7 +367,7 @@ unsafe fn pushctype(objs: &Objects, lib: &LuaLib, L: *mut lua_State, tab: c_int,
             lib.lua_pushnumber(L, ty as _);
             lib.lua_call(L, 1, 1);
         },
-        ObjectRef::TTEN(&TTEN { elem, dim: 1, .. }) => {
+        ObjectRef::TTEN(&TTEN { elem, dim: 1, .. }) if objs[elem].op == Obj::TPRI => {
             lib.lua_getfield(L, STACK_TENSORLIB, c"vector_ctype".as_ptr());
             pushctype(objs, lib, L, tab, elem);
             lib.lua_call(L, 1, 1);

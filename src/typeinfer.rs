@@ -11,9 +11,10 @@ use rustc_hash::FxHasher;
 
 use crate::compile::{self, Ccx, Phase};
 use crate::dump::trace_objs;
+use crate::hash::HashMap;
 use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intrinsics::Intrinsic;
-use crate::obj::{obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, EXPR, GET, KFP64, KINT, KINT64, LOAD, MOD, QUERY, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, EXPR, GET, KFP64, KINT, KINT64, LOAD, MOD, NEW, QUERY, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, Scheme, SchemeBytecode};
@@ -230,33 +231,34 @@ fn createtypeobj(objs: &mut Objects, ty: TypeRepr, work: &[u32]) -> ObjRef {
     }
 }
 
-fn createtype(objs: &Objects, tvar: &mut IndexVec<TypeVar, Type>, idx: ObjRef) -> Type {
-    match objs.get(idx) {
-        ObjectRef::TVAR(_) => {
-            // TODO: handle explicit type variables in type inference.
-            // probably the "correct" way to do this is to do two passes over objects in init:
-            //   1. collect all explicit type objects into a hashmap objref -> type.
-            //   2. set annotations for expressions and variables
-            // this also avoids re-creating all types like init currently does.
-            // note: unifyexpr() still must be called for all expressions with an explicit
-            // type annotations, because otherwise subexpressions won't be visited.
-            todo!()
-        },
+fn createtype(
+    objs: &Objects,
+    o2ty: &mut HashMap<ObjRef, Type>,
+    tvar: &mut IndexVec<TypeVar, Type>,
+    idx: ObjRef
+) -> Type {
+    if let Some(&ty) = o2ty.get(&idx) {
+        return ty;
+    }
+    let ty = match objs.get(idx) {
+        ObjectRef::TVAR(_) => Type::var(newtypevar(tvar)),
         ObjectRef::TPRI(&TPRI { ty, .. }) => Type::pri(EnumSet::from_u16_truncated(1 << ty)),
         ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
-            let e = createtype(objs, tvar, elem);
+            let e = createtype(objs, o2ty, tvar, elem);
             newcontype(tvar, Constructor::Tensor, &[e, Type::dim(dim)])
         },
         ObjectRef::TTUP(&TTUP { ref elems, .. }) => {
             let mut ty = Type::UNIT;
             for &e in elems.iter().rev() {
-                let ety = createtype(objs, tvar, e);
+                let ety = createtype(objs, o2ty, tvar, e);
                 ty = newpairtype(tvar, ety, ty);
             }
             ty
         },
         _ => unreachable!()
-    }
+    };
+    o2ty.insert_unique_unchecked(idx, ty);
+    ty
 }
 
 fn totypevar(types: &mut IndexVec<TypeVar, Type>, ty: Type) -> TypeVar {
@@ -289,22 +291,17 @@ fn typeobj(ccx: &mut Ccx<TypeInfer>, ty: Type) -> ObjRef {
 }
 
 fn puttypeobj(ccx: &mut Ccx<TypeInfer>, idx: ObjRef) {
-    if let Entry::Vacant(e) = ccx.data.typeobj.entry(
-        hashtypeobj(ccx.objs.get(idx)),
-        |&i| ccx.objs.equal(i, idx),
-        |&i| hashtypeobj(ccx.objs.get(i))
-    ) {
-        e.insert(idx);
-    }
 }
 
-fn isconcretetype(objs: &Objects, idx: ObjRef) -> bool {
-    match objs.get(idx) {
-        ObjectRef::TVAR(_) => false,
-        ObjectRef::TPRI(_) => true,
-        ObjectRef::TTEN(&TTEN { elem, .. }) => isconcretetype(objs, elem),
-        ObjectRef::TTUP(TTUP { elems, .. }) => elems.iter().all(|&e| isconcretetype(objs, e)),
-        _ => unreachable!()
+fn isconcretetype(tvar: &IndexSlice<TypeVar, Type>, ty: Type) -> bool {
+    use TypeRepr::*;
+    match ty.unpack() {
+        Var(j) if ty == Type::var(j) => false,
+        Var(j) => isconcretetype(tvar, tvar[j]),
+        Con(c, base) => (0..Constructor::from_u8(c).arity() as isize)
+            .all(|i| isconcretetype(tvar, tvar[base+i])),
+        Pri(p) => p.len() <= 1,
+        Dim(_) => true
     }
 }
 
@@ -352,6 +349,23 @@ struct ExprAnn {
 }
 
 fn init(ccx: &mut Ccx<TypeInfer>) {
+    // pass 1: collect type objects
+    let mut o2ty: HashMap<ObjRef, Type> = Default::default();
+    for idx in ccx.objs.keys() {
+        if Operator::is_type_raw(ccx.objs[idx].op) {
+            let ty = createtype(&ccx.objs, &mut o2ty, &mut ccx.data.tvar, idx);
+            if isconcretetype(&ccx.data.tvar, ty) {
+                if let Entry::Vacant(e) = ccx.data.typeobj.entry(
+                    hashtypeobj(ccx.objs.get(idx)),
+                    |&i| ccx.objs.equal(i, idx),
+                    |&i| hashtypeobj(ccx.objs.get(i))
+                ) {
+                    e.insert(idx);
+                }
+            }
+        }
+    }
+    // pass 2: patch type annotations
     let mut idx = ObjRef::NIL;
     let base = ccx.tmp.end();
     while let Some(i) = ccx.objs.next(idx) {
@@ -368,29 +382,24 @@ fn init(ccx: &mut Ccx<TypeInfer>) {
                     if idx == ObjRef::TRUE.cast() || idx == ObjRef::FALSE.cast() {
                         ccx.data.tvar[tv] = Type::pri(Primitive::B1);
                     } else {
-                        ccx.tmp.push(ExprAnn {
-                            expr: idx.cast(),
-                            ann: createtype(&ccx.objs, &mut ccx.data.tvar, ann)
-                        });
+                        ccx.tmp.push(ExprAnn { expr: idx.cast(), ann: o2ty[&ann] });
                     }
                 }
             },
             op if op == Operator::VAR as _ => {
                 let ann = match ccx.objs[idx.cast::<VAR>()].ann {
                     a if a == ObjRef::NIL => newtypevar(&mut ccx.data.tvar),
-                    a => {
-                        let ty = createtype(&ccx.objs, &mut ccx.data.tvar, a);
-                        totypevar(&mut ccx.data.tvar, ty)
-                    }
+                    a => totypevar(&mut ccx.data.tvar, o2ty[&a])
                 };
                 trace!(TYPE "{:?} = {:?} VAR", ann, idx);
                 ccx.objs[idx.cast::<VAR>()].ann = zerocopy::transmute!(ann);
             },
-            op if Operator::is_type_raw(op) && isconcretetype(&ccx.objs, idx)
-                => puttypeobj(ccx, idx),
             _ => {}
         }
     }
+    // apply annotations.
+    // this must be done only after all annotations are collected because unifyexpr depends
+    // on the annotation existing.
     ccx.freeze_graph(|ctx| {
         let mut ptr = base.cast_up();
         let end = ctx.tmp.end().cast::<ExprAnn>();
@@ -511,9 +520,9 @@ fn unifyexpr(ctx: &mut Ctx, idx: ObjRef<EXPR>, ty: Type) {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(&LOAD { addr, ref dims, .. }) => {
+        ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
             unifyexpr(ctx, addr, Type::pri(Primitive::PTR));
-            for &d in dims {
+            for &d in shape {
                 // TODO: this should support all types of integers, but currently lower
                 // assumes all lengths are IRT_IDX (this is hardcoded in return slots).
                 // this should probably convert to IRT_IDX because there's not much benefit
@@ -521,6 +530,12 @@ fn unifyexpr(ctx: &mut Ctx, idx: ObjRef<EXPR>, ty: Type) {
                 unifyexpr(ctx, d, Type::pri(PRI_IDX));
             }
             // result type annotation is generated by parser, no need to unify it here.
+        },
+        ObjectRef::NEW(NEW { shape, .. }) => {
+            for &s in shape {
+                // nb. see TODO comment in LOAD
+                unifyexpr(ctx, s, Type::pri(PRI_IDX));
+            }
         },
         ObjectRef::GET(&GET { value, idx, .. }) => {
             let mut tt = newpairtype(&mut ctx.data.tvar, Type::var(tv), Type::UNIT);

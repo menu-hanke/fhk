@@ -326,13 +326,13 @@ define_ops! {
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
     KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
-    NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
     DIM.axis    { ann: ObjRef/*TY*/ };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
     CAT         { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
-    LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } dims: [ObjRef<EXPR>];
+    LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } shape: [ObjRef<EXPR>];
+    NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
     GET.idx     { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     FREF        { ann: ObjRef/*TY*/, func: ObjRef/*FUNC|FNI*/ };
     CALL        { ann: ObjRef/*TY*/, func: ObjRef<EXPR> } args: [ObjRef<EXPR>];
@@ -541,7 +541,6 @@ impl Objects {
             (KINT64(a),KINT64(b)) => a.k == b.k,
             (KFP64(a), KFP64(b))  => a.k == b.k,
             (KSTR(a),  KSTR(b))   => a.k == b.k,
-            (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (DIM(a),   DIM(b))    => a.axis == b.axis,
             (TUPLE(a), TUPLE(b))  => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
             (VGET(a),  VGET(b))   => a.var == b.var
@@ -550,7 +549,8 @@ impl Objects {
             (IDX(a),   IDX(b))    => self.equal(a.value.erase(), b.value.erase())
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
             (LOAD(a),  LOAD(b))   => a.addr == b.addr
-                && self.allequal(cast_args(&a.dims), cast_args(&b.dims)),
+                && self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
+            (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (GET(a),   GET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
             (FREF(_),  FREF(_))   => todo!(),
             (CALL(_),  CALL(_))   => todo!(),

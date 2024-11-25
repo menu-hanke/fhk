@@ -1,5 +1,11 @@
 local ffi = require "ffi"
 local buffer = require "string.buffer"
+require "table.new"
+
+-- it's logically an uint32_t, but signed generates slightly better code
+local IDX_CTYPE = "int32_t"
+
+---- Scalars -------------------------------------------------------------------
 
 -- ORDER PRI
 local PRI_F64 = 0
@@ -31,8 +37,61 @@ local PRI_CT = {
 	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
 }
 
--- it's logically an uint32_t, but signed generates slightly better code
-local IDX_CTYPE = "int32_t"
+local function scalar_ctype(pri)
+	return PRI_CT[pri]
+end
+
+---- Vectors -------------------------------------------------------------------
+
+local VEC_CTYPES = {}
+
+local function puttab(buf, tab)
+	buf:put("[")
+	for i=1, #tab do
+		local v = tab[i]
+		buf:put(" ")
+		if type(v) == "table" then
+			puttab(buf, v)
+		else
+			buf:put(v)
+		end
+	end
+	buf:put(" ]")
+end
+
+local function vec_totab(vec)
+	local t = table.new(vec.n, 0)
+	for i=0, vec.n-1 do
+		t[i] = vec.v[i]
+	end
+	return t
+end
+
+local function vec__tostring(vec)
+	local buf = buffer.new()
+	puttab(buf, vec_totab(vec))
+	return tostring(buf)
+end
+
+local vec_mt = {
+	__index = function(self, i) return self.v[i] end,
+	__newindex = function(self, i, v) self.v[i] = v end,
+	__len = function(self) return self.n end,
+	__ipairs = function(self) return array_inext, self, -1 end,
+	__tostring = vec__tostring
+}
+
+local function vector_ctype(e)
+	e = ffi.typeof(e)
+	local ctid = tonumber(e)
+	local ct = VEC_CTYPES[ctid]
+	if ct then return ct end
+	ct = ffi.metatype(ffi.typeof("struct { $ *v; int32_t data; }", e), vec_mt)
+	VEC_CTYPES[ctid] = ct
+	return ct
+end
+
+---- Tensors -------------------------------------------------------------------
 
 -- ctid -> {e,n}
 local METADATA = {}
@@ -112,20 +171,6 @@ local function makeshape(n)
 	return load(buf)()
 end
 
-local function puttab(buf, tab)
-	buf:put("[")
-	for i=1, #tab do
-		local v = tab[i]
-		buf:put(" ")
-		if type(v) == "table" then
-			puttab(buf, v)
-		else
-			buf:put(v)
-		end
-	end
-	buf:put(" ]")
-end
-
 local function tensor__tostring(tensor)
 	local buf = buffer.new()
 	puttab(buf, tensor:totable())
@@ -150,14 +195,6 @@ local function ctkey(e, n)
 	return bit.lshift(tonumber(e), 8) + n
 end
 
-local function scalar_ctype(pri)
-	return PRI_CT[pri]
-end
-
-local function vector_ctype(e)
-	error("TODO")
-end
-
 -- struct layout here must match query memory layout.
 local function tensor_ctype(e, n)
 	e = ffi.typeof(e)
@@ -174,6 +211,8 @@ local function tensor_ctype(e, n)
 	CTYPES[ctk] = ct
 	return ffi.metatype(ct, newmetatype(e, n))
 end
+
+--------------------------------------------------------------------------------
 
 return {
 	scalar_ctype = scalar_ctype,

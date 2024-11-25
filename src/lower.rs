@@ -18,7 +18,7 @@ use crate::intrinsics::Intrinsic;
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::Primitive;
@@ -1151,7 +1151,8 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(&LOAD { ref dims, .. }) => emitvalues(lcx, ctr, dims),
+        ObjectRef::LOAD(LOAD { shape, .. }) | ObjectRef::NEW(NEW { shape, .. })
+            => emitvalues(lcx, ctr, shape),
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(&CALLN { func, ref args, .. }) => {
@@ -1247,6 +1248,26 @@ fn emitfwdvget(lcx: &mut Lcx, vget: &VGET) -> IndexOption<InsId> {
     Some(base).into()
 }
 
+fn emitnew(lcx: &mut Lcx, ctr: &mut InsId, new: &NEW) -> InsId {
+    debug_assert!(lcx.objs[new.ann].op == Obj::TTEN);
+    let shape = emitvalues(lcx, ctr, &new.shape);
+    let len = emitshapelen(&lcx.data.func, shape, new.shape.len());
+    let base = lcx.tmp.end();
+    let deco = decomposition(&lcx.objs, lcx.objs[new.ann.cast::<TTEN>()].elem, &mut lcx.tmp);
+    let ds = deco.len();
+    let out = reserve(&lcx.data.func, deco.len() + new.shape.len());
+    for (i,&ty) in deco.iter().enumerate() {
+        let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
+        let num = lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, size));
+        lcx.data.func.code.set(out + i as isize, Ins::ALLOC(num, size));
+    }
+    lcx.tmp.truncate(base);
+    for i in 0..0+new.shape.len() {
+        lcx.data.func.code.set(out + (ds+i) as isize, Ins::MOV(IRT_IDX, shape + i as isize));
+    }
+    out
+}
+
 fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
     let objs = Access::borrow(&lcx.objs);
     let ann = objs[expr].ann;
@@ -1272,8 +1293,8 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                     },
                     ObjectRef::VGET(o) => emitvget1(lcx, ctr, o),
                     ObjectRef::IDX(_) => todo!(),
-                    ObjectRef::LOAD(&LOAD { ann, addr, ref dims, .. }) => {
-                        debug_assert!(dims.is_empty());
+                    ObjectRef::LOAD(&LOAD { ann, addr, ref shape, .. }) => {
+                        debug_assert!(shape.is_empty());
                         debug_assert!(lcx.objs[ann].op == Obj::TPRI);
                         let addr = emitvalue(lcx, ctr, addr);
                         lcx.data.func.code.push(Ins::LOAD(ty, addr))
@@ -1291,6 +1312,9 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                     // in memory.
                     return emitvalues(lcx, ctr, cast_args_raw(
                         &objs.get_raw(expr.erase())[obj_index_of!(LOAD,addr)..]));
+                }
+                if let ObjectRef::NEW(new) = o {
+                    return emitnew(lcx, ctr, new);
                 }
                 if let ObjectRef::VGET(vget) = o {
                     // special case: scalar load of a vector variable is already materialized.
@@ -1330,7 +1354,7 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(&LOAD { ann, addr, ref dims, .. }) => {
+        ObjectRef::LOAD(&LOAD { ann, addr, shape: ref dims, .. }) => {
             debug_assert!(lcx.objs[ann].op == Obj::TTEN);
             debug_assert!(lcx.objs[lcx.objs[ann.cast::<TTEN>()].elem].op == Obj::TPRI);
             let addr = emitvalue(lcx, &mut loop_.head, addr);
@@ -1446,10 +1470,11 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, fail: InsId) {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(&LOAD { addr, ref dims, .. }) => {
+        ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
             emitcheck(lcx, ctr, addr, fail);
-            emitcheckall(lcx, ctr, dims, fail);
+            emitcheckall(lcx, ctr, shape, fail);
         },
+        ObjectRef::NEW(NEW { shape, .. }) => emitcheckall(lcx, ctr, shape, fail),
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(CALLN { args, .. }) => emitcheckall(lcx, ctr, args, fail),
