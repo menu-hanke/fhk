@@ -1,22 +1,13 @@
 //! Bump allocator.
 
-// Q: why not use one of the 294 thousand existing arena/bump crates?
-// A: none of them (afaik) have all of the following in one lib:
-//    * support mixed types, including slices and trailing VLAs
-//    * support both static and dynamic alignment
-//    * 32-bit plain integer pointers into one flat array
-//    * no lifetimes (on pointers)
-//    * no refcell/freelist/atomics etc overhead
-// iow a special purpose data structure works better here than a general purpose one (as is
-// typical).
-
-use core::cmp::Ordering;
+use core::alloc::Layout;
+use core::any::type_name;
+use core::cmp::{max, Ordering};
+use core::fmt::Debug;
 use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut, Range, RangeFrom};
+use core::ops::{Deref, Range, RangeFrom};
 use core::ptr::NonNull;
-
-use alloc::alloc::Layout;
 
 const MAX_ALIGN: usize = 16;
 
@@ -44,50 +35,20 @@ pub struct BumpPtr([u8]);
 #[repr(transparent)]
 pub struct BumpRef<T: ?Sized>(u32, PhantomData<T>);
 
-// #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-// #[repr(C)]
-// struct BumpSliceRaw { ptr: u32, len: u32 }
-//
-// // "fat pointer" with length (multiples of *alignments*, not elements).
-// // this is defined in a funny way (with the BumpSliceRaw struct) because it must be
-// // repr(transparent) to implement the zerocopy traits, but it also should be aligned to 4 (and not
-// // 8, like if it was defined with a single u64).
-// #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-// #[repr(transparent)]
-// pub struct BumpSlice<T>(BumpSliceRaw, PhantomData<T>);
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+pub struct BumpRefOption<T: ?Sized> { pub raw: BumpRef<T> }
 
-pub unsafe trait Write {
-    fn write(&self, bump: &mut Bump);
-}
-
-pub unsafe trait Read {
-    fn read(base: *const u8, ptr: usize, len: usize) -> *const Self;
-}
-
-// NOTE: this is *not* the alignment of the type itself; it is the alignment the type requires
-// for writing/reading. in particular, types that implement Write but not Read may have
-// Alignment::ALIGN < align_of::<Self>()    (see obj.rs and trailing &[slice])
+// safety: must have T::ALIGN >= align_of_val(t)
 pub unsafe trait Aligned {
     const ALIGN: usize;
 }
 
-// the idea here is that these are equivalent to zerocopy::Intobytes+zerocopy::Immutable
-// and zerocopy::FromBytes respectively, but they can be implemented manually where zerocopy's
-// analysis fails. ideally these wouldn't be needed if zerocopy's analysis was better.
-// (the main problems are slices/DSTs and generics)
-pub unsafe trait WriteBytes {}
-pub unsafe trait ReadBytes {}
-unsafe impl<T: ?Sized + zerocopy::IntoBytes + zerocopy::Immutable> WriteBytes for T {}
-unsafe impl<T: ?Sized + zerocopy::FromBytes> ReadBytes for T {}
-
-// do *not* auto implement for all T.
-// write-only types should explicitly set their required alignments, because it's probably
-// something else than the type's alignment.
-unsafe impl<T: ReadBytes> Aligned for T {
+unsafe impl<T> Aligned for T {
     const ALIGN: usize = align_of::<T>();
 }
 
-unsafe impl<T: ReadBytes> Aligned for [T] {
+unsafe impl<T> Aligned for [T] {
     const ALIGN: usize = align_of::<T>();
 }
 
@@ -95,32 +56,40 @@ unsafe impl Aligned for str {
     const ALIGN: usize = 1;
 }
 
-pub fn as_bytes<T: ?Sized + WriteBytes>(value: &T) -> &[u8] {
-    unsafe {
-        core::slice::from_raw_parts(
-            value as *const T as *const u8,
-            size_of_val(value)
-        )
+// safety: type must have no padding and it must have the following layout:
+//   struct T {
+//      head: T::Head,
+//      tail: [T::Item]
+//   }
+pub unsafe trait PackedSliceDst {
+    type Head;
+    type Item;
+    fn ptr_from_raw_parts(addr: *const Self::Head, len: usize) -> *const Self;
+}
+
+fn size_of_dst<T>(len: usize) -> usize
+    where T: ?Sized + PackedSliceDst
+{
+    size_of::<T::Head>() + len*size_of::<T::Item>()
+}
+
+unsafe impl<T> PackedSliceDst for [T] {
+    type Head = ();
+    type Item = T;
+    fn ptr_from_raw_parts(addr: *const Self::Head, len: usize) -> *const Self {
+        core::ptr::slice_from_raw_parts(addr.cast(), len)
     }
 }
 
-unsafe impl<T: ?Sized + WriteBytes> Write for T {
-    fn write(&self, bump: &mut Bump) {
-        // TODO: special case for 1, 2, 4, 8 here.
-        // compiler doesn't know bump is aligned.
-        bump.push_slice(as_bytes(self))
-    }
-}
+// same meaning as zerocopy traits but can be manually implemented when zerocopy's analysis fails.
+pub unsafe trait FromBytes {}
+pub unsafe trait IntoBytes {}
+pub unsafe trait Immutable {}
+unsafe impl<T> FromBytes for T where T: ?Sized + zerocopy::FromBytes {}
+unsafe impl<T> IntoBytes for T where T: ?Sized + zerocopy::IntoBytes {}
+unsafe impl<T> Immutable for T where T: ?Sized + zerocopy::Immutable {}
 
-unsafe impl<T: ReadBytes> Read for T {
-    fn read(base: *const u8, ptr: usize, len: usize) -> *const Self {
-        if ptr + size_of::<T>() <= len {
-            unsafe { base.add(ptr) }.cast()
-        } else {
-            core::ptr::null()
-        }
-    }
-}
+/* ---- Bump references ----------------------------------------------------- */
 
 impl<T: ?Sized> BumpRef<T> {
 
@@ -145,7 +114,7 @@ impl<T: ?Sized> BumpRef<T> {
 impl<T: Aligned> BumpRef<T> {
 
     pub fn size_index(self) -> usize {
-        self.align_index() * size_of::<T>() / T::ALIGN
+        self.align_index() * T::ALIGN / size_of::<T>()
     }
 
     pub fn add_size(self, offset: isize) -> Self {
@@ -159,6 +128,10 @@ impl<T: ?Sized + Aligned> BumpRef<T> {
     pub fn cast<U: ?Sized + Aligned>(self) -> BumpRef<U> {
         debug_assert!(self.0 * T::ALIGN as u32 % U::ALIGN as u32 == 0);
         BumpRef(self.0 * T::ALIGN as u32 / U::ALIGN as u32, PhantomData)
+    }
+
+    pub fn cast_up<U: ?Sized + Aligned>(self) -> BumpRef<U> {
+        BumpRef((self.0 * T::ALIGN as u32 + U::ALIGN as u32 - 1) / U::ALIGN as u32, PhantomData)
     }
 
     pub fn from_offset(ofs: usize) -> Self {
@@ -205,14 +178,66 @@ impl<T: ?Sized> Hash for BumpRef<T> {
     }
 }
 
-// Q: why is this needed?
-// A: if T has too high alignment, then we can't guarantee that base+ptr stays aligned
-//    after a realloc (or if the pointer is used with the wrong Bump).
-// this is why *reads* must ensure T has low enough alignment. writes don't need to care,
-// as the pointer is aligned just before the write.
-fn check_alignment<T: ?Sized + Aligned>() {
-    const { assert!(T::ALIGN <= MAX_ALIGN) }
+impl<T: ?Sized> Debug for BumpRef<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "BumpRef<{}>({})", type_name::<T>(), self.0)
+    }
 }
+
+impl<T: ?Sized> BumpRefOption<T> {
+
+    pub const RAW_NONE: BumpRef<T> = zerocopy::transmute!(!0);
+
+    pub fn unpack(self) -> Option<BumpRef<T>> {
+        self.into()
+    }
+
+}
+
+impl<T: ?Sized> From<Option<BumpRef<T>>> for BumpRefOption<T> {
+
+    fn from(value: Option<BumpRef<T>>) -> Self {
+        BumpRefOption { raw: value.unwrap_or(Self::RAW_NONE) }
+    }
+
+}
+
+impl<T: ?Sized> From<BumpRefOption<T>> for Option<BumpRef<T>> {
+
+    fn from(value: BumpRefOption<T>) -> Self {
+        if value.raw == BumpRefOption::RAW_NONE {
+            None
+        } else {
+            Some(value.raw)
+        }
+    }
+
+}
+
+impl<T: ?Sized> Default for BumpRefOption<T> {
+    fn default() -> Self {
+        None.into()
+    }
+}
+
+impl<T: ?Sized> Clone for BumpRefOption<T> {
+    fn clone(&self) -> Self {
+        BumpRefOption { raw: self.raw }
+    }
+}
+
+impl<T: ?Sized> Copy for BumpRefOption<T> {}
+
+impl<T: ?Sized> PartialEq for BumpRefOption<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<T: ?Sized> Eq for BumpRefOption<T> {}
+
+
+/* ---- Bump management ----------------------------------------------------- */
 
 impl<W> Bump<W> {
 
@@ -225,11 +250,38 @@ impl<W> Bump<W> {
         }
     }
 
+}
+
+impl<W> Default for Bump<W> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/* ---- Writing values ------------------------------------------------------ */
+
+// Q: why is this needed?
+// A: if T has too high alignment, then we can't guarantee that base+ptr stays aligned
+//    after a realloc (or if the pointer is used with the wrong Bump).
+// this is why *reads* must ensure T has low enough alignment. writes don't need to care,
+// as the pointer is aligned just before the write.
+fn assert_type_alignment<T: ?Sized + Aligned>() {
+    const { assert!(T::ALIGN <= MAX_ALIGN) }
+}
+
+impl<W> Bump<W> {
+
+    pub fn align(&mut self, align: usize) {
+        // note: don't need to grow here even if len goes out of bounds,
+        // since all writes check for grow anyway.
+        self.len = (self.len + align as u32 - 1) & !(align as u32 - 1);
+    }
+
     #[cold]
-    fn grow(&mut self) {
+    fn grow_cap(&mut self, need: u32) {
         let mut cap = self.cap;
         if cap == 0 { cap = 64; }
-        while cap < self.len { cap *= 2 }
+        while cap < need { cap *= 2 }
         let ptr = match self.cap {
             0 => unsafe {
                 alloc::alloc::alloc(Layout::from_size_align_unchecked(cap as _, MAX_ALIGN))
@@ -242,95 +294,134 @@ impl<W> Bump<W> {
                 )
             }
         };
+        let ptr = NonNull::new(ptr).unwrap();
+        unsafe {
+            core::ptr::write_bytes(ptr.as_ptr().add(self.cap as _), 0, (cap - self.cap) as _);
+        }
+        self.ptr = ptr;
         self.cap = cap;
-        self.ptr = NonNull::new(ptr).unwrap();
     }
 
-    fn checksize(&mut self) {
-        if self.len > self.cap {
-            self.grow();
-        }
-    }
-
-    pub fn align(&mut self, align: u32) {
-        let newlen = (self.len + align - 1) & !(align - 1);
-        if newlen > self.len {
-            self.len = newlen;
-            self.checksize();
-            for i in self.len..newlen {
-                unsafe { *self.ptr.as_ptr().add(i as _) = 0 }
-            }
-        }
+    #[cold]
+    fn grow(&mut self) {
+        self.grow_cap(self.len)
     }
 
 }
 
 impl<W: Aligned> Bump<W> {
 
-    pub fn push<T>(&mut self, value: &T) -> BumpRef<T>
-        where T: ?Sized + Write + Aligned
+    fn reserve_aligned<T>(&mut self, num_bytes: u32) -> u32
+        where T: ?Sized + Aligned
     {
+        assert_type_alignment::<T>();
         if T::ALIGN > W::ALIGN {
-            self.align(T::ALIGN as _);
+            self.align(T::ALIGN);
         }
-        let ptr = self.len / T::ALIGN as u32;
-        value.write(unsafe { core::mem::transmute(&mut *self) });
+        let ofs = self.len;
+        self.len += num_bytes;
         if T::ALIGN < W::ALIGN {
-            self.align(W::ALIGN as _);
+            self.align(W::ALIGN);
         }
-        BumpRef(ptr, PhantomData)
+        if self.len > self.cap {
+            self.grow();
+        }
+        ofs
     }
 
-    pub fn push_zeroed_slice<T>(&mut self, len: usize) -> (BumpRef<T>, &mut [T])
-        where T: ReadBytes + WriteBytes
+    pub fn reserve<T>(&mut self) -> (BumpRef<T>, &mut T)
+        where T: FromBytes + IntoBytes
     {
-        let len0 = self.len;
-        if T::ALIGN > W::ALIGN {
-            // don't call align() here, include it in the padding
-            self.len = (self.len + T::ALIGN as u32 - 1) & !(T::ALIGN as u32 - 1);
-        }
-        let start = self.len;
-        self.len += (len*size_of::<T>()) as u32;
-        self.checksize();
-        unsafe {
-            // this must also zero padding bytes since someone could read them
-            core::ptr::write_bytes(
-                self.ptr.as_ptr().add(len0 as _),
-                0,
-                (self.len - len0) as _
-            );
-        }
-        let ptr = BumpRef(start/T::ALIGN as u32, PhantomData);
-        let ret = unsafe {
-            // this must start from `start`, not `len0` which is unaligned
-            core::slice::from_raw_parts_mut(
-                self.ptr.as_ptr().add(start as _).cast(),
-                len
-            )
-        };
-        (ptr, ret)
+        let ptr = self.reserve_aligned::<T>(size_of::<T>() as _);
+        let r = unsafe { &mut *self.ptr.as_ptr().add(ptr as _).cast() };
+        (BumpRef(ptr / T::ALIGN as u32, PhantomData), r)
     }
 
-    pub fn next<T: ?Sized + Aligned>(&self) -> BumpRef<T> {
-        let mut ptr = self.len;
-        if T::ALIGN > W::ALIGN {
-            ptr = (ptr + T::ALIGN as u32 - 1) & !(T::ALIGN as u32 - 1);
+    pub fn push<T>(&mut self, value: T) -> BumpRef<T>
+        where T: FromBytes + IntoBytes
+    {
+        let (ptr, r) = self.reserve();
+        *r = value;
+        ptr
+    }
+
+    pub fn reserve_dst<T>(&mut self, len: usize) -> (BumpRef<T>, &mut T)
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: FromBytes + IntoBytes,
+              T::Item: FromBytes + IntoBytes
+    {
+        let ptr = self.reserve_aligned::<T>(size_of_dst::<T>(len) as u32);
+        let addr = unsafe { self.ptr.as_ptr().add(ptr as _) as *const T::Head };
+        let r = T::ptr_from_raw_parts(addr, len) as *mut T;
+        let r = unsafe { &mut *r };
+        (BumpRef(ptr / T::ALIGN as u32, PhantomData), r)
+    }
+
+    pub fn write<T>(&mut self, value: &T) -> BumpRef<T>
+        where T: ?Sized + Aligned + IntoBytes
+    {
+        let ptr = self.reserve_aligned::<T>(size_of_val(value) as _);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                value as *const T as *const u8,
+                self.ptr.as_ptr().add(ptr as _),
+                size_of_val(value)
+            );
         }
         BumpRef(ptr/T::ALIGN as u32, PhantomData)
     }
 
-    pub fn end(&self) -> BumpRef<W> {
-        self.next()
+    pub fn write_range<T>(&mut self, range: Range<BumpRef<T>>) -> BumpRef<T>
+        where T: FromBytes + IntoBytes
+    {
+        todo!()
     }
 
-    pub fn truncate(&mut self, end: BumpRef<W>) {
-        let len = end.offset() as u32;
-        assert!(len <= self.len);
+    pub fn extend<I>(&mut self, iter: I) -> BumpRef<I::Item>
+        where I: IntoIterator,
+              I::Item: Aligned + IntoBytes
+    {
+        if I::Item::ALIGN > W::ALIGN {
+            self.align(I::Item::ALIGN);
+        }
+        let iter = iter.into_iter();
+        let (hint, _) = iter.size_hint();
+        if self.len + hint as u32 > self.cap {
+            self.grow_cap(self.len + hint as u32);
+        }
+        let ofs = self.len;
+        let mut len = ofs;
+        for item in iter {
+            let p = len;
+            len += size_of::<I::Item>() as u32;
+            if len > self.cap {
+                self.grow_cap(len);
+            }
+            unsafe {
+                *self.ptr.as_ptr().add(p as _).cast() = item;
+            }
+        }
         self.len = len;
+        if I::Item::ALIGN < W::ALIGN {
+            self.align(W::ALIGN);
+        }
+        BumpRef(ofs / I::Item::ALIGN as u32, PhantomData)
+    }
+
+    pub fn extend_write<'a,T,I>(&mut self, iter: I) -> BumpRef<T>
+        where I: IntoIterator<Item=&'a T>,
+              T: 'a + ?Sized + Aligned + IntoBytes + Immutable
+    {
+        todo!()
+    }
+
+    pub fn end(&self) -> BumpRef<W> {
+        BumpRef(self.len / W::ALIGN as u32, PhantomData)
     }
 
 }
 
+// these functions require bump to be unaligned because they may lower alignment
 impl Bump {
 
     pub fn align_for<T>(&mut self) -> &mut Bump<T> {
@@ -338,159 +429,189 @@ impl Bump {
         unsafe { core::mem::transmute(self) }
     }
 
-    // this could `data: &[W]`?
-    pub fn push_slice(&mut self, data: &[u8]) {
-        let ofs = self.len;
-        self.len = ofs + data.len() as u32;
-        self.checksize();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                self.ptr.as_ptr().add(ofs as _),
-                data.len()
-            )
-        }
+    pub fn truncate<T: ?Sized + Aligned>(&mut self, end: BumpRef<T>) {
+        let len = end.offset() as u32;
+        assert!(len <= self.len);
+        self.len = len;
     }
 
-    // this could be `range: Range<BumpRef<T>>`?
-    pub fn push_range(&mut self, range: Range<usize>) {
-        todo!()
-    }
-
-}
-
-impl BumpPtr {
-
-    pub fn get<T>(&self, ptr: BumpRef<T>) -> &T
-        where T: ?Sized + Read + Aligned
-    {
-        check_alignment::<T>();
-        debug_assert!((self.0.as_ptr() as usize + ptr.offset()) % T::ALIGN == 0);
-        let p = T::read(self.0.as_ptr(), ptr.offset(), self.0.len());
-        assert!(!p.is_null());
-        unsafe { &*p }
-    }
-
-    pub fn get_mut<T>(&mut self, ptr: BumpRef<T>) -> &mut T
-        where T: ?Sized + Read + Write + Aligned
-    {
-        check_alignment::<T>();
-        debug_assert!((self.0.as_ptr() as usize + ptr.offset()) % T::ALIGN == 0);
-        let p = T::read(self.0.as_mut_ptr(), ptr.offset(), self.0.len()) as *mut T;
-        assert!(!p.is_null());
-        unsafe { &mut *p }
-    }
-
-    pub fn as_slice<T>(&self) -> &[T]
-        where T: ReadBytes
-    {
-        check_alignment::<T>();
-        unsafe {
-            core::slice::from_raw_parts(
-                self.0.as_ptr().cast(),
-                self.0.len() / size_of::<T>()
-            )
-        }
-    }
-
-    pub fn as_mut_slice<T>(&mut self) -> &mut [T]
-        where T: ReadBytes + WriteBytes
-    {
-        check_alignment::<T>();
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                self.0.as_mut_ptr().cast(),
-                self.0.len() / size_of::<T>()
-            )
-        }
-    }
-
-    // safety: check alignment and length
-    unsafe fn from_slice_unchecked(data: &[u8]) -> &Self {
-        core::mem::transmute(data)
-    }
-
-    // safety: check alignment and length
-    unsafe fn from_mut_slice_unchecked(data: &mut [u8]) -> &mut Self {
-        core::mem::transmute(data)
-    }
-
-    pub fn empty() -> &'static Self {
-        unsafe {
-            Self::from_slice_unchecked(core::slice::from_raw_parts(MAX_ALIGN as *const u8, 0))
-        }
-    }
-
-}
-
-impl<W> Default for Bump<W> {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl<W: Aligned> core::fmt::Write for Bump<W> {
 
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.push(s);
+        self.write(s);
         Ok(())
     }
 
 }
 
-impl<W> Drop for Bump<W> {
-    fn drop(&mut self) {
-        if self.cap > 0 {
-            unsafe {
-                alloc::alloc::dealloc(
-                    self.ptr.as_ptr(),
-                    Layout::from_size_align_unchecked(self.cap as _, MAX_ALIGN)
-                )
-            }
-        }
+/* ---- Reading values ------------------------------------------------------ */
+
+pub trait Get {
+    fn get(bump: &BumpPtr, ptr: BumpRef<Self>) -> &Self;
+}
+
+pub trait GetMut {
+    fn get_mut(bump: &mut BumpPtr, ptr: BumpRef<Self>) -> &mut Self;
+}
+
+impl<T> Get for T
+    where T: FromBytes + Immutable
+{
+    fn get(BumpPtr(buf): &BumpPtr, ptr: BumpRef<Self>) -> &Self {
+        let ofs = ptr.offset();
+        assert!(ofs + size_of::<T>() <= buf.len());
+        unsafe { &*buf.as_ptr().add(ofs).cast() }
     }
 }
 
-impl<T: ?Sized + Read + Aligned> core::ops::Index<BumpRef<T>> for BumpPtr {
+impl<T> GetMut for T
+    where T: FromBytes + IntoBytes
+{
+    fn get_mut(BumpPtr(buf): &mut BumpPtr, ptr: BumpRef<Self>) -> &mut Self {
+        let ofs = ptr.offset();
+        assert!(ofs + size_of::<T>() <= buf.len());
+        unsafe { &mut *buf.as_mut_ptr().add(ofs).cast() }
+    }
+}
+
+unsafe fn transmute_slice<T>(mem: &[u8]) -> &[T] {
+    core::slice::from_raw_parts(mem.as_ptr().cast(), mem.len() / size_of::<T>())
+}
+
+unsafe fn transmute_slice_mut<T>(mem: &mut [u8]) -> &mut [T] {
+    core::slice::from_raw_parts_mut(mem.as_mut_ptr().cast(), mem.len() / size_of::<T>())
+}
+
+impl BumpPtr {
+
+    pub fn get<T>(&self, ptr: BumpRef<T>) -> &T
+        where T: ?Sized + Get
+    {
+        T::get(self, ptr)
+    }
+
+    pub fn get_mut<T>(&mut self, ptr: BumpRef<T>) -> &mut T
+        where T: ?Sized + GetMut
+    {
+        T::get_mut(self, ptr)
+    }
+
+    pub fn get_dst<T>(&self, ptr: BumpRef<T>, num: usize) -> &T
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: FromBytes + Immutable,
+              T::Item: FromBytes + Immutable
+    {
+        let ofs = ptr.offset();
+        let buf = &self.0;
+        assert!(ofs + size_of_dst::<T>(num) <= buf.len());
+        let ptr = T::ptr_from_raw_parts(unsafe { buf.as_ptr().add(ofs).cast() }, num);
+        unsafe { &*ptr }
+    }
+
+    pub fn get_dst_mut<T>(&mut self, ptr: BumpRef<T>, num: usize) -> &mut T
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: FromBytes + IntoBytes,
+              T::Item: FromBytes + IntoBytes
+    {
+        let ofs = ptr.offset();
+        let buf = &mut self.0;
+        assert!(ofs + size_of_dst::<T>(num) <= buf.len());
+        let ptr = T::ptr_from_raw_parts(unsafe { buf.as_mut_ptr().add(ofs) as _ }, num) as *mut _;
+        unsafe { &mut *ptr }
+    }
+
+    pub fn as_slice<T>(&self) -> &[T]
+        where T: FromBytes + Immutable
+    {
+        assert_type_alignment::<T>();
+        unsafe { transmute_slice(&self.0) }
+    }
+
+    pub fn as_mut_slice<T>(&mut self) -> &mut [T]
+        where T: FromBytes + IntoBytes
+    {
+        assert_type_alignment::<T>();
+        unsafe { transmute_slice_mut(&mut self.0) }
+    }
+
+    // safety: alignment
+    unsafe fn from_slice_unchecked(mem: &[u8]) -> &Self {
+        debug_assert!(mem.as_ptr() as usize % MAX_ALIGN == 0);
+        core::mem::transmute(mem)
+    }
+
+    // safety: alignment
+    unsafe fn from_mut_slice_unchecked(mem: &mut [u8]) -> &mut Self {
+        debug_assert!(mem.as_ptr() as usize % MAX_ALIGN == 0);
+        core::mem::transmute(mem)
+    }
+
+}
+
+/* ---- Operators ----------------------------------------------------------- */
+
+impl<T> core::ops::Index<BumpRef<T>> for BumpPtr
+    where T: ?Sized + Get
+{
     type Output = T;
     fn index(&self, index: BumpRef<T>) -> &T {
         self.get(index)
     }
 }
 
-impl<T: ?Sized + Read + Write + Aligned> core::ops::IndexMut<BumpRef<T>> for BumpPtr {
+impl<T> core::ops::IndexMut<BumpRef<T>> for BumpPtr
+    where T: ?Sized + Get + GetMut
+{
     fn index_mut(&mut self, index: BumpRef<T>) -> &mut T {
         self.get_mut(index)
     }
 }
 
-impl<T: ReadBytes> core::ops::Index<Range<BumpRef<T>>> for BumpPtr {
+impl<T> core::ops::Index<Range<BumpRef<T>>> for BumpPtr
+    where T: FromBytes + Immutable
+{
     type Output = [T];
     fn index(&self, index: Range<BumpRef<T>>) -> &[T] {
-        &self.as_slice()[index.start.size_index()..index.end.size_index()]
+        assert_type_alignment::<T>();
+        let mem: &[u8] = &self.as_slice()[index.start.offset()..index.end.offset()];
+        unsafe { transmute_slice(mem) }
     }
 }
 
-impl<T: ReadBytes + WriteBytes> core::ops::IndexMut<Range<BumpRef<T>>> for BumpPtr {
+impl<T> core::ops::IndexMut<Range<BumpRef<T>>> for BumpPtr
+    where T: FromBytes + IntoBytes + Immutable
+{
     fn index_mut(&mut self, index: Range<BumpRef<T>>) -> &mut [T] {
-        &mut self.as_mut_slice()[index.start.size_index()..index.end.size_index()]
+        assert_type_alignment::<T>();
+        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.offset()..index.end.offset()];
+        unsafe { transmute_slice_mut(mem) }
     }
 }
 
-impl<T: ReadBytes> core::ops::Index<RangeFrom<BumpRef<T>>> for BumpPtr {
+impl<T> core::ops::Index<RangeFrom<BumpRef<T>>> for BumpPtr
+    where T: FromBytes + Immutable
+{
     type Output = [T];
     fn index(&self, index: RangeFrom<BumpRef<T>>) -> &[T] {
-        &self.as_slice()[index.start.size_index()..]
+        assert_type_alignment::<T>();
+        let mem: &[u8] = &self.as_slice()[index.start.offset()..];
+        unsafe { transmute_slice(mem) }
     }
 }
 
-impl<T: ReadBytes + WriteBytes> core::ops::IndexMut<RangeFrom<BumpRef<T>>> for BumpPtr {
+impl<T> core::ops::IndexMut<RangeFrom<BumpRef<T>>> for BumpPtr
+    where T: FromBytes + IntoBytes + Immutable
+{
     fn index_mut(&mut self, index: RangeFrom<BumpRef<T>>) -> &mut [T] {
-        &mut self.as_mut_slice()[index.start.size_index()..]
+        assert_type_alignment::<T>();
+        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.offset()..];
+        unsafe { transmute_slice_mut(mem) }
     }
 }
 
-impl<W> Deref for Bump<W> {
+impl<W> core::ops::Deref for Bump<W> {
     type Target = BumpPtr;
     fn deref(&self) -> &BumpPtr {
         unsafe {
@@ -501,7 +622,7 @@ impl<W> Deref for Bump<W> {
     }
 }
 
-impl<W> DerefMut for Bump<W> {
+impl<W> core::ops::DerefMut for Bump<W> {
     fn deref_mut(&mut self) -> &mut BumpPtr {
         unsafe {
             BumpPtr::from_mut_slice_unchecked(
@@ -511,37 +632,220 @@ impl<W> DerefMut for Bump<W> {
     }
 }
 
-// impl<W: ReadBytes> Deref for BumpPtr<W> {
-//     type Target = [W];
-//     fn deref(&self) -> &[W] {
-//         self.as_slice()
-//     }
-// }
-// 
-// impl<W: ReadBytes + WriteBytes> DerefMut for BumpPtr<W> {
-//     fn deref_mut(&mut self) -> &mut [W] {
-//         self.as_mut_slice()
-//     }
-// }
+/* ---- VLAs ---------------------------------------------------------------- */
 
-#[repr(C)]
-pub struct TrailingVLA<Body, Tail> {
-    body: Body,
-    tail: [Tail]
+macro_rules! vla_struct {
+    (
+        // this allows also non-vla structs to simplify some macros that use this macro.
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $($fvis:vis $field:ident : $type:ty),* $(,)?
+        }
+    ) => {
+        #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+        $(#[$meta])*
+        $vis struct $name<Tail: ?Sized=[$tailtype]> {
+            $($fvis $field : $type,)*
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $($fvis:vis $field:ident : $type:ty),* $(,)?
+        } $tvis:vis $tail:ident : [$tailtype:ty; |$lenx:ident| $len:expr]
+    ) => {
+
+        $(#[$meta])*
+        #[repr(C)]
+        $vis struct $name<Tail: ?Sized=[$tailtype]> {
+            $($fvis $field : $type,)*
+            $tvis $tail: Tail
+        }
+
+        impl $name {
+            fn __bump_vla_len(bump: &$crate::bump::BumpPtr, ptr: $crate::bump::BumpRef<Self>) -> usize {
+                // the purpose of Head and Head1 here is only to make sure they pass zerocopy's
+                // analysis. both are needed to ensure the dst cannot have padding for any
+                // slice length.
+                #[allow(dead_code)]
+                #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+                $(#[$meta])*
+                #[repr(C)]
+                struct Head { $($field:$type,)* $tail: [$tailtype; 0] }
+                #[allow(dead_code)]
+                #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+                $(#[$meta])*
+                #[repr(C)]
+                struct Head1 { $($field:$type,)* $tail: [$tailtype; 1] }
+                let $lenx = &bump[ptr.cast::<Head>()];
+                $len
+            }
+        }
+
+        unsafe impl $crate::bump::FromBytes for $name<[$tailtype]> {}
+        unsafe impl $crate::bump::IntoBytes for $name<[$tailtype]> {}
+        unsafe impl $crate::bump::Immutable for $name<[$tailtype]> {}
+        unsafe impl<const K: usize> $crate::bump::FromBytes for $name<[$tailtype; K]> {}
+        unsafe impl<const K: usize> $crate::bump::IntoBytes for $name<[$tailtype; K]> {}
+        unsafe impl<const K: usize> $crate::bump::Immutable for $name<[$tailtype; K]> {}
+
+        unsafe impl $crate::bump::PackedSliceDst for $name {
+            type Head = $name<[$tailtype; 0]>;
+            type Item = $tailtype;
+            fn ptr_from_raw_parts(addr: *const Self::Head, len: usize) -> *const Self {
+                core::ptr::slice_from_raw_parts(addr, len) as _
+            }
+        }
+
+        unsafe impl $crate::bump::Aligned for $name {
+            const ALIGN: usize = align_of::<$name<[$tailtype; 0]>>();
+        }
+
+        impl $crate::bump::Get for $name {
+            fn get(bump: &$crate::bump::BumpPtr, ptr: $crate::bump::BumpRef<Self>) -> &Self {
+                bump.get_dst(ptr, $name::__bump_vla_len(bump, ptr))
+            }
+        }
+
+        impl $crate::bump::GetMut for $name {
+            fn get_mut(bump: &mut $crate::bump::BumpPtr, ptr: $crate::bump::BumpRef<Self>) -> &mut Self {
+                bump.get_dst_mut(ptr, $name::__bump_vla_len(bump, ptr))
+            }
+        }
+
+    };
 }
 
-pub unsafe fn trailing_vla_ptr<Body, Tail>(
-    base: *const u8,
-    ptr: usize,
-    len: usize,
-    num: usize
-) -> *const TrailingVLA<Body, Tail> {
-    if ptr + size_of::<Body>() + num*size_of::<Tail>() <= len {
-        let vlabase = unsafe { base.add(ptr) };
-        // this is a hack to make it work on stable.
-        // replace with ptr::from_raw_parts when it stabilizes.
-        core::ptr::slice_from_raw_parts(vlabase.cast::<Tail>(), num) as *const _
-    } else {
-        (&[]) as *const [u8] as *const _
+use logos::Source;
+pub(crate) use vla_struct;
+
+/* ---- Containers ---------------------------------------------------------- */
+
+// note: the `*Raw` structs are a hack to work around the lack of generic support in zerocopy.
+
+#[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C)]
+struct BumpArrayRaw {
+    data: u32, // BumpRef<T>
+    len: u32
+}
+
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+pub struct BumpArray<T> {
+    raw: BumpArrayRaw,
+    _marker: PhantomData<T>
+}
+
+impl<T> Clone for BumpArray<T> {
+    fn clone(&self) -> Self {
+        BumpArray { raw: self.raw, _marker: PhantomData }
+    }
+}
+
+impl<T> Copy for BumpArray<T> {}
+
+#[derive(Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C)]
+struct BumpVecRaw {
+    data: BumpArrayRaw,
+    cap: u32
+}
+
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+pub struct BumpVec<T> {
+    raw: BumpVecRaw,
+    _marker: PhantomData<T>
+}
+
+impl<T> BumpArray<T> {
+
+    pub fn len(self) -> u32 {
+        self.raw.len
+    }
+
+    pub fn base(self) -> BumpRef<T> {
+        zerocopy::transmute!(self.raw.data)
+    }
+
+    pub fn as_slice<W>(self, bump: &Bump<W>) -> &[T]
+        where T: FromBytes + Immutable
+    {
+        bump.get_dst(self.base().cast(), self.len() as _)
+    }
+
+    pub fn as_mut_slice<W>(self, bump: &mut Bump<W>) -> &mut [T]
+        where T: FromBytes + IntoBytes + Immutable
+    {
+        bump.get_dst_mut(self.base().cast(), self.len() as _)
+    }
+
+}
+
+impl<T> BumpVec<T> {
+
+    #[cold]
+    fn grow<W>(&mut self, bump: &mut Bump<W>, need: u32)
+        where T: FromBytes + IntoBytes + Immutable
+    {
+        let mut cap = max(self.raw.cap, 8);
+        while cap < need {
+            cap *= 2;
+        }
+        let (newdata, _) = bump.reserve_dst::<[T]>(cap as _);
+        let have = self.len();
+        if have > 0 {
+            let (old, new) = bump.as_mut_slice::<u8>().split_at_mut(newdata.offset());
+            let base = self.base().offset();
+            let havebytes = have as usize * size_of::<T>();
+            new[..havebytes].copy_from_slice(&old[base..base+havebytes]);
+        }
+        self.raw.data.data = zerocopy::transmute!(newdata);
+        self.raw.cap = cap;
+    }
+
+    // pub fn reserve<'bump,W>(&mut self, bump: &'bump mut Bump<W>, num: usize) -> &'bump mut [T]
+    //     where T: FromBytes + IntoBytes + Immutable
+    // {
+    //     let idx = self.len();
+    //     if idx + num as u32 > self.raw.cap {
+    //         self.grow(bump, idx + num as u32);
+    //     }
+    //     self.raw.data.len = idx + num as u32;
+    //     let base = self.base().add_size(idx as _);
+    //     &mut bump[base..base.add_size(num as _)]
+    // }
+
+    pub fn push<W>(&mut self, bump: &mut Bump<W>, value: T)
+        where T: FromBytes + IntoBytes + Immutable
+    {
+        let idx = self.raw.data.len;
+        if idx >= self.raw.cap {
+            self.grow(bump, idx + 1);
+        }
+        self.raw.data.len = idx+1;
+        bump[self.base().add_size(idx as _)] = value;
+    }
+
+    pub fn truncate(&mut self, len: u32) {
+        self.raw.data.len = len;
+    }
+
+}
+
+impl<T> Default for BumpVec<T> {
+    fn default() -> Self {
+        Self { raw: Default::default(), _marker: PhantomData }
+    }
+}
+
+// do not implement DerefMut!
+// there's nothing useful you can do with a &mut BumpArray,
+// but you can misuse it by eg. swapping the data arrays of two bumpvecs
+impl<T> Deref for BumpVec<T> {
+    type Target = BumpArray<T>;
+    fn deref(&self) -> &BumpArray<T> {
+        zerocopy::transmute_ref!(&self.raw.data)
     }
 }

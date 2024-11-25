@@ -10,11 +10,12 @@ use core::str;
 use enumset::EnumSetType;
 use hashbrown::hash_table::{Entry, VacantEntry};
 use hashbrown::HashTable;
+use zerocopy::Unalign;
 
 use crate::bump::{self, Aligned, Bump, BumpRef};
-use crate::compile::{Ccx, Seq};
+use crate::compile::Ccx;
 use crate::hash::fxhash;
-use crate::intern::InternRef;
+use crate::intern::IRef;
 use crate::mcode::MCodeOffset;
 use crate::typing::Primitive;
 
@@ -71,14 +72,15 @@ impl ObjRef {
     // ORDER OBJ
     pub const NIL: ObjRef = zerocopy::transmute!(0);          // NIL
     pub const B1: ObjRef<TPRI> = zerocopy::transmute!(1);     // TPRI.B1
-    pub const FALSE: ObjRef<KINT> = zerocopy::transmute!(2);  // KINT B1 0
-    pub const TRUE: ObjRef<KINT> = zerocopy::transmute!(5);   // KINT B1 1
+    pub const PTR: ObjRef<TPRI> = zerocopy::transmute!(2);    // TPRI.PTR
+    pub const FALSE: ObjRef<KINT> = zerocopy::transmute!(3);  // KINT B1 0
+    pub const TRUE: ObjRef<KINT> = zerocopy::transmute!(6);   // KINT B1 1
                                                               // TUPLE NIL
-    pub const GLOBAL: ObjRef<TAB> = zerocopy::transmute!(10); // TAB GLOBAL []
+    pub const GLOBAL: ObjRef<TAB> = zerocopy::transmute!(11); // TAB GLOBAL []
 
 }
 
-impl<T: ?Sized + ObjType> ObjRef<T> {
+impl<T: ?Sized> ObjRef<T> {
 
     pub fn cast<U: ?Sized + ObjType>(self) -> ObjRef<U> {
         zerocopy::transmute!(self)
@@ -137,8 +139,11 @@ impl<'a> Iterator for OpFieldIter<'a> {
     }
 }
 
+// for define_ops macro:
+type Name = IRef<[u8]>;
+
 macro_rules! define_ops {
-    (@meta ($($buf:expr,)*) ) => { crate::concat::concat_slices!($($buf),*) };
+    (@meta ($($buf:expr,)*) ) => { crate::concat::concat_slices!(u8; $($buf),*) };
     (@meta ($($buf:expr,)*) , $($rest:tt)*) => {
         define_ops!(@meta ($($buf,)*) $($rest)*)
     };
@@ -158,8 +163,8 @@ macro_rules! define_ops {
     (@meta ($($buf:expr,)*) $name:ident : ObjRef $($rest:tt)*) => {
         define_ops!(@meta ($($buf,)*) @emit Ref $name @skip $name : ObjRef $($rest)*)
     };
-    (@meta ($($buf:expr,)*) $name:ident : InternRef<Seq> $($rest:tt)*) => {
-        define_ops!(@meta ($($buf,)*) @emit Name $name @skip $name : InternRef<Seq> $($rest)*)
+    (@meta ($($buf:expr,)*) $name:ident : Name $($rest:tt)*) => {
+        define_ops!(@meta ($($buf,)*) @emit Name $name @skip $name : Name $($rest)*)
     };
     (@meta ($($buf:expr,)*) $name:ident : $type:ty, $($rest:tt)*) => {
         define_ops!(@meta ($($buf,)*) @emit Lit $name $($rest)*)
@@ -175,12 +180,14 @@ macro_rules! define_ops {
         ($($def:ident=$defval:expr;)* @stop $($_:tt)*)
         $(,)* $($field:ident:$ty:ty $(,)+)*
     ) => {
+        #[allow(dead_code)]
         pub fn new($($field:$ty),*) -> Self {
             $name { $($def:$defval,)* $($field,)* }
         }
     };
     (@struct ($name:ident $($field:ident:$ty:ty),*;) ($data:ident $($_:tt)*)) => {
         // layout must match struct Obj
+        #[allow(dead_code)]
         #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
         #[repr(C,align(4))]
         pub struct $name {
@@ -194,49 +201,23 @@ macro_rules! define_ops {
     };
     (@struct ($name:ident $($field:ident:$ty:ty),*; $vla:ident:$vty:ty) ($data:ident $($_:tt)*)) => {
         // layout must match struct Obj
-        #[repr(C,align(4))]
-        pub struct $name<T: ?Sized=[$vty]> {
-            pub n: u8,
-            pub op: u8,
-            pub mark: u8,
-            pub $data: u8,
-            $(pub $field : $ty,)*
-            pub $vla: T
+        bump::vla_struct! {
+            #[allow(dead_code)]
+            #[repr(align(4))]
+            pub struct $name {
+                pub n: u8,
+                pub op: u8,
+                pub mark: u8,
+                pub $data: u8,
+                $(pub $field : $ty,)*
+            } pub $vla: [$vty; |x| x.n as usize - $name::FIXARGS]
         }
         impl $name {
             // note: includes the obj itself, too
             const FIXARGS: usize = size_of::<$name<[$vty; 0]>>()/size_of::<u32>();
         }
         unsafe impl<const K: usize> ObjType for $name<[$vty; K]> {}
-        unsafe impl<const K: usize> bump::WriteBytes for $name<[$vty; K]> {}
-        unsafe impl<const K: usize> bump::ReadBytes for $name<[$vty; K]> {}
-        unsafe impl Aligned for $name { const ALIGN: usize = 4; }
-        unsafe impl Aligned for $name<&[$vty]> { const ALIGN: usize = 4; }
         unsafe impl ObjType for $name {}
-        unsafe impl ObjType for $name<&[$vty]> {}
-        unsafe impl bump::WriteBytes for $name {}
-        unsafe impl bump::Read for $name {
-            fn read(base: *const u8, ptr: usize, len: usize) -> *const Self {
-                if ptr < len {
-                    let n = unsafe { *base.add(ptr) } as usize - Self::FIXARGS;
-                    let p = unsafe {
-                        bump::trailing_vla_ptr::<$name<[$vty; 0]>, $vty>(base, ptr, len, n)
-                    };
-                    p as _
-                } else {
-                    (&[]) as *const [u8] as *const _
-                }
-            }
-        }
-        unsafe impl bump::Write for $name<&[$vty]> {
-            fn write(&self, bump: &mut Bump) {
-                {
-                    let body = unsafe { (&*(self as *const Self as *const $name<[$vty; 0]>)) };
-                    body.write(bump);
-                }
-                self.$vla.write(bump);
-            }
-        }
     };
     (
         $(
@@ -261,9 +242,9 @@ macro_rules! define_ops {
             };
             pub const FIELDS: (&'static [u8], &'static [u16]) = {
                 $(
-                    const $operator: &'static [u8] = &define_ops!(@meta () $(.$data)? $($fields)*, $($vla:[$($vty)*])?);
+                    const $operator: &[u8] = &define_ops!(@meta () $(.$data)? $($fields)*, $($vla:[$($vty)*])?);
                 )*
-                const DESC: &'static [u8] = &$crate::concat::concat_slices!($($operator),*);
+                const DESC: &'static [u8] = &$crate::concat::concat_slices!(u8; $($operator),*);
                 const OFS: &'static [u16] = &{
                     let mut ofs = [$($operator.len() as u16,)* 0];
                     let mut i = 0;
@@ -281,16 +262,16 @@ macro_rules! define_ops {
         }
         $(
             define_ops!(@struct ($operator $($fields)*; $($vla:$($vty)*)?) ($($data)? data));
-            impl $(<$vla>)? $operator $(<$vla>)? {
+            impl $operator $(<[$($vty)*; 0]>)? {
                 define_ops!(
                     @new $operator
-                    (op=Operator::$operator as _; n=0; mark=0; $(@stop $data)? data=0; @stop)
+                    (op=Operator::$operator as _; n=0; mark=0; $($vla=[];)? $(@stop $data)? data=0; @stop)
                     $($data:u8,)?
                     $($fields)*,
-                    $($vla:$vla,)?
                 );
             }
         )*
+        #[allow(dead_code)]
         #[derive(Clone, Copy)]
         #[repr(C,u8)]
         pub enum ObjectRef<'a> {
@@ -319,10 +300,10 @@ macro_rules! define_ops {
 define_ops! {
     // named objects. name must be first. tab must be second for VAR and MOD.
     // ORDER NAMEDOBJ
-    VAR         { name: InternRef<Seq>, tab: ObjRef<TAB>, ann: ObjRef/*TY*/};
-    MOD         { name: InternRef<Seq>, tab: ObjRef<TAB>, guard: ObjRef<EXPR> } value: [ObjRef<VSET>];
-    TAB         { name: InternRef<Seq>, shape: ObjRef<TUPLE> };
-    FUNC        { name: InternRef<Seq>, value: ObjRef<EXPR> };
+    VAR         { name: Name, tab: ObjRef<TAB>, ann: ObjRef/*TY*/};
+    MOD         { name: Name, tab: ObjRef<TAB>, guard: ObjRef<EXPR> } value: [ObjRef<VSET>];
+    TAB         { name: Name, shape: ObjRef<TUPLE> };
+    FUNC        { name: Name, value: ObjRef<EXPR> };
     // non-named objects.
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
@@ -330,12 +311,14 @@ define_ops! {
     NIL         {};
     // types
     TPRI.ty     {};
-    TDIM.dim    {};
-    TPAR.idx    {};
-    TCON.con    {} args: [ObjRef/*TY*/];
-    // expressions. ann must be first. ORDER EXPR.
+    TTEN.dim    { elem: ObjRef/*TY*/ };
+    TTUP        {} elems: [ObjRef/*TY*/];
+    // (TFUNC for functions + generic type annotations TPAR/TCON etc)
+    // expressions. ann must be first.
     KINT        { ann: ObjRef/*TY*/, k: i32 };
-    KREF        { ann: ObjRef/*TY*/, k: BumpRef<[u8; 8]> /* -> ccx.constants */ };
+    KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
+    KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
+    KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
     DIM.axis    { ann: ObjRef/*TY*/ };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
@@ -346,7 +329,7 @@ define_ops! {
     FREF        { ann: ObjRef/*TY*/, func: ObjRef/*FUNC|FNI*/ };
     CALL        { ann: ObjRef/*TY*/, func: ObjRef<EXPR> } args: [ObjRef<EXPR>];
     CALLN.func  { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
-    CALLX.lang  { ann: ObjRef/*TY*/, func: u32 } args: [ObjRef<EXPR>];
+    CALLX.lang  { ann: ObjRef/*TY*/, func: u32 } inputs: [ObjRef<EXPR>];
 }
 
 define_ops!(@struct (EXPR ann:ObjRef;) (data));
@@ -377,7 +360,7 @@ impl Operator {
     }
 
     pub fn is_type_raw(op: u8) -> bool {
-        ((1 << Self::TPRI as u8) | (1 << Self::TPAR as u8) | (1 << Self::TCON as u8))
+        ((1 << Self::TPRI as u8) | (1 << Self::TTEN as u8) | (1 << Self::TTUP as u8))
             & (1 << op) != 0
     }
 
@@ -445,10 +428,16 @@ pub struct Objects {
     lookup: HashTable<ObjRef>
 }
 
-fn newobj<T: ?Sized+ObjType+bump::Write>(bump: &mut Bump<u32>, obj: &T) -> ObjRef<T> {
-    let idx = ObjRef { raw: bump.push(obj) };
-    bump[idx.erase().raw].n = (bump.end().align_index() - idx.raw.align_index()) as _;
-    idx
+fn fixupn(bump: &mut Bump<u32>, start: ObjRef) {
+    bump[start.raw].n = (bump.end().align_index() - start.raw.align_index()) as _;
+}
+
+fn pushobj<T>(bump: &mut Bump<u32>, obj: T) -> ObjRef<T>
+    where T: ObjType + bump::FromBytes + bump::IntoBytes
+{
+    let p = ObjRef { raw: bump.push(obj) };
+    fixupn(bump, p.erase());
+    p
 }
 
 fn checkvalidobj(o: Obj) {
@@ -458,8 +447,44 @@ fn checkvalidobj(o: Obj) {
 
 impl Objects {
 
-    pub fn push<T: ?Sized+ObjType+bump::Write>(&mut self, obj: &T) -> ObjRef<T> {
-        newobj(&mut self.bump, obj)
+    pub fn push<T>(&mut self, obj: T) -> ObjRef<T>
+        where T: ObjType + bump::FromBytes + bump::IntoBytes
+    {
+        pushobj(&mut self.bump, obj)
+    }
+
+    pub fn push_args<T>(&mut self, head: T::Head, items: &[T::Item]) -> ObjRef<T>
+        where T: ?Sized + ObjType + bump::PackedSliceDst,
+              T::Head: bump::FromBytes + bump::IntoBytes,
+              T::Item: zerocopy::FromBytes + zerocopy::IntoBytes
+    {
+        let p = ObjRef { raw: self.bump.push(head) };
+        self.bump.write(items);
+        fixupn(&mut self.bump, p.erase());
+        p.cast()
+    }
+
+    pub fn push_extend<T,I>(&mut self, head: T::Head, items: I) -> ObjRef<T>
+        where T: ?Sized + ObjType + bump::PackedSliceDst,
+              T::Head: bump::FromBytes + bump::IntoBytes,
+              T::Item: bump::FromBytes + bump::IntoBytes,
+              I: Iterator<Item=T::Item>
+    {
+        let p = ObjRef { raw: self.bump.push(head) };
+        self.bump.extend(items);
+        fixupn(&mut self.bump, p.erase());
+        p.cast()
+    }
+
+    pub fn push_reserve_dst<T>(&mut self, len: usize) -> (ObjRef<T>, &mut T)
+        where T: ?Sized + ObjType + Aligned + bump::PackedSliceDst,
+              T::Head: bump::FromBytes + bump::IntoBytes,
+              T::Item: bump::FromBytes + bump::IntoBytes
+    {
+        let (raw, ptr) = self.bump.reserve_dst(len);
+        let n = size_of_val(ptr) / T::ALIGN;
+        unsafe { (*(ptr as *mut T as *mut Obj)).n = n as _; }
+        (ObjRef { raw }, ptr)
     }
 
     pub fn get_raw(&self, idx: ObjRef) -> &[u32] {
@@ -500,32 +525,55 @@ impl Objects {
         use ObjectRef::*;
         // note: this only does types and expressions. add other objects if needed.
         match (self.get(a.erase()), self.get(b.erase())) {
-            (TPRI(a),  TPRI(b))  => a.ty == b.ty,
-            (TDIM(a),  TDIM(b))  => a.dim == b.dim,
-            (TPAR(a),  TPAR(b))  => a.idx == b.idx,
-            (TCON(a),  TCON(b))  => a.con == b.con && self.allequal(&a.args, &b.args),
-            (KINT(a),  KINT(b))  => a.k == b.k,
-            (KREF(a),  KREF(b))  => a.k == b.k,
-            (DIM(a),   DIM(b))   => a.axis == b.axis,
-            (TUPLE(a), TUPLE(b)) => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
-            (VGET(a),  VGET(b))  => a.var == b.var
+            (TPRI(a),  TPRI(b))   => a.ty == b.ty,
+            (TTEN(a),  TTEN(b))   => a.dim == b.dim && self.equal(a.elem, b.elem),
+            (TTUP(a),  TTUP(b))   => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
+            (KINT(a),  KINT(b))   => a.k == b.k,
+            (KINT64(a),KINT64(b)) => a.k == b.k,
+            (KFP64(a), KFP64(b))  => a.k == b.k,
+            (KSTR(a),  KSTR(b))   => a.k == b.k,
+            (DIM(a),   DIM(b))    => a.axis == b.axis,
+            (TUPLE(a), TUPLE(b))  => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
+            (VGET(a),  VGET(b))   => a.var == b.var
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
-            (CAT(a),   CAT(b))   => self.allequal(cast_args(&a.args), cast_args(&b.args)),
-            (IDX(a),   IDX(b))   => self.equal(a.value.erase(), b.value.erase())
+            (CAT(a),   CAT(b))    => self.allequal(cast_args(&a.args), cast_args(&b.args)),
+            (IDX(a),   IDX(b))    => self.equal(a.value.erase(), b.value.erase())
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
-            (LOAD(_),  LOAD(_))  => todo!(),
-            (GET(a),   GET(b))   => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
-            (FREF(_),  FREF(_))  => todo!(),
-            (CALL(_),  CALL(_))  => todo!(),
-            (CALLN(a), CALLN(b)) => a.func == b.func
+            (LOAD(_),  LOAD(_))   => todo!(),
+            (GET(a),   GET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
+            (FREF(_),  FREF(_))   => todo!(),
+            (CALL(_),  CALL(_))   => todo!(),
+            (CALLN(a), CALLN(b))  => a.func == b.func
                 && self.allequal(cast_args(&a.args), cast_args(&b.args)),
-            (CALLX(_), CALLX(_)) => todo!(),
+            (CALLX(_), CALLX(_))  => todo!(),
             _ => false
         }
     }
 
     pub fn allequal(&self, xs: &[ObjRef], ys: &[ObjRef]) -> bool {
         xs.len() == ys.len() && zip(xs.iter(), ys.iter()).all(|(&x, &y)| self.equal(x, y))
+    }
+
+    pub fn totype(&self, x: ObjRef) -> ObjRef {
+        let op = self[x].op;
+        if Operator::is_type_raw(op) {
+            x
+        } else if op == Obj::VAR {
+            self[x.cast::<VAR>()].ann
+        } else {
+            debug_assert!(Operator::is_expr_raw(op));
+            self[x.cast::<EXPR>()].ann
+        }
+    }
+
+    pub fn annotate(&mut self, idx: ObjRef<EXPR>, ann: ObjRef) {
+        if self[idx].ann.is_nil() {
+            self[idx].ann = ann;
+        } else {
+            // TODO: unify annotations. either do it right here, or leave a hint for type
+            // inference.
+            todo!()
+        }
     }
 
 }
@@ -567,9 +615,9 @@ impl Objects {
 
 }
 
-fn lookupkey(data: &[u32], idx: usize) -> (u32, InternRef<Seq>) {
+fn lookupkey(data: &[u32], idx: usize) -> (u32, IRef<[u8]>) {
     let obj: Obj = zerocopy::transmute!(data[idx]);
-    let name: InternRef<Seq> = zerocopy::transmute!(data[idx+1]);
+    let name: IRef<[u8]> = zerocopy::transmute!(data[idx+1]);
     let mut namespace = obj.op as u32;
     if Operator::has_name_and_tab_raw(obj.op) {
         namespace |= data[idx+2] << 3;
@@ -580,7 +628,7 @@ fn lookupkey(data: &[u32], idx: usize) -> (u32, InternRef<Seq>) {
 fn entry<'lookup, 'data>(
     lookup: &'lookup mut HashTable<ObjRef>,
     data: &'data [u32],
-    key: (u32, InternRef<Seq>)
+    key: (u32, IRef<[u8]>)
 ) -> Entry<'lookup, ObjRef> {
     lookup.entry(
         fxhash(key),
@@ -631,13 +679,13 @@ impl Objects {
 
     pub fn tab(
         &mut self,
-        name: InternRef<Seq>
+        name: IRef<[u8]>
     ) -> LookupEntry<'_, TAB, impl FnMut() -> ObjRef<TAB> + '_> {
         match entry(&mut self.lookup, self.bump.as_slice(), (Operator::TAB as _, name)) {
             Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
             Entry::Vacant(entry) => {
                 let bump = &mut self.bump;
-                let create = move || newobj(bump, &TAB::new(name, ObjRef::NIL.cast()));
+                let create = move || pushobj(bump, TAB::new(name, ObjRef::NIL.cast()));
                 LookupEntry::Vacant(VacantLookupEntry { entry, create })
             }
         }
@@ -646,7 +694,7 @@ impl Objects {
     pub fn var(
         &mut self,
         tab: ObjRef<TAB>,
-        name: InternRef<Seq>
+        name: IRef<[u8]>
     ) -> LookupEntry<'_, VAR, impl FnMut() -> ObjRef<VAR> + '_> {
         let raw: u32 = zerocopy::transmute!(tab);
         match entry(
@@ -657,7 +705,7 @@ impl Objects {
             Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
             Entry::Vacant(entry) => {
                 let bump = &mut self.bump;
-                let create = move || newobj(bump, &VAR::new(name, tab, ObjRef::NIL));
+                let create = move || pushobj(bump, VAR::new(name, tab, ObjRef::NIL));
                 LookupEntry::Vacant(VacantLookupEntry { entry, create })
             }
         }
@@ -665,7 +713,9 @@ impl Objects {
 
 }
 
-impl<T: ?Sized+ObjType+bump::Read> Index<ObjRef<T>> for Objects {
+impl<T> Index<ObjRef<T>> for Objects
+    where T: ?Sized + ObjType + bump::Get
+{
     type Output = T;
     fn index(&self, idx: ObjRef<T>) -> &T {
         checkvalidobj(self.bump[idx.erase().raw]);
@@ -673,7 +723,9 @@ impl<T: ?Sized+ObjType+bump::Read> Index<ObjRef<T>> for Objects {
     }
 }
 
-impl<T: ?Sized+ObjType+bump::Read+bump::Write> IndexMut<ObjRef<T>> for Objects {
+impl<T> IndexMut<ObjRef<T>> for Objects
+    where T: ?Sized + ObjType + bump::Get + bump::GetMut
+{
     fn index_mut(&mut self, idx: ObjRef<T>) -> &mut T {
         checkvalidobj(self.bump[idx.erase().raw]);
         &mut self.bump[idx.raw]
@@ -688,12 +740,19 @@ impl Default for Objects {
             lookup: Default::default()
         };
         // ORDER OBJ
-        objs.push(&NIL::new());
-        objs.push(&TPRI::new(Primitive::B1 as _));
-        objs.push(&KINT::new(ObjRef::B1.erase(), 0));
-        objs.push(&KINT::new(ObjRef::B1.erase(), 1));
-        let empty = objs.push(&TUPLE::new(ObjRef::NIL, []));
-        objs.push(&TAB::new(Ccx::SEQ_GLOBAL, empty.cast()));
+        let nil = objs.push(NIL::new());
+        let b1 = objs.push(TPRI::new(Primitive::B1 as _));
+        let ptr = objs.push(TPRI::new(Primitive::PTR as _));
+        let false_ = objs.push(KINT::new(ObjRef::B1.erase(), 0));
+        let true_ = objs.push(KINT::new(ObjRef::B1.erase(), 1));
+        let empty = objs.push(TUPLE::new(ObjRef::NIL));
+        let global = objs.push(TAB::new(Ccx::SEQ_GLOBAL, empty.cast()));
+        debug_assert!(nil == ObjRef::NIL.cast());
+        debug_assert!(b1 == ObjRef::B1);
+        debug_assert!(ptr == ObjRef::PTR);
+        debug_assert!(false_ == ObjRef::FALSE);
+        debug_assert!(true_ == ObjRef::TRUE);
+        debug_assert!(global == ObjRef::GLOBAL);
         objs.lookup.insert_unique(
             fxhash((Operator::TAB as u32, Ccx::SEQ_GLOBAL)),
             ObjRef::GLOBAL.erase(),

@@ -7,7 +7,7 @@ use core::ops::Range;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 
-use crate::bump::{as_bytes, Aligned, Bump, BumpRef, Read, ReadBytes, Write, WriteBytes};
+use crate::bump::{self, Aligned, Bump, BumpRef, PackedSliceDst};
 use crate::hash::fxhash;
 
 const PTR_BITS: usize = 27;
@@ -34,45 +34,45 @@ const PTR_BITS: usize = 27;
  */
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
-pub struct InternRef<T: ?Sized>(u32, PhantomData<T>);
+pub struct IRef<T: ?Sized>(u32, PhantomData<T>);
 
 pub struct Intern {
     bump: Bump<u8>,
-    tab: HashTable<InternRef<[u8]>>,
+    tab: HashTable<IRef<[u8]>>,
     base: BumpRef<u8>
 }
 
-impl<T: ?Sized> Clone for InternRef<T> {
+impl<T: ?Sized> Clone for IRef<T> {
     fn clone(&self) -> Self {
         Self(self.0, PhantomData)
     }
 }
 
-impl<T: ?Sized> Copy for InternRef<T> {}
+impl<T: ?Sized> Copy for IRef<T> {}
 
-impl<T: ?Sized> PartialEq for InternRef<T> {
+impl<T: ?Sized> PartialEq for IRef<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T: ?Sized> Eq for InternRef<T> {}
+impl<T: ?Sized> Eq for IRef<T> {}
 
-impl<T: ?Sized> Hash for InternRef<T> {
+impl<T: ?Sized> Hash for IRef<T> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         state.write_u32(self.0)
     }
 }
 
-impl<T: ?Sized> InternRef<T> {
+impl<T: ?Sized> IRef<T> {
 
-    pub fn cast<U: ?Sized>(self) -> InternRef<U> {
+    pub fn cast<U: ?Sized>(self) -> IRef<U> {
         zerocopy::transmute!(self)
     }
 
 }
 
-impl<T: ?Sized + Aligned> InternRef<T> {
+impl<T: ?Sized + Aligned> IRef<T> {
 
     pub fn to_bump_sized(self, size: usize) -> BumpRef<T> {
         BumpRef::from_offset(refend(self.0) as usize - size)
@@ -85,7 +85,7 @@ impl<T: ?Sized + Aligned> InternRef<T> {
 
 }
 
-impl<T: Aligned> InternRef<T> {
+impl<T: Aligned> IRef<T> {
 
     pub fn to_bump(self) -> BumpRef<T> {
         self.to_bump_sized(size_of::<T>())
@@ -102,7 +102,7 @@ const fn bigref(ptr: u32, size: u32) -> u32 {
     ptr | ((!size) << PTR_BITS)
 }
 
-impl<T: ?Sized> InternRef<T> {
+impl<T: ?Sized> IRef<T> {
 
     // public for hardcoding constant references (eg. Ccx::SEQ_GLOBAL).
     // extremely easy to misuse.
@@ -189,11 +189,11 @@ unsafe fn dyndata(r: u32, data: &[u8]) -> &[u8] {
 
 // safety: tab and bump must come from the same intern table
 unsafe fn entry<'tab, 'short>(
-    tab: &'tab mut HashTable<InternRef<[u8]>>,
+    tab: &'tab mut HashTable<IRef<[u8]>>,
     bump: &'short [u8],
     bytes: &'short [u8],
     align: u32
-) -> Entry<'tab, InternRef<[u8]>> {
+) -> Entry<'tab, IRef<[u8]>> {
     tab.entry(
         fxhash(bytes),
         // note: this tests that the *end* is aligned, which works as long as size is a multiple
@@ -206,7 +206,7 @@ unsafe fn entry<'tab, 'short>(
 fn writebiglen(data: &mut Bump<u8>, mut len: usize) -> u32 {
     let mut bytes = 0;
     loop {
-        data.push(&(len as u8));
+        data.push(len as u8);
         len >>= 8;
         bytes += 1;
         if len == 0 { return bytes }
@@ -221,13 +221,14 @@ fn newref(bump: &mut Bump<u8>, len: usize) -> u32 {
     }
 }
 
-fn internbytes(intern: &mut Intern, bytes: &[u8], align: u32) -> InternRef<[u8]> {
+fn internbytes(intern: &mut Intern, bytes: &[u8], align: u32) -> IRef<[u8]> {
     match unsafe { entry(&mut intern.tab, intern.bump.as_slice(), bytes, align) } {
         Entry::Occupied(e) => *e.get(),
         Entry::Vacant(e) => {
-            intern.bump.align(align);
-            intern.bump.push_slice(bytes);
-            *e.insert(InternRef(newref(&mut intern.bump, bytes.len()), PhantomData)).get()
+            intern.bump.align(align as _);
+            intern.bump.write(bytes);
+            intern.base = intern.bump.end();
+            *e.insert(IRef(newref(&mut intern.bump, bytes.len()), PhantomData)).get()
         }
     }
 }
@@ -252,27 +253,48 @@ fn refrange(data: &[u8], r: u32) -> Range<usize> {
 
 impl Intern {
 
-    pub fn intern<T: ?Sized + WriteBytes + Aligned>(&mut self, value: &T) -> InternRef<T> {
-        internbytes(self, as_bytes(value), T::ALIGN as _).cast()
+    pub fn intern<T>(&mut self, value: &T) -> IRef<T>
+        where T: ?Sized + Aligned + bump::IntoBytes
+    {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                value as *const T as *const u8,
+                size_of_val(value)
+            )
+        };
+        internbytes(self, bytes, T::ALIGN as _).cast()
     }
 
-    pub fn intern_range(&mut self, range: Range<usize>) -> InternRef<[u8]> {
+    pub fn intern_collect<T>(&mut self, values: impl IntoIterator<Item=T>) -> IRef<[T]>
+        where T: Aligned + bump::FromBytes + bump::IntoBytes
+    {
+        let base = self.bump.extend(values).cast();
+        self.intern_consume_from(base).cast()
+    }
+
+    pub fn intern_range(&mut self, range: Range<usize>) -> IRef<[u8]> {
         todo!()
     }
 
-    pub fn find<T: ?Sized + WriteBytes>(&self, value: &T) -> Option<InternRef<T>> {
+    pub fn find<T>(&self, value: &T) -> Option<IRef<T>>
+        where T: ?Sized + bump::IntoBytes
+    {
         todo!()
     }
 
-    pub fn get_range(&self, r: InternRef<[u8]>) -> Range<usize> {
+    pub fn get_range(&self, r: IRef<[u8]>) -> Range<usize> {
         refrange(self.bump.as_slice(), r.0)
     }
 
-    pub fn get<T: ?Sized + Read + Aligned>(&self, r: InternRef<T>) -> &T {
+    pub fn get<T>(&self, r: IRef<T>) -> &T
+        where T: ?Sized + Aligned + bump::Get
+    {
         &self.bump[BumpRef::from_offset(refrange(self.bump.as_slice(), r.0).start)]
     }
 
-    pub fn get_slice<T: ReadBytes>(&self, r: InternRef<[T]>) -> &[T] {
+    pub fn get_slice<T>(&self, r: IRef<[T]>) -> &[T]
+        where T: bump::FromBytes + bump::Immutable
+    {
         let Range { start, end } = refrange(self.bump.as_slice(), r.0);
         &self.bump[BumpRef::from_offset(start)..BumpRef::from_offset(end)]
     }
@@ -281,21 +303,34 @@ impl Intern {
         &self.bump
     }
 
-    pub fn ref_to_bump<T: ?Sized + Aligned>(&self, r: InternRef<T>) -> BumpRef<T> {
+    pub fn ref_to_bump<T>(&self, r: IRef<T>) -> BumpRef<T>
+        where T: ?Sized + Aligned
+    {
         r.to_bump_sized(reflen(self.bump.as_slice(), r.0))
     }
 
-    pub fn push<T: ?Sized + Write + Aligned>(&mut self, value: &T) {
-        self.bump.push(value);
+    pub fn write<T>(&mut self, value: &T)
+        where T: ?Sized + Aligned + bump::IntoBytes
+    {
+        self.bump.write(value);
     }
 
     // type doesn't matter here, so take a concrete type for better type inference and less
     // monomorphization
-    pub fn push_ref(&mut self, r: InternRef<[u8]>) {
-        self.bump.push_range(self.get_range(r));
+    pub fn write_ref(&mut self, r: IRef<[u8]>) {
+        let Range { start, end } = self.get_range(r);
+        self.bump.write_range::<u8>(BumpRef::from_offset(start)..BumpRef::from_offset(end));
     }
 
-    pub fn intern_consume_from(&mut self, cursor: BumpRef<u8>) -> InternRef<[u8]> {
+    pub fn reserve_dst<T>(&mut self, len: usize) -> &mut T
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: bump::FromBytes + bump::IntoBytes,
+              T::Item: bump::FromBytes + bump::IntoBytes
+    {
+        self.bump.reserve_dst(len).1
+    }
+
+    pub fn intern_consume_from(&mut self, cursor: BumpRef<u8>) -> IRef<[u8]> {
         match unsafe { entry(&mut self.tab, self.bump.as_slice(), &self.bump[cursor..], 1) } {
             Entry::Occupied(e) => {
                 // this assert is needed for correctness because any ref in the hashtable
@@ -310,7 +345,7 @@ impl Intern {
                 let len = self.bump.end().offset() - cursor.offset();
                 let r = newref(&mut self.bump, len);
                 self.base = cursor;
-                *e.insert(InternRef(r, PhantomData)).get()
+                *e.insert(IRef(r, PhantomData)).get()
             }
         }
     }
@@ -320,14 +355,16 @@ impl Intern {
 impl Default for Intern {
     fn default() -> Self {
         let mut tab = HashTable::new();
-        tab.insert_unique(fxhash(&[0; 0]), InternRef::EMPTY, |_| unreachable!());
+        tab.insert_unique(fxhash(&[0; 0]), IRef::EMPTY, |_| unreachable!());
         Self { tab, bump: Default::default(), base: BumpRef::zero() }
     }
 }
 
-impl<T: ?Sized + Read + Aligned> core::ops::Index<InternRef<T>> for Intern {
+impl<T> core::ops::Index<IRef<T>> for Intern
+    where T: ?Sized + Aligned + bump::Get
+{
     type Output = T;
-    fn index(&self, r: InternRef<T>) -> &T {
+    fn index(&self, r: IRef<T>) -> &T {
         self.get(r)
     }
 }
@@ -341,7 +378,7 @@ impl core::fmt::Write for Intern {
 }
 
 // the following COULD be implemented...
-//     impl<T: ReadBytes> core::ops::Index<InternRef<[T]>> for Intern { ... }
+//     impl<T: ReadBytes> core::ops::Index<IRef<[T]>> for Intern { ... }
 // BUT implementing it breaks type inference in...
 //     let v: Type = intern[zerocopy::transmute!(handle)]
 // so for now just use get_slice() for slices.

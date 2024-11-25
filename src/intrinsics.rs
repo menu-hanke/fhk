@@ -2,7 +2,7 @@
 
 use enumset::EnumSetType;
 
-use crate::typing::{scheme, Primitive, Scheme};
+use crate::typing::{scheme, Scheme};
 
 macro_rules! define_intrinsics {
     (@scheme [$($scheme:tt)*]) => { &scheme!($($scheme)*) };
@@ -12,41 +12,20 @@ macro_rules! define_intrinsics {
         #[repr(u8)]
         pub enum Intrinsic { $($name),* }
 
-        const INTRINSIC_SCHEME: &'static [&'static Scheme] = &[
+        const INTRINSIC_SCHEME: &[&Scheme] = &[
             $(define_intrinsics!(@scheme $scheme)),*
         ];
 
-        const INTRINSIC_FUNC: phf::Map<&'static [u8], Intrinsic> = phf::phf_map! {
+        const INTRINSIC_FUNC: phf::Map<&[u8], Intrinsic> = phf::phf_map! {
             $( $( $func => Intrinsic::$name, )? )*
         };
     };
 }
 
-const LOGIC: &'static Scheme = scheme![(T:{B1}) : (Func T T T)];
-
-const CMP: &'static Scheme = scheme![
-    (T, N, B:{B1}) : (Func (Tensor B N) (Tensor T N) (Tensor T N))
-];
-
-const NUM: u16 = {
-    use Primitive::*;
-    (1 << I8 as u8) | (1 << I16 as u8) | (1 << I32 as u8) | (1 << I64 as u8)
-        | (1 << U8 as u8) | (1 << U16 as u8) | (1 << U32 as u8) | (1 << U64 as u8)
-        | (1 << F32 as u8) | (1 << F64 as u8)
-};
-
-const FP: u16 = {
-    use Primitive::*;
-    (1 << F32 as u8) | (1 << F64 as u8)
-};
-
-const ARITH: &'static Scheme = scheme![
-    (T:NUM, N) : (Func (Tensor T N) (Tensor T N) (Tensor T N))
-];
-
-const FPMATH: &'static Scheme = scheme![
-    (T:FP, N) : (Func (Tensor T N) (Tensor T N))
-];
+const LOGIC: &Scheme = scheme![t.PriBool : [t t] -> t];
+const CMP: &Scheme = scheme![t n b.PriBool : [(Tensor t n) (Tensor t n)] -> (Tensor b n)];
+const ARITH: &Scheme = scheme![t.PriNum n : [(Tensor t n) (Tensor t n)] -> (Tensor t n)];
+const FPMATH: &Scheme = scheme![t.PriNum n : [(Tensor t n)] -> (Tensor t n)];
 
 define_intrinsics! {
     // binary operators ORDER BINOP
@@ -56,25 +35,25 @@ define_intrinsics! {
     SUB            :: ARITH;
     MUL            :: ARITH;
     DIV            :: ARITH;
-    POW            :: [(T:NUM, U:NUM, N) : (Func (Tensor T N) (Tensor T N) (Tensor U N))];
+    POW            :: [t.PriNum u.PriNum n : [(Tensor t n) (Tensor u n)] -> (Tensor t n)];
     EQ             :: CMP;
     NE             :: CMP;
     LT             :: CMP;
     LE             :: CMP;
     // unary math
-    UNM            :: [(T:NUM, N) : (Func (Tensor T N) (Tensor T N))];
+    UNM            :: [t.PriNum n : [(Tensor t n)] -> (Tensor t n)];
     EXP    b"exp"  :: FPMATH;
     LOG    b"log"  :: FPMATH;
     // unary logic
-    NOT            :: [(T:{B1}, N) : (Func (Tensor T N) (Tensor T N))];
+    NOT            :: [t.PriBool n : [(Tensor t n)] -> (Tensor t n)];
     // logic
     // SELECT      :: [(T:{B1}, U) : (Func U T U U)];
-    // types
-    CONV   b"conv" :: [(T, U, N) : (Func (Tensor T N) (Tensor U N))];
-    SPLAT          :: [(T, N) : (Func (Tensor T N) (Splat T))];
-    REP            :: [(T, N, M) : (Func (Tensor T N) (Tensor T M))];
     // vector math
-    SUM    b"sum"  :: [(T, N) : (Func T (Tensor T N))];
+    SUM    b"sum"  :: [t n : [(Tensor t n)] -> t];
+    // types
+    CONV   b"conv" :: [t u n : [(Tensor t n)] -> (Tensor u n)];
+    // SPLAT          :: [];
+    REP            :: [t n m : [(Tensor t n)] -> (Tensor t m)];
 }
 
 impl Intrinsic {

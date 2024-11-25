@@ -4,33 +4,21 @@ use core::cmp::max;
 use core::ops::Range;
 
 use enumset::{enum_set, EnumSet};
-use zerocopy::IntoBytes;
 
-use crate::compile::{self, Const, Seq};
-use crate::index::IndexOption;
-use crate::intern::{Intern, InternRef};
+use crate::compile;
+use crate::intern::{Intern, IRef};
 use crate::intrinsics::Intrinsic;
+use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, ObjRef, CALLN, DIM, EXPR, GET, KINT, MOD, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, next, redeferr, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, ScopeId, SyntaxError};
+use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, MOD, TUPLE, VAR, VGET, VSET};
+use crate::parser::{check, consume, langerr, next, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 
 pub const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
     Token::Model | Token::Table | Token::Func | Token::Macro | Token::Eof
 );
 
-fn parse_maybe_scope(pcx: &mut Pcx) -> compile::Result<IndexOption<ScopeId>> {
-    Ok(match pcx.data.token {
-        Token::Scope => {
-            let id = pcx.data.tdata;
-            next(pcx)?;
-            Some(zerocopy::transmute!(id))
-        },
-        _ => None
-    }.into())
-}
-
-fn parse_name(pcx: &mut Pcx) -> compile::Result<InternRef<Seq>> {
-    let start = pcx.sequences.bump().end();
+fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+    let base = pcx.tmp.end();
     save(pcx);
     if check(pcx, Token::Scope)? { save(pcx); }
     consume(pcx, Token::Ident)?;
@@ -51,7 +39,9 @@ fn parse_name(pcx: &mut Pcx) -> compile::Result<InternRef<Seq>> {
         }
         next(pcx)?; // skip subscript token or closing parenthesis
     }
-    Ok(pcx.sequences.intern_consume_from(start).cast())
+    let name = pcx.intern.intern(&pcx.tmp[base..]);
+    pcx.tmp.truncate(base);
+    Ok(name)
 }
 
 fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
@@ -66,40 +56,35 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
     Ok(pcx.objs.var(table, name).get_or_create())
 }
 
-fn getintrinsic(seq: &Intern, constants: &Intern, name: InternRef<Seq>) -> Option<Intrinsic> {
+fn getintrinsic(intern: &Intern, name: IRef<[u8]>) -> Option<Intrinsic> {
     const IDENT: u8 = Token::Ident as _;
-    if let name @ [IDENT, _, _, _, _] = seq.get_slice(name.cast()) {
+    if let name @ [IDENT, _, _, _, _] = intern.get_slice(name.cast()) {
         let name: [u8; 4] = name[1..].try_into().unwrap();
-        let name: InternRef<Const> = zerocopy::transmute!(name);
-        Intrinsic::from_func(constants.get_slice(name.cast()))
+        let name: IRef<[u8]> = zerocopy::transmute!(name);
+        Intrinsic::from_func(intern.get_slice(name.cast()))
     } else {
         None
     }
 }
 
-fn parse_call(pcx: &mut Pcx, name: InternRef<Seq>) -> compile::Result<ObjRef<EXPR>> {
+fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
     next(pcx)?; // skip '('
-    let base = pcx.data.tmpref.len();
+    let base = pcx.tmp.end();
     while pcx.data.token != Token::RParen {
         let param = parse_expr(pcx)?;
-        pcx.data.tmpref.push(param.erase());
-        if pcx.data.token == Token::Comma {
-            next(pcx)?;
-        } else {
-            consume(pcx, Token::RParen)?;
-            break;
-        }
+        pcx.tmp.push(param);
+        if !check(pcx, Token::Comma)? { break }
     }
-    let expr = if let Some(intrin) = getintrinsic(&pcx.sequences, &pcx.constants, name) {
-        pcx.objs.push(&CALLN::new(
-                intrin as _,
-                ObjRef::NIL,
-                cast_args(&pcx.data.tmpref[base..])
-        )).cast()
+    consume(pcx, Token::RParen)?;
+    let expr = if let Some(intrin) = getintrinsic(&pcx.intern, name) {
+        pcx.objs.push_args::<CALLN>(
+            CALLN::new(intrin as _, ObjRef::NIL),
+            &pcx.tmp[base.cast_up()..]
+        ).cast()
     } else {
         todo!("user function call")
     };
-    pcx.data.tmpref.truncate(base);
+    pcx.tmp.truncate(base);
     Ok(expr)
 }
 
@@ -107,7 +92,15 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<EXPR>> 
     if pcx.data.token == Token::LBracket {
         todo!("vget with index")
     }
-    Ok(pcx.objs.push(&VGET::new(ObjRef::NIL, var, [])).cast())
+    Ok(pcx.objs.push(VGET::new(ObjRef::NIL, var)).cast())
+}
+
+fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    require(pcx, Token::Ident)?;
+    let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
+        else { return langerr(pcx) };
+    next(pcx)?; // skip name
+    lang.parse_callx(pcx, n)
 }
 
 // ORDER BINOP
@@ -154,7 +147,38 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             todo!("concat")
         },
         Token::Let => {
-            todo!("let-in")
+            next(pcx)?;
+            let base = pcx.data.bindings.len();
+            let name = parse_name(pcx)?;
+            match pcx.data.token {
+                Token::Eq => {
+                    next(pcx)?;
+                    let value = parse_expr(pcx)?;
+                    pcx.data.bindings.push(Binding { name, value });
+                },
+                Token::Comma => {
+                    pcx.data.bindings.push(Binding { name, value: ObjRef::NIL.cast() });
+                    let mut n = 1;
+                    while check(pcx, Token::Comma)? {
+                        let name = parse_name(pcx)?;
+                        pcx.data.bindings.push(Binding { name, value: ObjRef::NIL.cast() });
+                        n += 1;
+                    }
+                    consume(pcx, Token::Eq)?;
+                    consume(pcx, Token::Call)?;
+                    let call = parse_callx(pcx, n)?;
+                    for i in 0..n {
+                        pcx.data.bindings[base+i].value = pcx.objs.push(
+                            GET::new(i as _, ObjRef::NIL, call.cast())
+                        ).cast();
+                    }
+                },
+                _ => return tokenerr(pcx, Token::Eq | Token::Comma)
+            }
+            consume(pcx, Token::In)?;
+            let value = parse_expr(pcx)?;
+            pcx.data.bindings.truncate(base);
+            Ok(value)
         },
         // Token::Minus | Token::Not => {
         //     let tok = pcx.data.token;
@@ -173,18 +197,20 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
         //         args: [value]
         //     }).erase())
         // },
-        Token::Int     => {
-            let value = pcx.data.tdata;
+        Token::Int | Token::Int64 | Token::Fp64 | Token::Literal => {
+            let mut o = KINT::new(ObjRef::NIL, pcx.data.tdata as _);
+            match pcx.data.token {
+                Token::Int64   => o.op = Obj::KINT64,
+                Token::Fp64    => o.op = Obj::KFP64,
+                Token::Literal => o.op = Obj::KSTR,
+                _ => {}
+            }
             next(pcx)?;
-            Ok(pcx.objs.push(&KINT::new(ObjRef::NIL, value as _)).cast())
+            Ok(pcx.objs.push(o).cast())
         }
-        // Token::Int64 | Token::Fp64
-        //                => Ok(pcx.objs.push(&obj!(KREF k=zerocopy::transmute!(pcx.data.tdata)))
-        //                    .erase()),
-        // Token::Literal => Ok(pcx.objs.push(&obj!(KREF.STR k=zerocopy::transmute!(pcx.data.tdata)))
-        //                    .erase()),
-        Token::True    => { next(pcx)?; Ok(ObjRef::TRUE.cast()) },
-        Token::False   => { next(pcx)?; Ok(ObjRef::FALSE.cast()) },
+        Token::Call => { next(pcx)?; Ok(parse_callx(pcx, 1)?.cast()) },
+        Token::True => { next(pcx)?; Ok(ObjRef::TRUE.cast()) },
+        Token::False => { next(pcx)?; Ok(ObjRef::FALSE.cast()) },
         _ => syntaxerr(pcx, SyntaxError::ExpectedValue)
     }
 }
@@ -202,11 +228,10 @@ fn parse_binop(pcx: &mut Pcx, limit: u8) -> compile::Result<ObjRef<EXPR>> {
             op = unsafe { core::mem::transmute(op as u8 - 2) };
             (lhs, rhs) = (rhs, lhs);
         }
-        lhs = pcx.objs.push(&CALLN::new(
-                Intrinsic::OR as u8 + (op as u8 - Token::Or as u8),
-                ObjRef::NIL,
-                [lhs, rhs]
-        )).cast();
+        lhs = pcx.objs.push_args::<CALLN>(
+            CALLN::new(Intrinsic::OR as u8 + (op as u8 - Token::Or as u8), ObjRef::NIL),
+            &[lhs, rhs]
+        ).cast();
     }
     Ok(lhs)
 }
@@ -218,12 +243,12 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     if !pcx.objs[tab].shape.is_nil() {
         return redeferr(pcx, Namespace::Table, name);
     }
-    debug_assert!(pcx.data.tmpref.is_empty());
+    let base = pcx.tmp.end();
     if check(pcx, Token::LBracket)? {
         pcx.data.tab = ObjRef::GLOBAL;
         while pcx.data.token != Token::RBracket {
             let value = parse_expr(pcx)?;
-            pcx.data.tmpref.push(value.erase());
+            pcx.tmp.push(value);
             if pcx.data.token == Token::Comma {
                 next(pcx)?;
             } else {
@@ -232,56 +257,59 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
             }
         }
     }
-    pcx.objs[tab].shape = pcx.objs.push(&TUPLE::new(ObjRef::NIL, cast_args(&pcx.data.tmpref))).cast();
-    pcx.data.tmpref.clear();
+    pcx.objs[tab].shape = pcx.objs.push_args::<TUPLE>(
+        TUPLE::new(ObjRef::NIL),
+        &pcx.tmp[base.cast_up()..]
+    ).cast();
+    pcx.tmp.truncate(base);
     Ok(())
 }
 
 fn deconstruct(pcx: &mut Pcx, value: ObjRef<EXPR>, num: usize) {
     match num {
         0 => {},
-        1 => pcx.data.tmpref.push(value.cast()),
+        1 => {
+            pcx.tmp.push(value);
+        },
         _ => for i in 0..num as u8 {
-            let get = pcx.objs.push(&GET::new(i, ObjRef::NIL, value));
-            pcx.data.tmpref.push(get.erase());
+            pcx.tmp.push(pcx.objs.push(GET::new(i, ObjRef::NIL, value)));
         }
     }
 }
 
 fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
-    let base = pcx.data.tmpref.len();
+    let base = pcx.tmp.end();
     loop {
         let var = parse_vref(pcx)?;
         if check(pcx, Token::LBracket)? {
             todo!(); // TODO: parse subset
             consume(pcx, Token::RBracket)?;
         }
-        let vset = pcx.objs.push(&VSET::new(var, ObjRef::NIL.cast(), []));
-        pcx.data.tmpref.push(vset.erase());
+        pcx.tmp.push(pcx.objs.push(VSET::new(var, ObjRef::NIL.cast())));
         match pcx.data.token {
             Token::Comma => { next(pcx)?; todo!("handle multiple outputs"); continue; },
             Token::Eq    => { next(pcx)?; break },
             _            => return tokenerr(pcx, Token::Comma | Token::Eq)
         }
     }
+    let deco_base = pcx.tmp.align_for::<ObjRef<EXPR>>().end();
+    let vset_base = base.cast_up::<ObjRef<VSET>>();
+    let num = deco_base.size_index() - vset_base.size_index();
     let value = parse_expr(pcx)?;
-    let num = pcx.data.tmpref.len() - base;
     deconstruct(pcx, value, num);
-    for i in (base..base+num).rev() {
-        let vset: ObjRef<VSET> = pcx.data.tmpref[i].cast();
-        pcx.objs[vset].value = pcx.data.tmpref.pop().unwrap().cast();
+    for i in (0..num as isize).rev() {
+        let vset = pcx.tmp[vset_base.add_size(i)];
+        pcx.objs[vset].value = pcx.tmp[deco_base.add_size(i)]
     }
-    let guard = match pcx.data.token {
-        Token::Where => { next(pcx)?; parse_expr(pcx)? },
-        _ => ObjRef::NIL.cast()
+    let guard = match check(pcx, Token::Where)? {
+        true  => parse_expr(pcx)?,
+        false => ObjRef::NIL.cast()
     };
-    pcx.objs.push(&MOD::new(
-            InternRef::EMPTY,
-            pcx.data.tab,
-            guard,
-            cast_args(&pcx.data.tmpref[base..])
-    ));
-    pcx.data.tmpref.truncate(base);
+    pcx.objs.push_args::<MOD>(
+        MOD::new(IRef::EMPTY, pcx.data.tab, guard),
+        cast_args(&pcx.tmp[vset_base..deco_base.cast::<ObjRef<VSET>>()])
+    );
+    pcx.tmp.truncate(base);
     Ok(())
 }
 
@@ -299,7 +327,7 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
                 continue;
             }
             let name = parse_name(pcx)?;
-            let value = pcx.objs.push(&DIM::new(axis as _, ObjRef::NIL)).cast();
+            let value = pcx.objs.push(DIM::new(axis as _, ObjRef::NIL)).cast();
             pcx.data.bindings.push(Binding { name, value });
             if pcx.data.token == Token::Comma {
                 next(pcx)?;
@@ -335,46 +363,46 @@ fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> 
             Token::CapPos | Token::Dollar if !template
                 => return syntaxerr(pcx, SyntaxError::CapPosInBody),
             Token::Dollar => {
-                pcx.sequences.push(&[Token::OpInsert as u8, nextcap]);
+                pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                 nextcap += 1;
             },
             Token::DollarDollar => {
-                pcx.sequences.push(&(Token::OpThis as u8));
+                pcx.tmp.push(Token::OpThis as u8);
             },
             Token::CapName => {
-                let name: InternRef<Const> = zerocopy::transmute!(pcx.data.tdata);
+                let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
                 let idx = match pcx.data.marg.iter().position(|a| *a == name) {
                     Some(i) => i,
                     None => return syntaxerr(pcx, SyntaxError::UndefCap)
                 };
-                pcx.sequences.push(&[Token::OpInsert as u8, idx as u8]);
+                pcx.tmp.push([Token::OpInsert as u8, idx as u8]);
                 nextcap = max(nextcap, idx as u8+1);
             },
             Token::CapPos => {
-                pcx.sequences.push(&[Token::OpInsert as u8, pcx.data.tdata as u8]);
+                pcx.tmp.push([Token::OpInsert as u8, pcx.data.tdata as u8]);
             }
             Token::Literal => {
                 // this mess should probably go somewhere in the lexer instead.
-                let sid: InternRef<Const> = zerocopy::transmute!(pcx.data.tdata);
-                let Range { start, end } = pcx.constants.get_range(sid.cast());
-                let mut data: &[u8] = pcx.constants.bump().as_slice();
+                let sid: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+                let Range { start, end } = pcx.intern.get_range(sid.cast());
+                let mut data: &[u8] = pcx.intern.bump().as_slice();
                 if let Some(mut cursor) = data[start..end].iter().position(|c| *c == '$' as _) {
-                    pcx.sequences.push(&(Token::OpLiteralBoundary as u8));
+                    pcx.tmp.push(Token::OpLiteralBoundary as u8);
                     let mut base = start;
                     cursor += base;
                     loop {
                         // INVARIANT: here cursor points at '$'
                         if cursor > base {
-                            pcx.sequences.push(&(Token::Literal as u8));
-                            pcx.sequences.push(pcx.constants.intern_range(base..cursor).as_bytes());
-                            data = pcx.constants.bump().as_slice();
+                            pcx.tmp.push(Token::Literal as u8);
+                            pcx.tmp.push(pcx.intern.intern_range(base..cursor));
+                            data = pcx.intern.bump().as_slice();
                         }
                         if cursor >= end { break; }
                         assert!(end <= data.len()); // eliminate some bound checks.
                         cursor += 1;
                         match data.get(cursor) {
                             Some(b'$') => {
-                                pcx.sequences.push(&(Token::OpThis as u8));
+                                pcx.tmp.push(Token::OpThis as u8);
                                 cursor += 1;
                             },
                             Some(&(mut c)) if c.is_ascii_digit() => {
@@ -387,7 +415,7 @@ fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> 
                                     c = data[cursor];
                                     if !c.is_ascii_digit() { break }
                                 }
-                                pcx.sequences.push(&[Token::OpInsert as u8, idx]);
+                                pcx.tmp.push([Token::OpInsert as u8, idx]);
                                 nextcap = max(nextcap, idx+1);
                             },
                             Some(&(mut c)) if c.is_ascii_alphanumeric() || c == b'_' => {
@@ -399,7 +427,7 @@ fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> 
                                     c = data[cursor];
                                     if !(c.is_ascii_alphanumeric() || c == b'_') { break }
                                 }
-                                let cap = match pcx.constants.find(&data[start..cursor]) {
+                                let cap = match pcx.intern.find(&data[start..cursor]) {
                                     Some(r) => r,
                                     None => return syntaxerr(pcx, SyntaxError::UndefCap)
                                 }.cast();
@@ -407,11 +435,11 @@ fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> 
                                     Some(i) => i,
                                     None => return syntaxerr(pcx, SyntaxError::UndefCap)
                                 };
-                                pcx.sequences.push(&[Token::OpInsert as u8, idx as _]);
+                                pcx.tmp.push([Token::OpInsert as u8, idx as _]);
                             },
                             _ => {
                                 if !template { return syntaxerr(pcx, SyntaxError::CapPosInBody) }
-                                pcx.sequences.push(&[Token::OpInsert as u8, nextcap]);
+                                pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                                 nextcap += 1;
                             }
                         }
@@ -484,8 +512,10 @@ pub fn parse_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     parse_binop(pcx, 0)
 }
 
-pub fn parse_template(pcx: &mut Pcx) -> compile::Result<InternRef<Seq>> {
-    let start = pcx.sequences.bump().end();
+pub fn parse_template(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+    let base = pcx.tmp.end();
     parse_macro_body(pcx, Token::Eof.into(), true)?;
-    Ok(pcx.sequences.intern_consume_from(start).cast())
+    let template = pcx.intern.intern(&pcx.tmp[base..]);
+    pcx.tmp.truncate(base);
+    Ok(template)
 }

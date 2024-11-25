@@ -2,7 +2,10 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, TrapCode, Value};
+use zerocopy::Unalign;
 
+use crate::bump::BumpRef;
+use crate::lang::Lang;
 use crate::mem::SizeClass;
 use crate::support::{ALLOC, DSINIT};
 use crate::compile;
@@ -59,12 +62,12 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
                     },
                     FuncKind::Query(Query { offsets, .. }) => {
                         let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
-                        let ofs = ecx.bump[offsets.add_size(phi as _)];
+                        let ofs = ecx.perm[offsets.add_size(phi as _)];
                         emit.fb.ins().store(MEM_RESULT, emit.values[value], res, ofs as i32);
                     },
                     FuncKind::Bundle(Bundle { scl, slots, .. }) => {
                         let vmctx = emit.fb.vmctx();
-                        let slot = ecx.bump[slots.add_size(phi as _)];
+                        let slot = ecx.perm[slots.add_size(phi as _)];
                         storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value]);
                     }
                 }
@@ -123,17 +126,25 @@ fn ins_phi(ecx: &mut Ecx, id: InsId) {
         block2cl(v2block(emit.values[ctr])))[idx as usize];
 }
 
-fn ins_kint(ecx: &mut Ecx, id: InsId) {
+fn ins_kintx(ecx: &mut Ecx, id: InsId) {
     use Type::*;
     let ins = ecx.data.code[id];
     let type_ = ins.type_();
     let data = ins.bc();
+    let k = match ins.opcode() {
+        Opcode::KINT => data as i64,
+        Opcode::KINT64 => {
+            let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(data);
+            ecx.intern.bump()[data].get()
+        },
+        _ => unreachable!()
+    };
     let value = match type_ {
-        I8 | I16 | I32 | I64 | PTR | B1 => ecx.data.fb.ins().iconst(irt2cl(type_), data as i64),
+        I8 | I16 | I32 | I64 | PTR | B1 => ecx.data.fb.ins().iconst(irt2cl(type_), k),
         F32 | F64 => {
             let data = match type_ {
-                F32 => ecx.mcode.data.intern(&(data as f32)).to_bump().cast(),
-                _   => ecx.mcode.data.intern(&(data as f64)).to_bump().cast()
+                F32 => ecx.mcode.data.intern(&(k as f32)).to_bump().cast(),
+                _   => ecx.mcode.data.intern(&(k as f64)).to_bump().cast()
             };
             let data = ecx.data.fb.importdataref(data);
             let ptr = ecx.data.fb.dataptr(data);
@@ -259,6 +270,11 @@ fn ins_load(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = emit.fb.ins().load(ty, MemFlags::trusted(), emit.values[ptr], 0);
 }
 
+fn ins_callx(ecx: &mut Ecx, id: InsId) -> compile::Result {
+    let (_, func) = ecx.data.code[id].decode_CALLX();
+    Lang::from_u8(ecx.intern[func].lang).emit_callx(ecx, id)
+}
+
 fn ins_callb(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (idx, _, bundle) = emit.code[id].decode_CALLB();
@@ -278,14 +294,18 @@ fn ins_callb(ecx: &mut Ecx, id: InsId) {
     emit.fb.block = merge_block;
 }
 
-fn ins_res(ecx: &mut Ecx, id: InsId) {
+fn ins_res(ecx: &mut Ecx, id: InsId) -> compile::Result {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
     let ty = ins.type_();
-    if ty == Type::FX { return; }
+    if ty == Type::FX { return Ok(()); }
     let (call, phi) = ins.decode_RES();
     let value = match emit.code[call].opcode() {
         Opcode::CALL => todo!(),
+        Opcode::CALLX => {
+            let (_, func) = emit.code[call].decode_CALLX();
+            Lang::from_u8(ecx.intern[func].lang).emit_res(ecx, id)?
+        },
         Opcode::CALLB | Opcode::CALLBI => {
             let (idx, _, bundle) = emit.code[call].decode_CALLB();
             let FuncKind::Bundle(Bundle { scl, slots, .. }) = ecx.ir.funcs[bundle].kind
@@ -293,11 +313,12 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
             debug_assert!(ecx.ir.funcs[bundle].phis.at(phi).type_ == ty);
             let vmctx = emit.fb.vmctx();
             let phi: usize = phi.into();
-            loadslot(emit, vmctx, emit.values[idx], scl, ecx.bump[slots.add_size(phi as _)], ty)
+            loadslot(emit, vmctx, emit.values[idx], scl, ecx.perm[slots.add_size(phi as _)], ty)
         },
         _ => unreachable!()
     };
-    emit.values[id] = value;
+    ecx.data.values[id] = value;
+    Ok(())
 }
 
 fn ins_binit(ecx: &mut Ecx, id: InsId) {
@@ -329,13 +350,11 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
         UB => ins_ub(ecx),
         PHI => ins_phi(ecx, id),
         KNOP => { /* NOP */ },
-        KINT => ins_kint(ecx, id),
-        KINT64 => todo!(),
+        KINT | KINT64 => ins_kintx(ecx, id),
         KFP64 => todo!(),
         KSTR => todo!(),
         MOV | MOVB | MOVF => ins_mov(ecx, id),
         CONV => todo!(),
-        JOIN => { /* NOP */ },
         ADD | SUB | MUL | DIV => ins_arith(ecx, id),
         ADDP => ins_addp(ecx, id),
         POW => todo!(),
@@ -344,10 +363,12 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
         ALLOC => ins_alloc(ecx, id),
         STORE => ins_store(ecx, id),
         LOAD => ins_load(ecx, id),
+        BOX => todo!(),
         CALL => todo!(),
+        CALLX => ins_callx(ecx, id)?,
         CALLB | CALLBI => ins_callb(ecx, id),
         CARG => { /* NOP */ },
-        RES => ins_res(ecx, id),
+        RES => ins_res(ecx, id)?,
         BINIT => ins_binit(ecx, id),
     }
     Ok(())

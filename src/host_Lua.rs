@@ -6,11 +6,11 @@ use core::pin::Pin;
 use alloc::boxed::Box;
 
 use crate::bytestring::ByteString;
-use crate::compile::{Ccx, Seq};
+use crate::compile::Ccx;
 use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
-use crate::intern::InternRef;
+use crate::intern::IRef;
 use crate::mem::applyreset;
 use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, TAB};
 use crate::parse::{parse_def, parse_expr, parse_template};
@@ -31,7 +31,7 @@ type fhk_Graph = Ccx<Parser>;
 type fhk_Image = Image;
 type fhk_Instance = Instance;
 type fhk_ObjRef<T=Obj> = ObjRef<T>;
-type fhk_SeqRef = InternRef<Seq>;
+type fhk_SeqRef = IRef<[u8]>;
 type fhk_Operator = Operator;
 type fhk_Result = i32;
 type fhk_Alloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut u8;
@@ -134,8 +134,8 @@ extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
     G.host.buf.clear();
     stringify(
         &mut G.host.buf,
-        &G.constants,
-        G.sequences.get_slice(string.cast()),
+        &G.intern,
+        G.intern.get_slice(string.cast()),
         SequenceType::Pattern
     );
 }
@@ -169,7 +169,7 @@ unsafe extern "C" fn fhk_newquery(
     values: *const fhk_ObjRef<EXPR>,
     num: usize
 ) -> fhk_ObjRef<QUERY> {
-    G.objs.push(&QUERY::new(tab, 0, core::slice::from_raw_parts(values, num))).cast()
+    G.objs.push_args(QUERY::new(tab, 0), core::slice::from_raw_parts(values, num))
 }
 
 // extern "C" fn fhk_args(G: &mut fhk_Graph, node: fhk_ObjRef, ptr: *mut *mut fhk_ObjRef) -> fhk_Result {
@@ -186,7 +186,7 @@ unsafe extern "C" fn fhk_define(G: &mut fhk_Graph, src: *const c_char, len: usiz
 
 extern "C" fn fhk_dumpobjs(G: &mut fhk_Graph) {
     G.host.buf.clear();
-    dump_objs(&mut G.host.buf, &G.constants, &G.sequences, &G.objs, ObjRef::NIL);
+    dump_objs(&mut G.host.buf, &G.intern, &G.objs, ObjRef::NIL);
 }
 
 unsafe extern "C" fn fhk_compile(G: &mut fhk_Graph, image: *mut *mut fhk_Image) -> fhk_Result {

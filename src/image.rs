@@ -9,13 +9,11 @@ use core::pin::Pin;
 use cfg_if::cfg_if;
 
 use crate::host::HostInst;
-use crate::lang::{self, LangMap};
 use crate::mem::{Breakpoints, Offset};
 use crate::mmap::Mmap;
 
 pub struct Image {
     pub mem: Mmap,
-    pub lang: LangMap<lang::ImageData>,
     pub breakpoints: Breakpoints,
     pub size: Offset
 }

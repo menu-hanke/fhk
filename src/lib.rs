@@ -11,8 +11,10 @@ mod concat;
 mod controlflow;
 mod data;
 mod dataflow;
+mod dl;
 mod dump;
 mod emit;
+mod finalize;
 mod hash;
 mod image;
 mod index;
@@ -55,8 +57,8 @@ macro_rules! foreach_lang {
     ($mac:path $(,$($extra:tt)*)?) => {
         $mac! {
             $($($extra)*)?
-//            #[cfg(feature="lang-C")] lang_C::C;
-            #[cfg(feature="lang-Lua")] lang_Lua::Lua;
+            #[cfg(feature="lang-C")] lang_C::C;
+//            #[cfg(feature="lang-Lua")] lang_Lua::Lua;
 //            #[cfg(feature="lang-R")] lang_R::R;
         }
     };

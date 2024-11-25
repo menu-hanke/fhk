@@ -9,11 +9,11 @@ use cranelift_codegen::{FinalizedMachReloc, FinalizedRelocTarget};
 use cranelift_entity::packed_option::ReservedValue;
 
 use crate::bitmap::BitMatrix;
-use crate::bump::{Aligned, WriteBytes};
+use crate::bump::{self, Aligned, Bump};
 use crate::compile::{self, Ccx, Phase};
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::index::{self, IndexSlice, IndexVec, InvalidValue};
-use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
+use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
 use crate::mcode::{Label, MCode, MCodeData, MCodeOffset, Reloc};
 use crate::mem::{SizeClass, Slot};
 use crate::schedule::{compute_schedule, BlockId, Gcm};
@@ -21,6 +21,10 @@ use crate::support::{emitsupport, SuppRef, SupportFuncs};
 use crate::trace::trace;
 use crate::translate::translate;
 use crate::typestate::{Absent, R, RW};
+
+// workaround for cranelift types which are newtypes over u32 but don't implement zerocopy traits:
+pub unsafe trait CraneliftEntityRef32 {}
+unsafe impl CraneliftEntityRef32 for Value {}
 
 pub struct FuncBuilder {
     pub ctx: cranelift_codegen::Context,
@@ -178,7 +182,7 @@ impl FuncBuilder {
     }
 
     pub fn importdata<T>(&mut self, mcode: &mut MCode, value: &T) -> GlobalValue
-        where T: ?Sized + WriteBytes + Aligned
+        where T: ?Sized + Aligned + bump::IntoBytes
     {
         self.importdataref(mcode.data.intern(value).to_bump_sized(size_of_val(value)).cast())
     }
@@ -291,6 +295,21 @@ pub fn storeslot(
     emit.fb.ins().store(MEM_VMCTX, value, ptr, 0);
 }
 
+pub fn cast_entitrefs<T>(xs: &[u32]) -> &[T]
+    where T: CraneliftEntityRef32
+{
+    unsafe { core::slice::from_raw_parts(xs as *const [u32] as *const u32 as *const T, xs.len()) }
+}
+
+pub fn collectargs(emit: &Emit, dest: &mut Bump<u32>, mut arg: InsId) {
+    while emit.code[arg].opcode() != Opcode::KNOP {
+        debug_assert!(emit.code[arg].opcode() == Opcode::CARG);
+        let (ap, v) = emit.code[arg].decode_CARG();
+        dest.push(emit.values[v].as_u32());
+        arg = ap;
+    }
+}
+
 fn trace_schedule(emit: &Emit, func: &Func, fid: FuncId) {
     trace!(
         "---------- FUNC {} ----------",
@@ -393,7 +412,7 @@ fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
     let loc = mcode.code.end().offset() as MCodeOffset;
     emit.fb.ctx.compile(&*emit.isa, &mut Default::default()).unwrap();
     let code = emit.fb.ctx.compiled_code().unwrap();
-    mcode.code.push_slice(code.code_buffer());
+    mcode.code.write(code.code_buffer());
     mcode.align_code();
     for reloc in code.buffer.relocs() {
         emitreloc(mcode, emit, loc, reloc);

@@ -8,7 +8,7 @@ use enumset::EnumSetType;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 
-use crate::bump::{as_bytes, Aligned, Bump, BumpRef, ReadBytes, WriteBytes};
+use crate::bump::{self, Aligned, Bump, BumpRef};
 use crate::emit::{block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
 use crate::hash::fxhash;
 use crate::image::Instance;
@@ -37,7 +37,7 @@ impl Arg {
 pub type FuncPtr = usize;
 
 // marker for type bounds
-pub trait SuppFuncType: WriteBytes + ReadBytes + Aligned {}
+pub trait SuppFuncType: Aligned + bump::FromBytes + bump::IntoBytes + bump::Immutable {}
 
 #[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C,align(4))]
@@ -138,9 +138,14 @@ pub struct SupportFuncs {
     pub work: VecDeque<SuppRef>,
 }
 
-fn suppbytes<T: WriteBytes>(supp: &T) -> &[u8] {
+fn suppbytes<T>(supp: &T) -> &[u8]
+    where T: SuppFuncType
+{
     // first two bytes are label, which does not affect hash or equality
-    &as_bytes(supp)[2..]
+    let bytes = unsafe {
+        core::slice::from_raw_parts(supp as *const T as *const u8, size_of_val(supp))
+    };
+    &bytes[2..]
 }
 
 impl SupportFuncs {
@@ -154,7 +159,7 @@ impl SupportFuncs {
         ) {
             Entry::Occupied(e) => e.get().cast(),
             Entry::Vacant(e) => {
-                let sr = self.bump.push(supp);
+                let sr = self.bump.write(supp);
                 self.bump[sr.cast::<Supp>()].label = mcode.labels.push(0);
                 self.work.push_back(sr.cast());
                 e.insert(sr.cast());

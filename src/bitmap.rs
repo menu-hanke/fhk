@@ -14,7 +14,7 @@ use crate::index::Index;
 // but register size, ie u64, probably works best.
 type Word = u64;
 
-pub const WORD_BITS: usize = 8*size_of::<Word>(); // public for bitmap_array macro
+const WORD_BITS: usize = 8*size_of::<Word>();
 const SHIFT: usize = WORD_BITS.ilog2() as _;
 const MASK: usize = WORD_BITS - 1;
 
@@ -26,6 +26,26 @@ pub struct Bitmap<I: Index = usize> {
 
 fn set(bitmap: &mut [Word], bit: usize) {
     bitmap[bit>>SHIFT] |= 1 << (bit&MASK);
+}
+
+fn set_range(bitmap: &mut [Word], start: usize, end: usize) {
+    debug_assert!(WORD_BITS == 64); // this is not generic atm
+    if start == end { return }
+    let endw = (end-1) >> 6;
+    let idx = start >> 6;
+    if idx == endw {
+        let mask = ((-1i64 as u64) << (start & 0x3f))
+            & ((-1i64 as u64) >> (((-(end as isize)) & 0x3f) as usize));
+        bitmap[idx] |= mask;
+    } else {
+        let mask = (-1i64 as u64) << (start & 0x3f);
+        bitmap[idx] |= mask;
+        for j in idx+1..endw {
+            bitmap[j] = -1i64 as u64;
+        }
+        let mask = (-1i64 as u64) >> (((-(end as isize)) & 0x3f) as usize);
+        bitmap[endw] |= mask;
+    }
 }
 
 fn test(bitmap: &[Word], bit: usize) -> bool {
@@ -67,11 +87,22 @@ fn popcount_leading(bitmap: &[Word], end: usize) -> u32 {
         + (bitmap[idx] & ((!0) >> ((-(end as isize) as usize)&MASK))).count_ones()
 }
 
+fn ffs(bitmap: &[Word]) -> Option<usize> {
+    bitmap
+        .iter()
+        .enumerate()
+        .find_map(|(i,&w)| match w {
+            0 => None,
+            w => Some(i*WORD_BITS + w.trailing_zeros() as usize)
+        })
+}
+
 // nb. watch out for monomorphization. anything that takes a generic should delegate to a
 // non-generic version.
 impl<I: Index> Bitmap<I> {
 
     #[inline(always)] pub fn set(&mut self, idx: I) { set(&mut self.raw, idx.into()) }
+    #[inline(always)] pub fn set_range(&mut self, idx: Range<I>) { set_range(&mut self.raw, idx.start.into(), idx.end.into()) }
     #[inline(always)] pub fn test(&self, idx: I) -> bool { test(&self.raw, idx.into()) }
     #[inline(always)] pub fn clear(&mut self, idx: I) { clear(&mut self.raw, idx.into()) }
     #[inline(always)] pub fn clear_all(&mut self) { self.raw.fill(0); }
@@ -81,6 +112,7 @@ impl<I: Index> Bitmap<I> {
     #[inline(always)] pub fn union(&mut self, other: &Bitmap<I>) { union(&mut self.raw, &other.raw) }
     #[inline(always)] pub fn popcount(&self) -> u32 { popcount(&self.raw) }
     #[inline(always)] pub fn popcount_leading(&self, end: I) -> u32 { popcount_leading(&self.raw, end.into()) }
+    #[inline(always)] pub fn ffs(&self) -> Option<I> { ffs(&self.raw).map(Into::into) }
 
     pub fn copy_from(&mut self, other: &Bitmap<I>) {
         self.raw.copy_from_slice(&other.raw)
@@ -198,10 +230,16 @@ pub struct BitmapArray<const W: usize, I: Index = usize> {
     raw: [Word; W]
 }
 
+pub type BitmapWord<I=usize> = BitmapArray<1, I>;
+
+impl<const W: usize> BitmapArray<W> {
+    pub const BITS: usize = W * WORD_BITS;
+}
+
 macro_rules! bitmap_array {
     ($index:ty; $bits:expr) => {
         $crate::bitmap::BitmapArray<
-            { ($bits + $crate::bitmap::WORD_BITS - 1) / $crate::bitmap::WORD_BITS },
+            { ($bits + $crate::bitmap::BitmapWord::BITS - 1) / $crate::bitmap::BitmapWord::BITS },
             $index
         >
     };

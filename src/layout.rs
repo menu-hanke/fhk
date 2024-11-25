@@ -66,7 +66,7 @@ fn collect(ctx: &mut Ccx<ComputeLayout>) {
 //   * create dynamic slots for BINIT
 fn save(ctx: &mut Ccx<ComputeLayout>) {
     let slotdefs: &IndexSlice<SlotId, SlotDef> = &ctx.data.slots;
-    let insert = ctx.bump.align_for::<Slot>();
+    let insert = ctx.perm.align_for::<Slot>();
     let mut slot: SlotId = 0.into();
     // order must match collect
     for func in &mut ctx.ir.funcs.raw {
@@ -78,14 +78,14 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                 if scl.is_dynamic() {
                     // alloc dynamic slot data for BINIT
                     let base = slot;
-                    *dynslots = ctx.mcode.data.bump().next();
-                    ctx.mcode.data.push(&DynSlot::new(bitmap.byte(), Type::B1));
+                    *dynslots = ctx.mcode.data.bump().end().cast_up();
+                    ctx.mcode.data.write(&DynSlot::new(bitmap.byte(), Type::B1));
                     for phi in index::iter_span(func.ret) {
                         let ty = func.phis.at(phi).type_;
                         if ty != Type::FX {
                             slot += 1;
                             let phislot = slotdefs[slot].value;
-                            ctx.mcode.data.push(&DynSlot::new(phislot.byte(), ty));
+                            ctx.mcode.data.write(&DynSlot::new(phislot.byte(), ty));
                         }
                     }
                     slot = base;
@@ -93,7 +93,7 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                 slot += 1;
                 // alloc vmctx slots (fx slots don't matter, they will never be read/written)
                 for phi in index::iter_span(func.ret) {
-                    insert.push(&match func.phis.at(phi).type_ {
+                    insert.push(match func.phis.at(phi).type_ {
                         Type::FX => Default::default(),
                         _ => {
                             let s = slotdefs[slot].value;

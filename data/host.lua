@@ -35,7 +35,8 @@ local PRI_U32 = 7
 local PRI_U16 = 8
 local PRI_U8  = 9
 local PRI_B1  = 10
-local PRI_STR = 11
+local PRI_PTR = 11
+local PRI_STR = 12
 local PRI_CT = {
 	[PRI_F64] = ffi.typeof("double"),
 	[PRI_F32] = ffi.typeof("float"),
@@ -48,6 +49,7 @@ local PRI_CT = {
 	[PRI_U16] = ffi.typeof("uint16_t"),
 	[PRI_U8]  = ffi.typeof("uint8_t"),
 	[PRI_B1]  = ffi.typeof("bool"),
+	[PRI_PTR] = ffi.typeof("void *"),
 	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
 }
 
@@ -388,16 +390,17 @@ local function graph_dump(graph, flags)
 	return buf:get()
 end
 
--- logic here should match `vtypeann` in lower.rs
-local function vtypeann(obj)
+local function ann2ct(obj)
 	if obj.ann then
 		obj = obj.ann
 	end
 	local aty = objtypeof(obj)
 	if aty == "TPRI" then
 		return PRI_CT[obj.ty]
-	elseif aty == "TCON" then
-		return tensor.ctypeof(vtypeann(obj.args[1]), obj.args[2].dim)
+	elseif aty == "TTEN" then
+		return tensor.ctypeof(ann2ct(obj.elem), obj.dim)
+	else
+		error("bad type annotation")
 	end
 end
 
@@ -418,7 +421,7 @@ local function queryctype(query)
 	local args = {}
 	for i,v in ipairs(query.obj.value) do
 		buf:putf("$ v%d;\n", i)
-		args[i] = vtypeann(v)
+		args[i] = ann2ct(v)
 	end
 	buf:put("}")
 	return ffi.metatype(

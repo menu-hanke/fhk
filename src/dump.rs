@@ -20,8 +20,7 @@ use crate::trace::trace;
 
 fn dump_field(
     buf: &mut ByteString,
-    constants: &Intern,
-    sequences: &Intern,
+    intern: &Intern,
     fty: FieldType,
     value: u32
 ) {
@@ -32,8 +31,8 @@ fn dump_field(
         Ref  => write!(buf, "{:?}", {let r: ObjRef = zerocopy::transmute!(value); r}).unwrap(),
         Name => stringify(
             buf,
-            constants,
-            sequences.get_slice(zerocopy::transmute!(value)),
+            intern,
+            intern.get_slice(zerocopy::transmute!(value)),
             SequenceType::Pattern // doesn't matter what is passed here, it doesn't have captures
         ),
         _ => unreachable!()
@@ -42,8 +41,7 @@ fn dump_field(
 
 fn dump_obj(
     buf: &mut ByteString,
-    constants: &Intern,
-    sequences: &Intern,
+    intern: &Intern,
     objs: &Objects,
     idx: ObjRef
 ) {
@@ -60,7 +58,7 @@ fn dump_obj(
         }
         write!(buf, " {}:", name).unwrap();
         if (Lit | Ref | Name).contains(fty) {
-            dump_field(buf, constants, sequences, fty, raw[idx]);
+            dump_field(buf, intern, fty, raw[idx]);
             idx += 1;
             continue
         }
@@ -68,7 +66,7 @@ fn dump_obj(
         let fty = match fty { VRef => Ref, _ => Lit };
         buf.push('[');
         while idx < raw.len() {
-            dump_field(buf, constants, sequences, fty, raw[idx]);
+            dump_field(buf, intern, fty, raw[idx]);
             idx += 1;
             if idx < raw.len() { buf.push(' ') }
         }
@@ -79,24 +77,23 @@ fn dump_obj(
 
 pub fn dump_objs(
     buf: &mut ByteString,
-    constants: &Intern,
-    sequences: &Intern,
+    intern: &Intern,
     objs: &Objects,
     start: ObjRef
 ) {
     if start == objs.end() { return }
     let mut idx = start;
     loop {
-        dump_obj(buf, constants, sequences, objs, idx);
+        dump_obj(buf, intern, objs, idx);
         let Some(i) = objs.next(idx) else { break };
         idx = i;
     }
 }
 
-pub fn trace_objs(constants: &Intern, sequences: &Intern, objs: &Objects, start: ObjRef) {
+pub fn trace_objs( sequences: &Intern, objs: &Objects, start: ObjRef) {
     trace!("{}", {
         let mut tmp = Default::default();
-        dump_objs(&mut tmp, constants, sequences, objs, start);
+        dump_objs(&mut tmp, sequences, objs, start);
         tmp
     });
 }
@@ -119,6 +116,7 @@ fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&emit::Val
         match op {
             Operand::X  => write!(buf, " {}", raw as i16),
             Operand::XX => { raw >>= 16; write!(buf, " {}", raw as i32) },
+            Operand::XF => write!(buf, " XF:{:x}", raw as u32),
             Operand::V  => write!(buf, " {:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i}),
             Operand::C  => {
                 if let Some(values) = values {

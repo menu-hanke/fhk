@@ -103,7 +103,7 @@ pub enum Token {
     #[token("table")]     Table,
     #[token("func")]      Func,
     #[token("where")]     Where,
-    #[token("intrinsic")] Intrinsic,
+    #[token("out")]       Out,
     #[token("let")]       Let,
     #[token("in")]        In,
     #[token("true")]      True,
@@ -175,7 +175,7 @@ impl Token {
             Table      => "table",
             Func       => "func",
             Where      => "where",
-            Intrinsic  => "intrinsic",
+            Out        => "out",
             Let        => "let",
             In         => "in",
             And        => "and",
@@ -203,14 +203,14 @@ fn internid(pcx: &mut Pcx, ofs: usize) {
     if id.get(0).cloned() == Some('`' as _) {
         id = &id[1..id.len()-1];
     }
-    pcx.data.tdata = zerocopy::transmute!(pcx.constants.intern(id));
+    pcx.data.tdata = zerocopy::transmute!(pcx.intern.intern(id));
 }
 
 fn internint(pcx: &mut Pcx, v: i64) -> Token {
     let (token, data) = if (v as i32) as i64 == v {
         (Token::Int, v as _)
     } else {
-        (Token::Int64, zerocopy::transmute!(pcx.constants.intern(&v.to_ne_bytes())))
+        (Token::Int64, zerocopy::transmute!(pcx.intern.intern(&v.to_ne_bytes()).to_bump()))
     };
     pcx.data.tdata = data;
     token
@@ -220,7 +220,7 @@ fn internfloat(pcx: &mut Pcx, v: f64) -> Token {
     if (v as i64) as f64 == v {
         internint(pcx, v as i64)
     } else {
-        pcx.data.tdata = zerocopy::transmute!(pcx.constants.intern(&v.to_ne_bytes()));
+        pcx.data.tdata = zerocopy::transmute!(pcx.intern.intern(&v.to_ne_bytes()).to_bump());
         Token::Fp64
     }
 }
@@ -271,7 +271,7 @@ pub fn next(pcx: &mut Pcx) -> compile::Result<Token> {
         },
         Token::Literal => {
             let s = parser.lex.slice();
-            parser.tdata = zerocopy::transmute!(pcx.constants.intern(&s[1..s.len()-1]));
+            parser.tdata = zerocopy::transmute!(pcx.intern.intern(&s[1..s.len()-1]));
         },
         _ => {}
     }

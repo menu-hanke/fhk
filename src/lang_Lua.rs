@@ -1,22 +1,29 @@
 //! Lua language support.
 
-use crate::compile;
+use crate::compile::{self, Ccx};
 use crate::lang::Language;
+use crate::obj::{ObjRef, CALLX};
 use crate::parser::Pcx;
 
-pub struct Lua;
+#[derive(Default)]
+pub struct Lua {
+
+}
+
+// funcdef :: (module+func)|source + arg?
+// arg     :: value + arg?
+// value   :: obj|tab
+// tab     :: key next
+// etc...
 
 impl Language for Lua {
-    const NAME: &'static [u8] = b"Lua";
-    type ObjData = ();
-    type EmitData = ();
-    type ImageData = ();
 
-    fn graph_data() -> Self::ObjData {
-        ()
-    }
-
-    fn parse_call(data: &mut Self::ObjData, pcx: &mut Pcx) -> compile::Result {
+    fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALLX>> {
         todo!()
     }
+
+    fn begin_emit(_: &mut Ccx) -> compile::Result<Self> {
+        Ok(Default::default())
+    }
+
 }

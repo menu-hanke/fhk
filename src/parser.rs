@@ -7,13 +7,12 @@ use core::ops::Range;
 use alloc::vec::Vec;
 use enumset::EnumSet;
 use logos::Logos;
-use zerocopy::IntoBytes;
 
 use crate::bytestring::ByteString;
-use crate::compile::{self, Ccx, Const, Phase, Seq};
+use crate::compile::{self, Ccx, Phase};
 use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
-use crate::intern::{Intern, InternRef};
+use crate::intern::{Intern, IRef};
 use crate::lex::{self, Token};
 use crate::obj::{ObjRef, EXPR, TAB};
 use crate::typestate::{typestate_union, Absent};
@@ -22,14 +21,14 @@ index!(pub struct ScopeId(u32) invalid(!0));
 index!(struct MacroId(u32) invalid(!0));
 
 pub struct Binding {
-    pub name: InternRef<Seq>,
+    pub name: IRef<[u8]>,
     pub value: ObjRef<EXPR>
 }
 
 struct Macro {
-    table_pattern: InternRef<Seq>, // only for model/var
-    name_pattern: InternRef<Seq>,
-    body: InternRef<Seq>,
+    table_pattern: IRef<[u8]>, // only for model/var
+    name_pattern: IRef<[u8]>,
+    body: IRef<[u8]>,
     next: IndexOption<MacroId> // next with same namespace and stem
 }
 
@@ -68,11 +67,10 @@ pub struct Parser<L=Absent> {
     pub scope: ScopeId,
     pub bindings: Vec<Binding>,
     pub tab: ObjRef<TAB>,
-    pub tmpref: Vec<ObjRef>,
-    pub marg: Vec<InternRef<Const>>,
+    pub marg: Vec<IRef<[u8]>>,
     pub rec: bool,
     macros: IndexVec<MacroId, Macro>,
-    chain: HashMap<(InternRef<Const>, Namespace), (MacroId, MacroId)>, // stem -> (head, tail)
+    chain: HashMap<(IRef<[u8]>, Namespace), (MacroId, MacroId)>, // stem -> (head, tail)
     stack: Vec<Frame>,
     captures: Vec<Range<u32>>,
     snippet: Vec<u8>,
@@ -124,7 +122,7 @@ const TK_DATA: u8 = Token::Literal as _;
 const TK_DATALEN: usize = 4;
 const TK_CAPTURE: u8 = Token::OpInsert as _;
 
-pub fn stringify(buf: &mut ByteString, constants: &Intern, body: &[u8], sty: SequenceType) {
+pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: SequenceType) {
     let mut i = 0;
     let mut space = false;
     let mut data = 0;
@@ -146,7 +144,7 @@ pub fn stringify(buf: &mut ByteString, constants: &Intern, body: &[u8], sty: Seq
                     if tk == Token::CapName { buf.push('$'); }
                     // TODO: this doesn't properly quote idents or escape quotes in strings.
                     if tk == Token::Literal { buf.push('"'); }
-                    buf.push_bytes(constants.get_slice(zerocopy::transmute!(data)));
+                    buf.push_bytes(intern.get_slice(zerocopy::transmute!(data)));
                     if tk == Token::Literal { buf.push('"'); }
                 },
                 Token::CapPos => {
@@ -157,11 +155,11 @@ pub fn stringify(buf: &mut ByteString, constants: &Intern, body: &[u8], sty: Seq
                 },
                 Token::Int => write!(buf, "{}", data as i32).unwrap(),
                 Token::Int64 => {
-                    let v = i64::from_ne_bytes(constants[zerocopy::transmute!(data)]);
+                    let v = i64::from_ne_bytes(intern[zerocopy::transmute!(data)]);
                     write!(buf, "{}", v).unwrap();
                 },
                 Token::Fp64 => {
-                    let v = f64::from_ne_bytes(constants[zerocopy::transmute!(data)]);
+                    let v = f64::from_ne_bytes(intern[zerocopy::transmute!(data)]);
                     write!(buf, "{}", v).unwrap();
                 },
                 tk => {
@@ -201,19 +199,19 @@ fn traceback(pcx: &mut Pcx) {
         match frame.ns {
             Model | Var | Func | Table | Snippet => {
                 let macro_ = &pcx.data.macros[zerocopy::transmute!(frame.this)];
-                if macro_.table_pattern != InternRef::EMPTY {
+                if macro_.table_pattern != IRef::EMPTY {
                     stringify(
                         &mut pcx.host.buf,
-                        &pcx.constants,
-                        pcx.sequences.get_slice(macro_.table_pattern.cast()),
+                        &pcx.intern,
+                        pcx.intern.get_slice(macro_.table_pattern.cast()),
                         SequenceType::Pattern
                     );
                     pcx.host.buf.push('.');
                 }
                 stringify(
                     &mut pcx.host.buf,
-                    &pcx.constants,
-                    pcx.sequences.get_slice(macro_.name_pattern.cast()),
+                    &pcx.intern,
+                    pcx.intern.get_slice(macro_.name_pattern.cast()),
                     SequenceType::Pattern
                 );
             },
@@ -221,8 +219,8 @@ fn traceback(pcx: &mut Pcx) {
                 let Range { start, end } = pcx.data.captures[frame.this as usize];
                 stringify(
                     &mut pcx.host.buf,
-                    &pcx.constants,
-                    &pcx.sequences.bump().as_slice()[start as usize .. end as usize],
+                    &pcx.intern,
+                    &pcx.intern.bump().as_slice()[start as usize .. end as usize],
                     SequenceType::Body
                 );
             }
@@ -264,27 +262,39 @@ pub fn tokenerr<T>(pcx: &mut Pcx, want: impl Into<EnumSet<Token>>) -> compile::R
 }
 
 #[cold]
-fn xdeferr_(pcx: &mut Pcx, ns: Namespace, body: InternRef<Seq>, what: &str) {
+fn xdeferr_(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>, what: &str) {
     pcx.host.buf.clear();
     pcx.host.buf.push_str(what);
     pcx.host.buf.push_str(nsname(ns));
     stringify(
         &mut pcx.host.buf,
-        &pcx.constants,
-        pcx.sequences.get_slice(body.cast()),
+        &pcx.intern,
+        pcx.intern.get_slice(body.cast()),
         SequenceType::Body
     );
     pcx.host.buf.push('\n');
     traceback(pcx)
 }
 
-pub fn undeferr<T>(pcx: &mut Pcx, ns: Namespace, body: InternRef<Seq>) -> compile::Result<T> {
+pub fn undeferr<T>(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>) -> compile::Result<T> {
     xdeferr_(pcx, ns, body, "undefined ");
     Err(())
 }
 
-pub fn redeferr<T>(pcx: &mut Pcx, ns: Namespace, body: InternRef<Seq>) -> compile::Result<T> {
+pub fn redeferr<T>(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>) -> compile::Result<T> {
     xdeferr_(pcx, ns, body, "redefinition of ");
+    Err(())
+}
+
+#[cold]
+fn langerr_(pcx: &mut Pcx) {
+    pcx.host.buf.clear();
+    pcx.host.buf.push_str("unsupported language: ");
+    pcx.host.buf.push_bytes(pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)));
+}
+
+pub fn langerr<T>(pcx: &mut Pcx) -> compile::Result<T> {
+    langerr_(pcx);
     Err(())
 }
 
@@ -325,7 +335,7 @@ impl ParenCounter {
 pub fn try_match(
     captures: &mut Vec<Range<u32>>,
     intern: &Intern,
-    candidate: InternRef<Seq>,
+    candidate: IRef<[u8]>,
     pattern: &[u8]
 ) -> bool {
     let candidate = intern.get_range(candidate.cast());
@@ -424,7 +434,7 @@ pub fn try_match(
     }
 }
 
-fn splitstem(name: &[u8]) -> InternRef<Const> {
+fn splitstem(name: &[u8]) -> IRef<[u8]> {
     debug_assert!(name[0] == Token::Ident as _);
     let stem: [u8; TK_DATALEN] = name[1..5].try_into().unwrap();
     zerocopy::transmute!(stem)
@@ -433,10 +443,10 @@ fn splitstem(name: &[u8]) -> InternRef<Const> {
 fn pushmacro<'a, 'input>(
     pcx: &'a mut Pcx<'input>,
     ns: Namespace,
-    table: InternRef<Seq>,
-    name: InternRef<Seq>
+    table: IRef<[u8]>,
+    name: IRef<[u8]>
 ) -> Option<&'a mut Frame> {
-    let stem = splitstem(pcx.sequences.get_slice(name.cast()));
+    let stem = splitstem(pcx.intern.get_slice(name.cast()));
     let parser = &mut *pcx.data;
     let mut id = parser.chain.get(&(stem, ns))?.0;
     let base = parser.captures.len() as _;
@@ -444,16 +454,16 @@ fn pushmacro<'a, 'input>(
         let macro_ = &parser.macros[id];
         if try_match(
             &mut parser.captures,
-            &pcx.sequences,
+            &pcx.intern,
             table,
-            pcx.sequences.get_slice(macro_.table_pattern.cast()),
+            pcx.intern.get_slice(macro_.table_pattern.cast()),
         ) && try_match(
             &mut parser.captures,
-            &pcx.sequences,
+            &pcx.intern,
             name,
-            pcx.sequences.get_slice(macro_.name_pattern.cast())
+            pcx.intern.get_slice(macro_.name_pattern.cast())
         ) {
-            let body = pcx.sequences.get_range(macro_.body.cast());
+            let body = pcx.intern.get_range(macro_.body.cast());
             parser.stack.push(Frame {
                 base,
                 cursor: body.start as _,
@@ -473,7 +483,7 @@ fn pushmacro<'a, 'input>(
     }
 }
 
-fn snipname(pcx: &mut Pcx) -> compile::Result<InternRef<Seq>> {
+fn snipname(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
     let parser = &mut *pcx.data;
     let base = parser.snippet.len();
     if parser.token == Token::Scope {
@@ -501,7 +511,7 @@ fn snipname(pcx: &mut Pcx) -> compile::Result<InternRef<Seq>> {
             token = pcx.data.token;
         }
     }
-    let id = pcx.sequences.intern(&pcx.data.snippet[base..]).cast();
+    let id = pcx.intern.intern(&pcx.data.snippet[base..]).cast();
     pcx.data.snippet.truncate(base);
     Ok(id)
 }
@@ -522,7 +532,7 @@ fn expandnext(pcx: &mut Pcx) -> Option<Token> {
             None => expandnext(pcx)
         }
     }
-    let data = &pcx.sequences.bump().as_slice()[top.cursor as usize ..];
+    let data = &pcx.intern.bump().as_slice()[top.cursor as usize ..];
     if data[0] < Token::OpInsert as u8 {
         let token: Token = unsafe { transmute(data[0]) };
         parser.token = token;
@@ -551,31 +561,31 @@ fn expandnext(pcx: &mut Pcx) -> Option<Token> {
 }
 
 fn expandstring(pcx: &mut Pcx) {
-    let start = pcx.constants.bump().end();
+    let start = pcx.intern.bump().end();
     loop {
         // this should never return none, because the recorder should never record
         // incomplete strings
         match expandnext(pcx).unwrap() {
             Token::OpLiteralBoundary => break,
-            Token::Ident | Token::Literal => pcx.constants.push_ref(
+            Token::Ident | Token::Literal => pcx.intern.write_ref(
                 zerocopy::transmute!(pcx.data.tdata)),
-            Token::Scope => write!(&mut pcx.constants, "%{}", pcx.data.tdata).unwrap(),
-            Token::Int => write!(&mut pcx.constants, "{}", pcx.data.tdata as i32).unwrap(),
+            Token::Scope => write!(&mut pcx.intern, "%{}", pcx.data.tdata).unwrap(),
+            Token::Int => write!(&mut pcx.intern, "{}", pcx.data.tdata as i32).unwrap(),
             Token::Int64 => {
-                let v = i64::from_ne_bytes(pcx.constants[zerocopy::transmute!(pcx.data.tdata)]);
-                write!(&mut pcx.constants, "{}", v).unwrap();
+                let v = i64::from_ne_bytes(pcx.intern[zerocopy::transmute!(pcx.data.tdata)]);
+                write!(&mut pcx.intern, "{}", v).unwrap();
             },
             Token::Fp64 => {
-                let v = f64::from_ne_bytes(pcx.constants[zerocopy::transmute!(pcx.data.tdata)]);
-                write!(&mut pcx.constants, "{}", v).unwrap();
+                let v = f64::from_ne_bytes(pcx.intern[zerocopy::transmute!(pcx.data.tdata)]);
+                write!(&mut pcx.intern, "{}", v).unwrap();
             },
             Token::OpThis => todo!(),
             // Token::OpThis => pushcap(&mut parser.macros,
             //     parser.builder.graph.vars[parser.this].name),
-            tok => pcx.constants.push(tok.str())
+            tok => pcx.intern.write(tok.str())
         }
     }
-    pcx.data.tdata = zerocopy::transmute!(pcx.constants.intern_consume_from(start));
+    pcx.data.tdata = zerocopy::transmute!(pcx.intern.intern_consume_from(start));
 }
 
 fn nexttoken(pcx: &mut Pcx) -> compile::Result<Token> {
@@ -595,7 +605,7 @@ pub fn next(pcx: &mut Pcx) -> compile::Result {
             next(pcx)?;
             let name = snipname(pcx)?;
             let Parser { token, tdata: data, .. } = *pcx.data;
-            match pushmacro(pcx, Namespace::Snippet, InternRef::EMPTY, name) {
+            match pushmacro(pcx, Namespace::Snippet, IRef::EMPTY, name) {
                 Some(frame) => {
                     frame.lookahead = Some(token);
                     frame.lookahead_data = data;
@@ -634,9 +644,10 @@ pub fn consume(pcx: &mut Pcx, token: Token) -> compile::Result {
 }
 
 pub fn save(pcx: &mut Pcx) {
-    pcx.sequences.push(&(pcx.data.token as u8));
+    pcx.tmp.push(pcx.data.token as u8);
     if pcx.data.token.has_data() {
-        pcx.sequences.push(pcx.data.tdata.as_bytes());
+        // don't push `tdata` directly here, this write must be unaligned
+        pcx.tmp.push(pcx.data.tdata.to_ne_bytes());
     }
 }
 
@@ -660,7 +671,7 @@ pub fn parse<'a,F,R>(ccx: &'a mut Ccx<Parser>, input: &'a [u8], func: F) -> comp
             {let o: u32 = zerocopy::transmute!(start); o},
             {let o: u32 = zerocopy::transmute!(pcx.objs.end()); o}
         );
-        crate::dump::trace_objs(&pcx.constants, &pcx.sequences, &pcx.objs, start);
+        crate::dump::trace_objs(&pcx.intern, &pcx.objs, start);
     }
     // safety: pcx contains a valid lexer
     unsafe { core::ptr::drop_in_place(&mut pcx.data.lex) }
@@ -677,7 +688,6 @@ impl Phase for Parser {
             scope: ScopeId(0),
             bindings: Default::default(),
             tab: ObjRef::GLOBAL,
-            tmpref: Default::default(),
             marg: Default::default(),
             macros: Default::default(),
             chain: Default::default(),

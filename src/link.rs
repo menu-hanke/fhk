@@ -1,5 +1,7 @@
 //! Machine code linking.
 
+use core::mem::take;
+
 use crate::compile::{self, Ccx, Phase};
 use crate::image::Image;
 use crate::mcode::{MCode, Reloc, Sym};
@@ -76,7 +78,6 @@ impl Phase for Link {
         let mem = link(&ccx.mcode)?;
         ccx.image = Some(Image {
             mem,
-            lang: Default::default(), // TODO
             breakpoints: ccx.layout.breakpoints,
             size: ccx.layout.size
         });

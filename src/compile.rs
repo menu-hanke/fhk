@@ -5,12 +5,14 @@ use core::mem::{transmute, ManuallyDrop};
 use zerocopy::IntoBytes;
 
 use crate::bump::{Bump, BumpRef};
+use crate::dl::DynLibs;
 use crate::emit::Emit;
+use crate::finalize::FinalizerBuilder;
 use crate::host::HostCtx;
 use crate::image::Image;
-use crate::intern::{Intern, InternRef};
+use crate::intern::{Intern, IRef};
 use crate::ir::IR;
-use crate::lang::{self, LangMap};
+use crate::lang::LangState;
 use crate::layout::ComputeLayout;
 use crate::lex::Token;
 use crate::link::Link;
@@ -54,31 +56,46 @@ define_phases! {
     LOWER       Lower;
     OPTIMIZE    Optimize;
     LAYOUT      ComputeLayout;
-    // REMOVEFX    RemoveFx;
     EMIT        Emit;
     LINK        Link;
 }
 
 #[repr(C)] // need repr(C) for transmuting references.
 pub struct Ccx<P=Absent, O=RW, I=RW> {
+    // current phase data
     pub data: PhaseData<P>,
+    // object graph
     pub objs: Access<Objects, O>,
+    // IR
     pub ir: Access<IR, I>,
+    // reset map and reset id alloc state
     pub resets: Resets,
-    pub bump: Bump,
-    pub constants: Intern, // strings, numbers
-    pub sequences: Intern, // names, macros
-    pub emit: LangMap<lang::EmitData>,
+    // memory for miscellaneous allocs that must live until the end of the compilation
+    pub perm: Bump,
+    // memory for temporary function-local allocs
+    // user should always reset this before returning
+    // idiom:
+    //   let base = tmp.end()
+    //   /* ... use tmp ... */
+    //   tmp.truncate(base)
+    pub tmp: Bump,
+    // interned byte strings (names, templates, extfuncs etc)
+    pub intern: Intern,
+    // dynamic library handles
+    pub dynlibs: DynLibs,
+    // finalizers
+    pub fin: FinalizerBuilder,
+    // language-specific state
+    pub lang: LangState,
+    // vmctx memory layout information
     pub layout: Layout,
+    // mcode functions and data
     pub mcode: MCode,
-    pub image: Option<Image>,
+    // host state
     pub host: HostCtx,
+    // compilation result
+    pub image: Option<Image>,
 }
-
-// Q: why are there two intern tables?
-// A: so that the parser can build names/macros incrementally while the lexer interns constants
-pub struct Const([u8]); // byte sequence stored in ccx.constants
-pub struct Seq([u8]);   // byte sequence stored in ccx.sequences
 
 pub struct CompilePhase<'a, P, T: PhaseMarker> {
     pub ccx: &'a mut Ccx<P, RW, RW>,
@@ -87,29 +104,30 @@ pub struct CompilePhase<'a, P, T: PhaseMarker> {
 
 impl Ccx {
 
-    pub const SEQ_GLOBAL: InternRef<Seq> = InternRef::small(5, 4); // ident + u32
+    pub const SEQ_GLOBAL: IRef<[u8]> = IRef::small(11, 4);
 
     pub fn new(host: HostCtx) -> Self {
-        let mut constants = Intern::default();
-        let k_global = constants.intern("global".as_bytes());
-        debug_assert!(k_global == InternRef::small(6, 5));
-        let mut sequences = Intern::default();
-        sequences.push(&(Token::Ident as u8));
-        sequences.push(InternRef::<Const>::small(6, 5).as_bytes()); // 5+1 = "global".len()
-        let seq_global = sequences.intern_consume_from(BumpRef::zero()).cast();
-        debug_assert!(seq_global == Self::SEQ_GLOBAL);
+        let mut intern = Intern::default();
+        let global_str = intern.intern("global");
+        debug_assert!(global_str == IRef::small(6, 6-1));
+        intern.write(&(Token::Ident as u8));
+        intern.write(global_str.as_bytes()); // must be unaligned
+        let global_seq = intern.intern_consume_from(BumpRef::from_offset(6));
+        debug_assert!(global_seq == Self::SEQ_GLOBAL);
         Self {
             host,
             ir: Default::default(),
             objs: Default::default(),
             resets: Default::default(),
-            bump: Default::default(),
-            constants,
-            sequences,
+            perm: Default::default(),
+            tmp: Default::default(),
+            intern,
+            dynlibs: Default::default(),
+            fin: Default::default(),
             data: Default::default(),
             mcode: Default::default(),
             image: Default::default(),
-            emit: Default::default(),
+            lang: Default::default(),
             layout: Default::default(),
         }
     }

@@ -8,6 +8,8 @@ use enumset::EnumSetType;
 
 use crate::bump::BumpRef;
 use crate::index::{index, IndexValueVec, IndexVec};
+use crate::intern::IRef;
+use crate::lang::Lang;
 use crate::mcode::MCodeData;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
 use crate::minivec::MiniIndexValueVec;
@@ -85,27 +87,48 @@ impl Type {
 
 /* ---- Opcodes ------------------------------------------------------------- */
 
-#[derive(EnumSetType)]
-pub enum Operand {
-    X,   // u16 data
-    XX,  // u32 data
-    V,   // value
-    C,   // control
-    P,   // phi
-    F,   // function
+macro_rules! define_operands {
+    ($(
+        $name:ident: $type:ty;
+    )*) => {
+
+        #[derive(EnumSetType)]
+        pub enum Operand {
+            $($name),*
+        }
+
+        mod mode_type {
+            use super::*;
+            $(pub type $name = $type;)*
+        }
+
+    };
 }
 
-// XXX: replace with concat_idents when it stabilizes
-//   type mode_X = u16
-//   type mode_V = InsId
-//   ...
-mod mode_type {
-    pub type X = u16;
-    pub type XX = u32;
-    pub type V = super::InsId;
-    pub type C = super::InsId;
-    pub type P = super::PhiId;
-    pub type F = super::FuncId;
+define_operands! {
+    V:  InsId;  // value
+    C:  InsId;  // control
+    P:  PhiId;  // phi
+    F:  FuncId; // function
+    X:  u16;    // 16-bit literal
+    XX: u32;    // 32-bit literal
+    XF: IRef<ExtFunc>; // external funcion
+}
+
+macro_rules! encode_at {
+    ($value:expr, $_:expr, $(XX)* $(XF)*) => {{
+        let v: u32 = zerocopy::transmute!($value);
+        (v as u64) << 32
+    }};
+    ($value:expr, $offset:expr, $_:ident) => {{
+        let v: u16 = zerocopy::transmute!($value);
+        (v as u64) << $offset
+    }};
+}
+
+macro_rules! decode_at {
+    ($ins:expr, $_:ident, $(XX)* $(XF)*) => { zerocopy::transmute!($ins.bc()) };
+    ($ins:expr, $field:ident, $_:ident) => { zerocopy::transmute!($ins.$field()) };
 }
 
 macro_rules! decode_fn {
@@ -113,38 +136,33 @@ macro_rules! decode_fn {
     ($vis:vis fn $name:ident -> $($field:ident=$mode:ident)*) => {
         #[allow(unused_parens)]
         $vis fn $name(self) -> ( $(mode_type::$mode),* ) {
-            ( $(zerocopy::transmute!(self.$field())),* )
+            ( $(decode_at!(self, $field, $mode)),* )
         }
     };
-    (
-        $vis:vis fn $name:ident ->
-        $($a:ident $($b:ident $($c:ident)?)?)?
-    ) => {
+    ($vis:vis fn $name:ident -> $($a:ident $($b:ident $($c:ident)?)?)?) => {
         decode_fn!($vis fn $name -> $(a=$a $(b=$b $(c=$c)?)?)?);
     };
 }
 
 macro_rules! define_opcodes {
-    (@new $name:ident ($($t1:tt)*) ($($t2:tt)*) XX) => {
-        pub const fn $name(type_: Type, arg: u32) -> Ins {
-            Ins::new(Opcode::$name, type_).set_bc(arg)
-        }
-    };
+    (@set $ins:expr, $set:ident $_:ident $v:expr) => { $ins.$set($v) };
     (
         @new $name:ident
         ($($typearg:ident)?; $($_:tt)*) ($typeval:expr; $($__:tt)*)
-        $($field:ident=$mode:ident)*
+        $($mode1:ident $($mode2:ident $($mode3:ident)?)?)?
     ) => {
-        pub const fn $name($($typearg: Type,)? $($field: mode_type::$mode),*) -> Ins {
-            Ins::new(Opcode::$name, $typeval)$(.$field(zerocopy::transmute!($field)))*
+        pub const fn $name(
+            $($typearg: Type,)?
+            $( v1: mode_type::$mode1, $( v2: mode_type::$mode2, $( v3: mode_type::$mode3, )?)?)?
+        ) -> Ins {
+            #[allow(unused_mut)]
+            let mut ins = Ins::new(Opcode::$name, $typeval);
+            $( ins.0 |= encode_at!(v1, 16, $mode1);
+            $( ins.0 |= encode_at!(v2, 32, $mode2);
+            $( ins.0 |= encode_at!(v3, 48, $mode3);
+            )?)?)?
+            ins
         }
-    };
-    (
-        @new $name:ident ($($t1:tt)*) ($($t2:tt)*)
-        // mood: https://i.imgur.com/Xy0VYlk.png
-        $($a:ident $($b:ident $($c:ident)?)?)?
-    ) => {
-        define_opcodes!(@new $name ($($t1)*) ($($t2)*) $(set_a=$a $(set_b=$b $(set_c=$c)?)?)?);
     };
     ($(
         $name:ident $(.$type:ident)?
@@ -221,7 +239,6 @@ define_opcodes! {
     MOVB      V;
     MOVF      V V;
     CONV      V X;
-    JOIN.FX   V V;
 
     ADD       V V;
     SUB       V V;
@@ -242,8 +259,10 @@ define_opcodes! {
     ALLOC.PTR V V;                     // size align
     STORE.FX  V V;                     // ptr value
     LOAD      V;                       // ptr
+    BOX.PTR   V;                       // value (b=offset after layout)
 
     CALL.FX   V F,   decode_CALL;      // args func
+    CALLX     V XF,  decode_CALLX;     // args extfunc
     CALLB.FX  V V F, decode_CALLB;     // idx fx bundle  (NOT inlineable)
     CALLBI.FX V V F;                   // idx fx bundle  (inlineable)
     CARG.FX   V V,   decode_CARG;      // arg next
@@ -480,6 +499,7 @@ pub struct Func {
     pub arg: PhiId, // one past last argument
     pub phis: MiniIndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
+    // TODO: box size
 }
 
 #[derive(Default)]
@@ -587,4 +607,16 @@ impl<'a> SignatureBuilder<'a, Args> {
         self.func.arg = self.func.phis.end();
     }
 
+}
+
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C)]
+pub struct ExtFunc {
+    pub lang: u8,
+}
+
+impl ExtFunc {
+    pub fn new(lang: Lang) -> Self {
+        Self { lang: lang as _ }
+    }
 }
