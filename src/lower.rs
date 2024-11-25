@@ -578,6 +578,20 @@ fn emitrangeloop(func: &Func, loop_: &mut LoopState, ty: Type, start: InsId, end
     i
 }
 
+fn emittensorloop(
+    func: &Func,
+    loop_: &mut LoopState,
+    ty: Type,  // TODO take an objref type instead to support more complex types
+    value: InsId,
+    len: InsId
+) -> (InsId, InsId) {
+    let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
+    let i = emitrangeloop(func, loop_, IRT_IDX, zero, len);
+    let ptr = emitarrayptr(func, value, i, ty);
+    let v = func.code.push(Ins::LOAD(ty, ptr));
+    (i, v)
+}
+
 //                       +-------------------------------------------------------+
 //                       |                   +---------------------------------+ |
 //                       |                   |                                 | v
@@ -1465,17 +1479,31 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
 fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
     let objs = Access::borrow(&lcx.objs);
     match objs.get(expr.erase()) {
-        ObjectRef::VGET(&VGET { var, ref idx, .. }) => {
-            let var = vardata(&lcx.data.objs, var);
-            let i = emitidx(lcx, ControlFlow::Loop(loop_), lcx.data.bump[var].tab, idx);
+        ObjectRef::VGET(&VGET { ann, var, ref idx, .. }) => {
+            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
+            let v = vardata(&lcx.data.objs, var);
+            let scalarload = ann == lcx.objs[var].ann;
+            let cf = match scalarload {
+                true => ControlFlow::Straight(&mut loop_.head),
+                false => ControlFlow::Loop(loop_)
+            };
+            let i = emitidx(lcx, cf, lcx.data.bump[v].tab, idx);
             let inline = !idxanalyze(
                 lcx,
-                lcx.data.bump[var].tab,
+                lcx.data.bump[v].tab,
                 lcx.data.bump[lcx.data.tab].n as _,
                 idx,
                 IdxAttr::Disjoint.into()
             ).is_empty();
-            emitvarload(lcx, var, i, inline)
+            let mut value = emitvarload(lcx, v, i, inline);
+            if scalarload {
+                let TTEN { elem, dim, .. } = lcx.objs[ann.cast()];
+                let len = emitshapelen(&lcx.data.func, value+1, dim as _);
+                // TODO support complex types here
+                let ty = Primitive::from_u8(lcx.objs[elem.cast::<TPRI>()].ty).to_ir();
+                value = emittensorloop(&lcx.data.func, loop_, ty, value, len).1;
+            }
+            value
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
@@ -1500,12 +1528,9 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
             let addr = emitvalue(lcx, &mut loop_.head, addr);
             let shape = emitvalues(lcx, &mut loop_.head, dims);
             let len = emitshapelen(&lcx.data.func, shape, dims.len());
-            let zero = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
-            let i = emitrangeloop(&lcx.data.func, loop_, IRT_IDX, zero, len);
             let ty = Primitive::from_u8(
                 lcx.objs[lcx.objs[ann.cast::<TTEN>()].elem.cast::<TPRI>()].ty).to_ir();
-            let ptr = emitarrayptr(&lcx.data.func, addr, i, ty);
-            lcx.data.func.code.push(Ins::LOAD(ty, ptr))
+            emittensorloop(&lcx.data.func, loop_, ty, addr, len).1
         },
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
