@@ -36,20 +36,6 @@ macro_rules! concat_slices {
         }
         v
     }};
-    // ($($v:expr),* $(,)?) => {{
-    //     let mut v = [0; 0 $(+ $v.len())*];
-    //     let mut base = 0;
-    //     $({
-    //         let mut i = 0;
-    //         while i < $v.len() {
-    //             v[base+i] = $v[i];
-    //             i += 1;
-    //         }
-    //         #[allow(unused_assignments)]
-    //         { base += $v.len(); }
-    //     })*
-    //     v
-    // }};
 }
 
 pub(crate) use concat_slices;

@@ -15,7 +15,6 @@ panic = "abort"
 [dependencies]
 iced-x86 = { version = "1.21.0", default-features = false, features = ["no_std", "decoder", "fast_fmt"], optional = true }
 cfg-if = "1.0.0"
-const_format = "0.2.32"
 cranelift-codegen = { version = "0.111.0", default-features = false, features = ["core", "host-arch"] }
 cranelift-entity = "0.111.0"
 cranelift-native = "0.111.0"

@@ -73,3 +73,21 @@ macro_rules! define_lang_mods {
 }
 
 foreach_lang!(define_lang_mods);
+
+/* -------------------------------------------------------------------------- */
+
+const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
+    match option_env!("FHK_GITHASH") { Some(v) => v.as_bytes(), None => b"(unknown version)" },
+    #[cfg(feature="host-Lua")] b" Lua",
+    b" [",
+    #[cfg(feature="lang-C")]   b" C",
+    #[cfg(feature="lang-Lua")] b" Lua",
+    b" ]",
+    b"\0"
+);
+
+#[repr(transparent)] struct Version(*const core::ffi::c_char);
+unsafe impl Sync for Version {}
+
+#[no_mangle]
+static fhk_VERSION: Version = Version(FHK_VERSION_STRING.as_ptr().cast());
