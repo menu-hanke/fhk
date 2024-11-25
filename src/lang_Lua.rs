@@ -235,9 +235,16 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
     let mut load: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
     next(pcx)?;
     if check(pcx, Token::Colon)? {
-        load = load;
-        // TODO: transform "module":"func" into the loader string -> `return require("module")["func"]`
-        if true { todo!() }
+        // TODO: this needs some escaping but that's a problem for another day.
+        let name: IRef<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
+        let base = pcx.tmp.end();
+        pcx.tmp.write(b"return require(\"");
+        pcx.tmp.write(pcx.intern.get_slice(load));
+        pcx.tmp.write(b"\")[\"");
+        pcx.tmp.write(pcx.intern.get_slice(name));
+        pcx.tmp.write(b"\"]");
+        load = pcx.intern.intern(&pcx.tmp[base..]);
+        pcx.tmp.truncate(base);
     }
     pcx.perm[ps.lf].load.set(load);
     consume(pcx, Token::RBracket)?;
