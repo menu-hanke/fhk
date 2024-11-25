@@ -115,15 +115,15 @@ pub enum SequenceType {
     Body      // OpInsert is followed by an index
 }
 
-const SPACE_BETWEEN: u64 = (1 << Token::Ident as u64)
-    | (1 << Token::Dollar as u64)
-    | (1 << Token::CapName as u64)
-    | (1 << Token::CapPos as u64)
-    | (1 << Token::Literal as u64)
-    | (1 << Token::Scope as u64)
-    | (1 << Token::Int as u64)
-    | (1 << Token::Int64 as u64)
-    | (1 << Token::Fp64 as u64);
+const SPACE_BETWEEN: u64 = {
+    use Token::*;
+    (1 << Ident as u64) | (1 << Dollar as u64) | (1 << CapName as u64) | (1 << CapPos as u64)
+        | (1 << Literal as u64) | (1 << Scope as u64) | (1 << Int as u64) | (1 << Int64 as u64)
+        | (1 << Fp64 as u64) | (1 << Not as u64) | (1 << Call as u64) | (1 << Macro as u64)
+        | (1 << Var as u64) | (1 << Model as u64) | (1 << Table as u64) | (1 << Func as u64)
+        | (1 << Where as u64) | (1 << Out as u64) | (1 << Let as u64) | (1 << In as u64)
+        | (1 << True as u64) | (1 << False as u64)
+};
 
 const TK_DATA: u8 = Token::Literal as _;
 const TK_DATALEN: usize = 4;
