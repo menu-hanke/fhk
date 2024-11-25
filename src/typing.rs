@@ -69,6 +69,7 @@ pub enum Constructor {
     Tensor, // (elem dim)
     Pair,   // (left right)
     Func,   // (arg ret)
+    Next,   // (prev)
     Unit,   // ()
     // NOTE: if more constructors are needed, typeinfer::Type needs another tag bit
 }
@@ -77,6 +78,7 @@ impl Constructor {
 
     pub const TENSOR: u8 = Self::Tensor as _;
     pub const PAIR: u8 = Self::Pair as _;
+    pub const NEXT: u8 = Self::Next as _;
     pub const UNIT: u8 = Self::Unit as _;
 
     pub fn from_u8(raw: u8) -> Self {
@@ -89,6 +91,7 @@ impl Constructor {
         use Constructor::*;
         match self {
             Tensor | Pair | Func => 2,
+            Next => 1,
             Unit => 0
         }
     }

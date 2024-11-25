@@ -16,7 +16,7 @@ use crate::index::{IndexOption, InvalidValue};
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::{Primitive, IRT_IDX};
@@ -449,9 +449,10 @@ fn collectobjs(ctx: &mut Ccx<Lower>) {
         if obj.op == Obj::VSET {
             let var = ctx.objs[idx.cast::<VSET>()].var;
             ctx.objs[var].mark += 1;
-        } else if (obj.op, obj.data) == (Obj::INTR, Intrinsic::WHICH as _) {
-            // `which` cannot have its shape computed cheaply or be iterated,
-            // so always treat it has having many refs.
+        } else if (obj.op, obj.data) == (Obj::INTR, Intrinsic::WHICH as _) || obj.op == Obj::CAT {
+            // cannot iter cheaply so always compute value.
+            // (TODO: more general mechanism for this. mark should be a bitmask for
+            // emitvalue/shape/etc behavior)
             ctx.objs[idx].mark = EXPR_MANY;
         }
         for i in obj.ref_params() {
@@ -1158,6 +1159,29 @@ fn emitcallx(lcx: &mut Lcx, ctr: &mut InsId, callx: ObjRef<CALLX>) -> InsId {
     value
 }
 
+// TODO: use code from materializecollect for splat `..x` implementation
+fn emitcat(lcx: &mut Lcx, ctr: &mut InsId, cat: &CAT) -> InsId {
+    debug_assert!(lcx.objs[cat.ann].op == Obj::TTEN);
+    if lcx.objs[cat.ann.cast::<TTEN>()].dim != 1 { todo!() }
+    let pri = Primitive::from_u8(lcx.objs[lcx.objs[cat.ann.cast::<TTEN>()].elem.cast::<TPRI>()].ty);
+    let ty = pri.to_ir();
+    let elemsize = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
+    let out = reserve(&lcx.data.func, 1);
+    let len = lcx.data.func.code.push(Ins::KINT(IRT_IDX, cat.elems.len() as _));
+    let size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, elemsize, len));
+    let buf = lcx.data.func.code.push(Ins::ALLOC(size, elemsize));
+    let mut ret = buf;
+    for (i,&e) in cat.elems.iter().enumerate() {
+        let v = emitvalue(lcx, ctr, e);
+        let ofs = lcx.data.func.code.push(Ins::KINT(IRT_IDX, (i*ty.size()) as _));
+        let ptr = lcx.data.func.code.push(Ins::ADDP(buf, ofs));
+        let store = lcx.data.func.code.push(Ins::STORE(ptr, v));
+        ret = lcx.data.func.code.push(Ins::MOVF(Type::PTR, ret, store));
+    }
+    lcx.data.func.code.set(out, Ins::MOV(Type::PTR, ret));
+    out
+}
+
 fn emitget(lcx: &mut Lcx, ctr: &mut InsId, get: &GET) -> InsId {
     debug_assert!(lcx.objs[lcx.objs[get.value].ann].op == Obj::TTUP);
     let offset: usize = lcx.objs[lcx.objs[get.value].ann.cast::<TTUP>()].elems[..get.idx as usize]
@@ -1196,7 +1220,6 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                 emitidxshape(lcx, ctr, tab, idx, ann)
             }
         },
-        ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::BINOP(&BINOP { left, right, .. }) => {
             // TODO: this should really insert an assertion that both shapes indeed are equal.
@@ -1401,6 +1424,7 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
     match objs.get(expr.erase()) {
         ObjectRef::GET(o) => emitget(lcx, ctr, o),
         ObjectRef::CALLX(_) => emitcallx(lcx, ctr, expr.cast()),
+        ObjectRef::CAT(cat) => emitcat(lcx, ctr, cat),
         o => match objs.get(ann) {
             ObjectRef::TPRI(&TPRI { ty, .. }) => /* scalar value */ {
                 let ty = Primitive::from_u8(ty).to_ir();
@@ -1504,7 +1528,6 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
             }
             value
         },
-        ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::BINOP(&BINOP { ann, binop, left, right, .. }) => {
             debug_assert!(lcx.objs[ann].op == Obj::TTEN);
@@ -1637,7 +1660,7 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, fail: InsId) {
                 emitcheckvgetloop(lcx, ctr, v, idx, inline, fail);
             }
         },
-        ObjectRef::CAT(_) => todo!(),
+        ObjectRef::CAT(CAT { elems, .. }) => emitcheckall(lcx, ctr, elems, fail),
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::BINOP(&BINOP { left, right, .. }) => {
             emitcheck(lcx, ctr, left, fail);
