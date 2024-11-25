@@ -2199,11 +2199,9 @@ impl Phase for Lower {
         emitobjs(unsafe { core::mem::transmute(&mut *ccx) });
         ccx.freeze_graph(computereset);
         if trace!(LOWER) {
-            trace!("{}", {
-                let mut tmp = Default::default();
-                dump_ir(&mut tmp, &ccx.ir);
-                tmp
-            })
+            let mut tmp = Default::default();
+            dump_ir(&mut tmp, &ccx.ir);
+            trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
         }
         Ok(())
     }

@@ -55,6 +55,7 @@ pub mod trace_impl {
     }
 
     macro_rules! trace {
+        () => { true };
         ($flag:ident) => {
             $crate::trace::trace_impl::trace_flags()
                 .contains($crate::trace::trace_impl::TraceFlag::$flag)
@@ -81,6 +82,7 @@ pub mod trace_impl {
 #[cfg(not(feature="trace"))]
 mod trace_impl {
     macro_rules! trace {
+        () => { false };
         ($_:ident) => { false };
         ($fmt: literal $($v:tt)*) => { if false { let _ = format_args!($fmt $($v)*); } };
         ($_:ident $($v:tt)+) => { if false { let _ = format_args!($($v)*); } };

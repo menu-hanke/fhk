@@ -9,7 +9,7 @@ use enumset::EnumSet;
 use hashbrown::hash_map::Entry;
 use logos::Logos;
 
-use crate::bytestring::ByteString;
+use crate::bump::Bump;
 use crate::compile::{self, Ccx, Phase};
 use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
@@ -128,14 +128,14 @@ const TK_DATA: u8 = Token::Literal as _;
 const TK_DATALEN: usize = 4;
 const TK_CAPTURE: u8 = Token::OpInsert as _;
 
-pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: SequenceType) {
+pub fn stringify(buf: &mut Bump, intern: &Intern, body: &[u8], sty: SequenceType) {
     let mut i = 0;
     let mut space = false;
     let mut data = 0;
     while let Some(t) = body.get(i).cloned() {
         let tsp = SPACE_BETWEEN & (1 << t as u64) != 0;
         if space && tsp {
-            buf.push(' ');
+            buf.push(b' ');
         }
         space = tsp;
         i += 1;
@@ -147,11 +147,11 @@ pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: Sequen
             }
             match token {
                 tk @ (Token::Ident | Token::Literal | Token::CapName) => {
-                    if tk == Token::CapName { buf.push('$'); }
+                    if tk == Token::CapName { buf.push(b'$'); }
                     // TODO: this doesn't properly quote idents or escape quotes in strings.
-                    if tk == Token::Literal { buf.push('"'); }
-                    buf.push_bytes(intern.get_slice(zerocopy::transmute!(data)));
-                    if tk == Token::Literal { buf.push('"'); }
+                    if tk == Token::Literal { buf.push(b'"'); }
+                    buf.write(intern.get_slice::<u8>(zerocopy::transmute!(data)));
+                    if tk == Token::Literal { buf.push(b'"'); }
                 },
                 Token::CapPos => {
                     write!(buf, "${}", data).unwrap();
@@ -169,13 +169,15 @@ pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: Sequen
                     write!(buf, "{}", v).unwrap();
                 },
                 tk => {
-                    buf.push_str(tk.str());
+                    buf.write(tk.str());
                 }
             }
         } else {
             debug_assert!(t == Token::OpInsert as _);
             match sty {
-                SequenceType::Pattern => buf.push('$'),
+                SequenceType::Pattern => {
+                    buf.push(b'$');
+                },
                 SequenceType::Body => {
                     write!(buf, "${}", body[i]).unwrap();
                     i += 1;
@@ -199,8 +201,8 @@ fn nsname(ns: Namespace) -> &'static str {
 fn traceback(pcx: &mut Pcx) {
     use Namespace::*;
     for frame in pcx.data.stack.iter().rev() {
-        pcx.host.buf.push_str(nsname(frame.ns));
-        pcx.host.buf.push(' ');
+        pcx.host.buf.write(nsname(frame.ns));
+        pcx.host.buf.push(b' ');
         match frame.ns {
             Var | Table | Snippet => {
                 let macro_ = &pcx.data.macros[zerocopy::transmute!(frame.this)];
@@ -211,7 +213,7 @@ fn traceback(pcx: &mut Pcx) {
                         pcx.intern.get_slice(macro_.table_pattern.cast()),
                         SequenceType::Pattern
                     );
-                    pcx.host.buf.push('.');
+                    pcx.host.buf.push(b'.');
                 }
                 stringify(
                     &mut pcx.host.buf,
@@ -239,7 +241,7 @@ fn traceback(pcx: &mut Pcx) {
                 );
             }
         }
-        pcx.host.buf.push('\n');
+        pcx.host.buf.push(b'\n');
     }
     let loc = lex::loc(&pcx.data.lex);
     write!(pcx.host.buf, "on line {} col {}", loc.line, loc.col).unwrap();
@@ -266,7 +268,7 @@ fn tokenerr_(pcx: &mut Pcx, want: EnumSet<Token>) {
         write!(pcx.host.buf, "{}`{}`", comma, tok.str()).unwrap();
         comma = ", ";
     }
-    pcx.host.buf.push_str(")\n");
+    pcx.host.buf.write(b")\n");
     traceback(pcx)
 }
 
@@ -278,15 +280,15 @@ pub fn tokenerr<T>(pcx: &mut Pcx, want: impl Into<EnumSet<Token>>) -> compile::R
 #[cold]
 fn xdeferr_(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>, what: &str) {
     pcx.host.buf.clear();
-    pcx.host.buf.push_str(what);
-    pcx.host.buf.push_str(nsname(ns));
+    pcx.host.buf.write(what);
+    pcx.host.buf.write(nsname(ns));
     stringify(
         &mut pcx.host.buf,
         &pcx.intern,
         pcx.intern.get_slice(body.cast()),
         SequenceType::Body
     );
-    pcx.host.buf.push('\n');
+    pcx.host.buf.push(b'\n');
     traceback(pcx)
 }
 
@@ -303,8 +305,8 @@ pub fn redeferr<T>(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>) -> compile::R
 #[cold]
 fn langerr_(pcx: &mut Pcx) {
     pcx.host.buf.clear();
-    pcx.host.buf.push_str("unsupported language: ");
-    pcx.host.buf.push_bytes(pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)));
+    pcx.host.buf.write(b"unsupported language: ");
+    pcx.host.buf.write(pcx.intern.get_slice::<u8>(zerocopy::transmute!(pcx.data.tdata)));
 }
 
 pub fn langerr<T>(pcx: &mut Pcx) -> compile::Result<T> {

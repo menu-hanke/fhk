@@ -6,7 +6,7 @@ use core::u64;
 
 use alloc::boxed::Box;
 
-use crate::bytestring::ByteString;
+use crate::bump::Bump;
 use crate::compile::Ccx;
 use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
@@ -37,7 +37,7 @@ type fhk_Alloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut u8;
 
 #[derive(Default)]
 pub struct HostCtx {
-    pub buf: ByteString
+    pub buf: Bump
 }
 
 pub struct HostInst {
@@ -84,7 +84,7 @@ unsafe extern "C" fn fhk_destroyimage(image: *mut fhk_Image) {
 
 extern "C" fn fhk_buf(G: &mut fhk_Graph) -> *const c_char {
     G.host.buf.null_terminate();
-    G.host.buf.as_ptr() as _
+    G.host.buf.as_slice().as_ptr() as _
 }
 
 extern "C" fn fhk_objs(G: &mut fhk_Graph) -> *mut u32 {

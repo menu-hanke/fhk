@@ -400,11 +400,9 @@ fn trace_schedule(emit: &Emit, func: &Func, fid: FuncId) {
         "---------- FUNC {} ----------",
         {let fid: u16 = zerocopy::transmute!(fid); fid}
     );
-    trace!("{}", {
-        let mut tmp = Default::default();
-        dump_schedule(&mut tmp, func, &emit.code, &emit.values, &emit.blockparams);
-        tmp
-    });
+    let mut tmp = Default::default();
+    dump_schedule(&mut tmp, func, &emit.code, &emit.values, &emit.blockparams);
+    trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
 }
 
 fn emithead(emit: &mut Emit, func: &Func) {
@@ -478,12 +476,10 @@ fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
     mcode.code.write(buf);
     mcode.align_code();
     if trace!(MCODE) {
-        trace!("{}", {
-            let mut sbuf = Default::default();
-            // dump mcode.code here rather than buf to also print the nop padding.
-            dump_mcode(&mut sbuf, &mcode.code.as_slice()[loc as usize..]);
-            sbuf
-        });
+        let mut sbuf = Default::default();
+        // dump mcode.code here rather than buf to also print the nop padding.
+        dump_mcode(&mut sbuf, &mcode.code.as_slice()[loc as usize..]);
+        trace!("{}", core::str::from_utf8(sbuf.as_slice()).unwrap());
     }
     loc
 }

@@ -5,7 +5,6 @@ extern crate alloc;
 
 mod bitmap;
 mod bump;
-mod bytestring;
 mod compile;
 mod concat;
 mod controlflow;

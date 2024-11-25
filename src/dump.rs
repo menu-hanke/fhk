@@ -1,11 +1,12 @@
 //! Textual dumps for debugging.
 
 use core::fmt::Write;
+use core::str;
 
 use cfg_if::cfg_if;
 
 use crate::bitmap::BitMatrix;
-use crate::bytestring::ByteString;
+use crate::bump::Bump;
 use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
@@ -20,7 +21,7 @@ use crate::trace::trace;
 /* ---- Objects ------------------------------------------------------------- */
 
 fn dump_field(
-    buf: &mut ByteString,
+    buf: &mut Bump,
     intern: &Intern,
     fty: FieldType,
     value: u32
@@ -28,7 +29,7 @@ fn dump_field(
     use FieldType::*;
     match fty {
         Lit  => write!(buf, "{}", value as i32).unwrap(),
-        Ref if value == zerocopy::transmute!(ObjRef::NIL) => buf.push_str("(nil)"),
+        Ref if value == zerocopy::transmute!(ObjRef::NIL) => { buf.write(b"(nil)"); },
         Ref  => write!(buf, "{:?}", {let r: ObjRef = zerocopy::transmute!(value); r}).unwrap(),
         Name => stringify(
             buf,
@@ -41,7 +42,7 @@ fn dump_field(
 }
 
 fn dump_obj(
-    buf: &mut ByteString,
+    buf: &mut Bump,
     intern: &Intern,
     objs: &Objects,
     idx: ObjRef
@@ -65,19 +66,19 @@ fn dump_obj(
         }
         // else: it's a vla
         let fty = match fty { VRef => Ref, _ => Lit };
-        buf.push('[');
+        buf.push(b'[');
         while idx < raw.len() {
             dump_field(buf, intern, fty, raw[idx]);
             idx += 1;
-            if idx < raw.len() { buf.push(' ') }
+            if idx < raw.len() { buf.push(b' '); }
         }
-        buf.push(']');
+        buf.push(b']');
     }
-    buf.push('\n');
+    buf.push(b'\n');
 }
 
 pub fn dump_objs(
-    buf: &mut ByteString,
+    buf: &mut Bump,
     intern: &Intern,
     objs: &Objects,
     start: ObjRef
@@ -92,16 +93,16 @@ pub fn dump_objs(
 }
 
 pub fn trace_objs( sequences: &Intern, objs: &Objects, start: ObjRef) {
-    trace!("{}", {
+    if trace!() {
         let mut tmp = Default::default();
         dump_objs(&mut tmp, sequences, objs, start);
-        tmp
-    });
+        trace!("{}", str::from_utf8(tmp.as_slice()).unwrap());
+    }
 }
 
 /* ---- IR ------------------------------------------------------------------ */
 
-fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&IndexSlice<InsId, InsValue>>) {
+fn dump_ins(buf: &mut Bump, id: InsId, ins: Ins, values: Option<&IndexSlice<InsId, InsValue>>) {
     let opcode = ins.opcode();
     write!(
         buf,
@@ -135,30 +136,30 @@ fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&IndexSlic
             Operand::F  => write!(buf, " {:?}", {let f: FuncId = zerocopy::transmute!(raw as u16); f})
         }.unwrap()
     }
-    buf.push('\n');
+    buf.push(b'\n');
 }
 
-fn dump_code(buf: &mut ByteString, code: &Code) {
+fn dump_code(buf: &mut Bump, code: &Code) {
     for id in index::iter_span(code.end()) {
         dump_ins(buf, id, code.at(id), None);
     }
 }
 
-fn dump_phi(buf: &mut ByteString, func: &Func, phi: PhiId) {
+fn dump_phi(buf: &mut Bump, func: &Func, phi: PhiId) {
     let raw: u16 = zerocopy::transmute!(phi);
     write!(buf, "[{} {}]", raw, func.phis.at(phi).type_.name()).unwrap();
 }
 
-fn dump_phis(buf: &mut ByteString, func: &Func) {
+fn dump_phis(buf: &mut Bump, func: &Func) {
     for idx in index::iter_span(func.phis.end()) {
-        if idx > 0.into() { buf.push(' '); }
-        buf.push(if idx < func.ret { 'R' } else if idx < func.arg { 'A' } else { 'P' });
+        if idx > 0.into() { buf.push(b' '); }
+        buf.push(if idx < func.ret { b'R' } else if idx < func.arg { b'A' } else { b'P' });
         dump_phi(buf, func, idx);
     }
-    buf.push('\n');
+    buf.push(b'\n');
 }
 
-pub fn dump_ir(buf: &mut ByteString, ir: &IR) {
+pub fn dump_ir(buf: &mut Bump, ir: &IR) {
     for (id, func) in ir.funcs.pairs() {
         write!(
             buf,
@@ -171,7 +172,7 @@ pub fn dump_ir(buf: &mut ByteString, ir: &IR) {
 }
 
 pub fn dump_schedule(
-    buf: &mut ByteString,
+    buf: &mut Bump,
     func: &Func,
     code: &IndexSlice<InsId, Ins>,
     values: &IndexSlice<InsId, InsValue>,
@@ -185,17 +186,17 @@ pub fn dump_schedule(
             block += 1;
             write!(buf, "->{}", {let b: u16 = zerocopy::transmute!(block); b}).unwrap();
             for phi in &params[block] {
-                buf.push(' ');
+                buf.push(b' ');
                 dump_phi(buf, func, phi);
             }
-            buf.push_str(":\n");
+            buf.write(b":\n");
         }
     }
 }
 
 /* ---- Memory -------------------------------------------------------------- */
 
-pub fn dump_layout(buf: &mut ByteString, layout: &Layout) {
+pub fn dump_layout(buf: &mut Bump, layout: &Layout) {
     let Some(end_reset) = layout.reset
         .pairs()
         .rev()
@@ -206,19 +207,19 @@ pub fn dump_layout(buf: &mut ByteString, layout: &Layout) {
         let i: u8 = zerocopy::transmute!(i);
         write!(buf, " {:02}", i).unwrap();
     }
-    buf.push('\n');
+    buf.push(b'\n');
     for breakpoint in index::iter_span(BreakpointId::MAXNUM.into()) {
         let this = layout.breakpoints[breakpoint];
         let next = layout.breakpoints[breakpoint+1];
         if next == 0 { break; }
         write!(buf, "{:4} .. {:4} ", this, next).unwrap();
         for i in index::iter_span(end_reset) {
-            buf.push_str(match layout.reset[i].test(breakpoint) {
-                true  => " * ",
-                false => "   "
+            buf.write(match layout.reset[i].test(breakpoint) {
+                true  => b" * ",
+                false => b"   "
             });
         }
-        buf.push('\n');
+        buf.push(b'\n');
     }
 }
 
@@ -230,7 +231,7 @@ mod x64 {
     use alloc::string::String;
     use iced_x86::{Decoder, FastFormatterOptions, Instruction, SpecializedFormatter, SpecializedFormatterTraitOptions};
 
-    use crate::bytestring::ByteString;
+    use crate::bump::Bump;
 
     struct FmtOptions;
 
@@ -253,10 +254,10 @@ mod x64 {
         }
     }
 
-    pub fn dump_mcode(buf: &mut ByteString, code: &[u8]) {
+    pub fn dump_mcode(buf: &mut Bump, code: &[u8]) {
         let mut s = String::new();
         disasm(&mut s, code);
-        buf.push_str(&s);
+        buf.write(&*s);
     }
 }
 
@@ -264,6 +265,6 @@ cfg_if! {
     if #[cfg(all(target_arch="x86_64", feature="iced-x86"))] {
         pub use x64::dump_mcode;
     } else {
-        pub fn dump_mcode(_buf: &mut ByteString, _code: &[u8]) {}
+        pub fn dump_mcode(_buf: &mut Bump, _code: &[u8]) {}
     }
 }

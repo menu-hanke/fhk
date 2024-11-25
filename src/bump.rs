@@ -462,6 +462,12 @@ impl Bump {
         self.len = 0;
     }
 
+    pub fn null_terminate(&mut self) {
+        if self.as_slice().last() != Some(&0) {
+            self.push(0u8);
+        }
+    }
+
 }
 
 impl<W: Aligned> core::fmt::Write for Bump<W> {

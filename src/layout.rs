@@ -205,11 +205,9 @@ impl Phase for ComputeLayout {
         });
         save(ccx);
         if trace!(MEM) {
-            trace!("{}", {
-                let mut tmp = Default::default();
-                dump_layout(&mut tmp, &ccx.layout);
-                tmp
-            })
+            let mut tmp = Default::default();
+            dump_layout(&mut tmp, &ccx.layout);
+            trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
         }
         Ok(())
     }
