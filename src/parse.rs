@@ -11,7 +11,7 @@ use crate::intern::IRef;
 use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, LookupEntry, Obj, ObjRef, ObjectRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, LookupEntry, Obj, ObjRef, ObjectRef, CALLN, CALLX, CAT, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, pushmacro, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
@@ -130,11 +130,22 @@ fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> 
     Ok(expr)
 }
 
-fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<EXPR>> {
-    if pcx.data.token == Token::LBracket {
-        todo!("vget with index")
-    }
-    Ok(pcx.objs.push(VGET::new(ObjRef::NIL, var)).cast())
+fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> {
+    Ok(if pcx.data.token == Token::LBracket {
+        next(pcx)?;
+        let base = pcx.tmp.end();
+        while pcx.data.token != Token::RBracket {
+            let idx = parse_expr(pcx)?;
+            pcx.tmp.push(idx);
+            if !check(pcx, Token::Comma)? { break }
+        }
+        consume(pcx, Token::RBracket)?;
+        let vget = pcx.objs.push_args(VGET::new(ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
+        pcx.tmp.truncate(base);
+        vget
+    } else {
+        pcx.objs.push(VGET::new(ObjRef::NIL, var)).cast()
+    })
 }
 
 fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
@@ -168,14 +179,16 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
                     let tab = reftab(pcx, name);
                     let name = parse_name(pcx)?;
                     let var = refvar(pcx, tab, name);
-                    parse_vget(pcx, var)
+                    let vget = parse_vget(pcx, var)?;
+                    Ok(vget.cast())
                 },
                 _ => match pcx.data.bindings.iter().find(|b| b.name == name) {
                     Some(v) => Ok(v.value),
                     None => {
                         let tab = implicittab(pcx)?;
                         let var = refvar(pcx, tab, name);
-                        parse_vget(pcx, var)
+                        let vget = parse_vget(pcx, var)?;
+                        Ok(vget.cast())
                     }
                 }
             }
@@ -187,7 +200,17 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             Ok(node)
         },
         Token::LBracket => {
-            todo!("concat")
+            next(pcx)?;
+            let base = pcx.tmp.end();
+            while pcx.data.token != Token::RBracket {
+                let value = parse_expr(pcx)?;
+                pcx.tmp.push(value);
+                if !check(pcx, Token::Comma)? { break }
+            }
+            consume(pcx, Token::RBracket)?;
+            let cat = pcx.objs.push_args::<CAT>(CAT::new(ObjRef::NIL), &pcx.tmp[base.cast_up()..]);
+            pcx.tmp.truncate(base);
+            Ok(cat.cast())
         },
         Token::Let => {
             next(pcx)?;
@@ -223,23 +246,16 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             pcx.data.bindings.truncate(base);
             Ok(value)
         },
-        // Token::Minus | Token::Not => {
-        //     let tok = pcx.data.token;
-        //     next(pcx)?;
-        //     let value = parse_binop(pcx, UNARY_PRIORITY)?;
-        //     let (intr, ty) = match tok {
-        //         Token::Minus => (Intrinsic::UNM, Type::INFER),
-        //         Token::Not => (Intrinsic::NOT, Type::scalar(Primitive::B1)),
-        //         _ => unreachable!()
-        //     };
-        //     Ok(pcx.objs.push(&INTR {
-        //         op: Operator::INTR as _,
-        //         ty,
-        //         func: intr as _,
-        //         n: 0,
-        //         args: [value]
-        //     }).erase())
-        // },
+        tok @ (Token::Minus | Token::Not | Token::Ellipsis) => {
+            next(pcx)?;
+            let value = parse_binop(pcx, UNARY_PRIORITY)?;
+            let func = match tok {
+                Token::Minus     => Intrinsic::UNM,
+                Token::Not       => Intrinsic::NOT,
+                _ /* Ellipsis */ => Intrinsic::SPREAD
+            };
+            Ok(pcx.objs.push_args::<CALLN>(CALLN::new(func as _, ObjRef::NIL), &[value]).cast())
+        },
         Token::Int | Token::Int64 | Token::Fp64 | Token::Literal => {
             let mut o = KINT::new(ObjRef::NIL, pcx.data.tdata as _);
             match pcx.data.token {

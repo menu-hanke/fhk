@@ -428,17 +428,15 @@ fn vidxtype(ctx: &mut Ctx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
         return Type::NEVER;
     }
     // any missing dimension is an implicit splat
-    let dims = need - have;
+    let mut dims = need - have;
     for &i in idx.iter() {
-        // let EXPR { op, data, .. } = ctx.objs[i];
-        // let ity = if (op, data) == (Operator::CALLN as _, Intrinsic::SPLAT as _) {
-        //     dims += 1;
-        //     Type::var(newtypecon(&mut ctx.data.types, Constructor::Splat, &[Type::pri(PRI_IDX)]))
-        // } else {
-        //     Type::pri(PRI_IDX)
-        // };
-        // TODO: explicit splats
-        let ity = Type::pri(PRI_IDX);
+        let EXPR { op, data, .. } = ctx.objs[i];
+        let ity = if (op, data) == (Obj::CALLN, Intrinsic::SPREAD as _) {
+            dims += 1;
+            newcontype(&mut ctx.data.tvar, Constructor::Tensor, &[Type::pri(PRI_IDX), Type::dim(1)])
+        } else {
+            Type::pri(PRI_IDX)
+        };
         unifyexpr(ctx, i, ity);
     }
     let mut vty: Type = zerocopy::transmute!(ctx.objs[var].ann);
@@ -518,7 +516,16 @@ fn unifyexpr(ctx: &mut Ctx, idx: ObjRef<EXPR>, ty: Type) {
             let vty = vidxtype(ctx, var, idx);
             unify(&mut ctx.data.tvar, tv, vty);
         },
-        ObjectRef::CAT(_) => todo!(),
+        ObjectRef::CAT(_) => {
+            // TODO: this should produce an (n+1)-dimensional tensor from a list of n-dimensional
+            // tensors. but the current unification cannot express this.
+            // dims should be represented as constructors, ie.
+            //   dim1 = next(dim0),
+            //   dim2 = next(dim1),
+            // etc. which makes it possible to express
+            //   (t,n) : tensor(t, n) -> tensor(t, next(n))
+            todo!()
+        },
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
             unifyexpr(ctx, addr, Type::pri(Primitive::PTR));

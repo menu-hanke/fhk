@@ -897,7 +897,7 @@ fn emitidxshape(
     let mut axis = 0;
     for &i in idx {
         if !isscalarann(&lcx.objs, i.erase()) {
-            // TODO: this only works for int arrays, not explicit splats, ranges, or bool arrays
+            // TODO: this only works for int arrays, not explicit splats or ranges
             let ilen = emitlen(lcx, ctr, i);
             lcx.data.func.code.set(base + axis as isize, Ins::MOV(IRT_IDX, ilen));
             axis += 1;
@@ -1156,7 +1156,8 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(&CALLN { func, ref args, .. }) => {
-            debug_assert!(Intrinsic::from_u8(func).is_broadcast());
+            debug_assert!(Intrinsic::from_u8(func).is_broadcast()
+                || Intrinsic::from_u8(func).is_annotation());
             // TODO: in the case of multiple args, what SHOULD be done here is to compute the
             // shape for all args, and trap if they don't match.
             computeshape(lcx, ctr, args[0])
@@ -1274,6 +1275,8 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
     match objs.get(expr.erase()) {
         ObjectRef::GET(o) => emitget(lcx, ctr, o),
         ObjectRef::CALLX(_) => emitcallx(lcx, ctr, expr.cast()),
+        ObjectRef::CALLN(&CALLN { func, ref args, .. }) if Intrinsic::from_u8(func).is_annotation()
+            => computevalue(lcx, ctr, args[0]),
         o => match objs.get(ann) {
             ObjectRef::TPRI(&TPRI { ty, .. }) => /* scalar value */ {
                 let ty = Primitive::from_u8(ty).to_ir();
@@ -1369,9 +1372,17 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
         },
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLN(&CALLN { ann, func, ref args, .. })
-            => broadcastintrinsic(lcx, loop_, Intrinsic::from_u8(func), args,
-                lcx.objs[ann.cast::<TTEN>()].elem),
+        ObjectRef::CALLN(&CALLN { ann, func, ref args, .. }) => {
+            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
+            let func = Intrinsic::from_u8(func);
+            if func.is_annotation() {
+                itervalue(lcx, loop_, args[0])
+            } else if func.is_broadcast() {
+                broadcastintrinsic(lcx, loop_, func, args, lcx.objs[ann.cast::<TTEN>()].elem)
+            } else {
+                unreachable!()
+            }
+        }
         ObjectRef::CALLX(_) => todo!(),
         _ => unreachable!()
     }

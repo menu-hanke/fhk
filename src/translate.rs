@@ -50,33 +50,34 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
     let ins = emit.code[id];
     let (value, target, phi) = ins.decode_JMP();
     let func = &ecx.ir.funcs[emit.fid];
+    let ty = emit.code[value].type_();
     'jret: {
-        if phi < func.ret {
-            let ty = func.phis.at(phi).type_;
-            if ty != Type::FX {
-                let phi: usize = phi.into();
-                match func.kind {
-                    FuncKind::User() => {
-                        // user funcs return normally
-                        break 'jret;
-                    },
-                    FuncKind::Query(Query { offsets, .. }) => {
-                        let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
-                        let ofs = ecx.perm[offsets.add_size(phi as _)];
-                        emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
-                    },
-                    FuncKind::Bundle(Bundle { scl, slots, .. }) => {
-                        let vmctx = emit.fb.vmctx();
-                        let slot = ecx.perm[slots.add_size(phi as _)];
-                        storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
-                    }
+        if phi < func.ret && ty != Type::FX {
+            let phi: usize = phi.into();
+            match func.kind {
+                FuncKind::User() => {
+                    // user funcs return normally
+                    break 'jret;
+                },
+                FuncKind::Query(Query { offsets, .. }) => {
+                    let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
+                    let ofs = ecx.perm[offsets.add_size(phi as _)];
+                    emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
+                },
+                FuncKind::Bundle(Bundle { scl, slots, .. }) => {
+                    let vmctx = emit.fb.vmctx();
+                    let slot = ecx.perm[slots.add_size(phi as _)];
+                    storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
                 }
             }
-            emitjump(ecx, target, None);
-            return;
         }
     }
-    emitjump(ecx, target, Some((phi, ecx.data.values[value].value())));
+    // TODO: handle fx types properly (whatever that means)
+    let jmp = match ty {
+        Type::FX => None,
+        _ => Some((phi, ecx.data.values[value].value()))
+    };
+    emitjump(ecx, target, jmp);
 }
 
 fn ins_goto(ecx: &mut Ecx, id: InsId) {

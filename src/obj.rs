@@ -329,7 +329,7 @@ define_ops! {
     DIM.axis    { ann: ObjRef/*TY*/ };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
-    CAT         { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
+    CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } shape: [ObjRef<EXPR>];
     NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
@@ -545,7 +545,7 @@ impl Objects {
             (TUPLE(a), TUPLE(b))  => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
             (VGET(a),  VGET(b))   => a.var == b.var
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
-            (CAT(a),   CAT(b))    => self.allequal(cast_args(&a.args), cast_args(&b.args)),
+            (CAT(a),   CAT(b))    => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
             (IDX(a),   IDX(b))    => self.equal(a.value.erase(), b.value.erase())
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
             (LOAD(a),  LOAD(b))   => a.addr == b.addr

@@ -57,6 +57,7 @@ define_intrinsics! {
     SUM    b"sum"  :: [t n : [(Tensor t n)] -> t];
     // types
     CONV   b"conv" :: [t u n : [(Tensor t n)] -> (Tensor u n)];
+    SPREAD         :: [t : [t] -> t];
     // SPLAT          :: [];
     REP            :: [t n m : [(Tensor t n)] -> (Tensor t m)];
 }
@@ -71,6 +72,11 @@ impl Intrinsic {
         // FIXME replace with core::mem::variant_count when it stabilizes
         assert!(raw < <Intrinsic as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
         unsafe { core::mem::transmute(raw) }
+    }
+
+    pub fn is_annotation(self) -> bool {
+        // SPLAT also
+        self == Intrinsic::SPREAD
     }
 
     pub fn is_broadcast(self) -> bool {
