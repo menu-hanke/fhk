@@ -16,6 +16,152 @@ local function getstr(graph, str)
 	return getstrbuf(graph)
 end
 
+---- Parse API -----------------------------------------------------------------
+
+local function checkbuf(graph, n)
+	local bufsz = graph.bufsz
+	if n > bufsz then
+		repeat bufsz = 2*bufsz until n <= bufsz
+		graph.buf = ffi.new("int32_t[?]", bufsz)
+		graph.bufsz = bufsz
+	end
+end
+
+local function setbuf(graph, xs)
+	checkbuf(graph, #xs)
+	for i,x in ipairs(xs) do
+		graph.buf[i-1] = x
+	end
+	return graph.buf, #xs
+end
+
+local function setbufo(graph, os)
+	local xs = table.new(#os, 0)
+	for i,o in ipairs(os) do
+		xs[i] = o.i
+	end
+	return setbuf(graph, xs)
+end
+
+local function checkres(graph, x)
+	if x == -1 then
+		return nil, getstrbuf(graph)
+	else
+		return x
+	end
+end
+
+local function isseq(x)
+	return type(x) == "table" and getmetatable(x).seq
+end
+
+local function getgraph(x)
+	return getmetatable(x).graph
+end
+
+local function getobjproto(obj)
+	local mt = getmetatable(obj)
+	if not mt then return end
+	local opdef = mt.opdef
+	if not opdef then return end
+	return opdef.proto
+end
+
+local function isobj(x)
+	return type(x) == "table" and getobjproto(x) ~= nil
+end
+
+-- must match host_Lua.rs
+local PARSE_DEF = 0
+local PARSE_EXPR = 1
+local PARSE_TEMPLATE = 2
+local PARSE_TAB = 3
+local PARSE_VAR = 4
+local PARSE_CREATE = 8
+
+local function toseqidx(graph, x)
+	if type(x) == "string" then
+		return graph.seq[x].i
+	elseif type(x) == "number" then
+		return x
+	elseif isseq(x) then
+		return x.i
+	elseif isobj(x) then
+		return x.name.i
+	else
+		error(string.format("argument is not a string: `%s'", x))
+	end
+end
+
+local function checkparse(graph, tab, what, src, ...)
+	local res
+	local args = {...}
+	if #args == 0 and (type(src) == "string" or type(src) == "cdata" or type(src) == "userdata") then
+		res = API.fhk_parse(graph.G, tab, src, #src, what)
+	else
+		src = toseqidx(graph, src)
+		for i,a in ipairs(args) do
+			args[i] = toseqidx(graph, a)
+		end
+		local cap, n = setbuf(graph, args)
+		res = API.fhk_tparse(graph.G, tab, src, cap, n, what)
+	end
+	return assert(checkres(graph, res))
+end
+
+local function parsetemplate(graph, src, ...)
+	if isseq(src) and select("#", ...) == 0 then return src end
+	return setmetatable({i=checkparse(graph, 0, PARSE_TEMPLATE, src, ...)}, graph.seq_mt)
+end
+
+local function graph_define(graph, src, ...)
+	checkparse(graph, 0, PARSE_DEF, src, ...)
+end
+
+local function createflag(create)
+	if create == false then
+		return 0
+	else
+		return PARSE_CREATE
+	end
+end
+
+local function graph_tab(graph, tab, create, ...)
+	if isobj(tab) then return tab end
+	tab = checkparse(graph, 0, PARSE_TAB+createflag(create), tab, ...)
+	if tab > 0 then return graph.objs[tab] end
+end
+
+local function graph_var(graph, tab, name, create, ...)
+	local tabi
+	if tab == nil then
+		tabi = 0
+	else
+		tab = graph_tab(graph, tab, create)
+		if not tab then return end
+		tabi = tab.i
+	end
+	local var = checkparse(graph, tabi, PARSE_VAR+createflag(create), name, ...)
+	if var > 0 then return graph.objs[var] end
+end
+
+local function graph_expr(graph, tab, src, ...)
+	if isobj(src) then return src end
+	return graph.objs[checkparse(graph, graph_tab(graph, tab).i, PARSE_EXPR, src, ...)]
+end
+
+local function graph_dump(graph, flags)
+	-- NOTE: this is really inefficient and does a bunch of unnecessary copies,
+	-- but it's only for debugging anyway.
+	local buf = buffer.new()
+	flags = flags or "o"
+	if flags:match("o") then
+		API.fhk_dumpobjs(graph.G)
+		buf:put(getstrbuf(graph))
+	end
+	return buf:get()
+end
+
 ---- Object management ---------------------------------------------------------
 
 -- ORDER FIELDTYPE
@@ -55,26 +201,6 @@ local PRI_CT = {
 	[PRI_PTR] = ffi.typeof("void *"),
 	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
 }
-
-local function getgraph(x)
-	return getmetatable(x).graph
-end
-
-local function getobjproto(obj)
-	local mt = getmetatable(obj)
-	if not mt then return end
-	local opdef = mt.opdef
-	if not opdef then return end
-	return opdef.proto
-end
-
-local function isobj(x)
-	return type(x) == "table" and getobjproto(x) ~= nil
-end
-
-local function isseq(x)
-	return type(x) == "table" and getmetatable(x).seq
-end
 
 local function isvalidobj(graph, i)
 	if i < graph.num then
@@ -248,6 +374,23 @@ local function makeseqmt(graph)
 	}
 end
 
+local function seqtab__index(self, seq)
+	if type(seq) ~= "string" then
+		-- TODO: int index like objs?
+		error("TODO")
+	end
+	local s = parsetemplate(getgraph(self), seq)
+	self[seq] = s
+	return s
+end
+
+local function makeseqtab(graph)
+	return setmetatable({}, {
+		graph   = graph,
+		__index = seqtab__index
+	})
+end
+
 local function objects_next(_, obj)
 	return obj.next
 end
@@ -255,121 +398,6 @@ end
 -- note: skips NIL
 local function graph_objects(graph)
 	return objects_next, nil, graph.objs[0]
-end
-
----- Parsing -------------------------------------------------------------------
-
-local function checkbuf(graph, n)
-	local bufsz = graph.bufsz
-	if n > bufsz then
-		repeat bufsz = 2*bufsz until n <= bufsz
-		graph.buf = ffi.new("int32_t[?]", bufsz)
-		graph.bufsz = bufsz
-	end
-end
-
-local function setbuf(graph, xs)
-	checkbuf(graph, #xs)
-	for i,x in ipairs(xs) do
-		graph.buf[i-1] = x
-	end
-	return graph.buf, #xs
-end
-
-local function setbufo(graph, os)
-	local xs = table.new(#os, 0)
-	for i,o in ipairs(os) do
-		xs[i] = o.i
-	end
-	return setbuf(graph, xs)
-end
-
-local function checkres(graph, x)
-	if x == -1 then
-		return nil, getstrbuf(graph)
-	else
-		return x
-	end
-end
-
--- must match host_Lua.rs
-local PARSE_DEF = 0
-local PARSE_EXPR = 1
-local PARSE_VREF = 2
-local PARSE_TEMPLATE = 3
-
-local function checkparse(graph, what, src, ...)
-	local res
-	local args = {...}
-	if #args > 0 or isseq(src) then
-		if isseq(src) then
-			src = src.i
-		elseif type(src) == "string" then
-			src = checkparse(graph, PARSE_TEMPLATE, src)
-		else
-			error("input must be a string or a template")
-		end
-		for i,a in ipairs(args) do
-			if type(a) == "string" then
-				args[i] = checkparse(graph, PARSE_TEMPLATE, a)
-			elseif isseq(a) then
-				args[i] = a.i
-			elseif isobj(a) then
-				args[i] = a.name.i
-			else
-				error("template argument must be a string or template")
-			end
-		end
-		local cap, n = setbuf(graph, args)
-		res = API.fhk_tparse(graph.G, src, cap, n, what)
-	else
-		res = API.fhk_parse(graph.G, src, #src, what)
-	end
-	return assert(checkres(graph, res))
-end
-
-local function graph_seq(graph, src, ...)
-	if isseq(src) and select("#", ...) == 0 and not arg1 then return src end
-	return setmetatable({i=checkparse(graph, PARSE_TEMPLATE, src, ...)}, graph.seq_mt)
-end
-
-local function defcreate(create)
-	if create == nil then return true else return create end
-end
-
-local function graph_tab(graph, tab, create)
-	if isobj(tab) then return tab end
-	tab = API.fhk_gettab(graph.G, graph_seq(graph, tab).i, defcreate(create))
-	if tab >= 0 then return graph.objs[tab] end
-end
-
-local function graph_define(graph, src, ...)
-	checkparse(graph, PARSE_DEF, src, ...)
-end
-
-local function graph_var(graph, tab, name, create)
-	tab = graph_tab(graph, tab, create)
-	if not tab then return end
-	local var = API.fhk_getvar(graph.G, graph_seq(graph, name).i, tab.i, defcreate(create))
-	if var >= 0 then return graph.objs[var] end
-end
-
-local function graph_expr(graph, tab, src, ...)
-	if isobj(src) then return src end
-	API.fhk_settab(graph.G, graph_tab(graph, tab, true).i)
-	return graph.objs[checkparse(graph, PARSE_EXPR, src, ...)]
-end
-
-local function graph_dump(graph, flags)
-	-- NOTE: this is really inefficient and does a bunch of unnecessary copies,
-	-- but it's only for debugging anyway.
-	local buf = buffer.new()
-	flags = flags or "o"
-	if flags:match("o") then
-		API.fhk_dumpobjs(graph.G)
-		buf:put(getstrbuf(graph))
-	end
-	return buf:get()
 end
 
 ---- Queries -------------------------------------------------------------------
@@ -467,7 +495,7 @@ end
 
 local function reset_add(reset, obj)
 	if not isobj(obj) then
-		obj = reset.graph.objs[checkparse(reset.graph, PARSE_VREF, obj)]
+		obj = reset.graph.objs[checkparse(reset.graph, 0, PARSE_VAR+PARSE_CREATE, obj)]
 	end
 	assert(obj.op == "VAR" or obj.op == "MOD", "only variables or models can be reset")
 	table.insert(reset.objs, obj)
@@ -537,7 +565,6 @@ end
 
 local graph_mt = {
 	objects  = graph_objects,
-	seq      = graph_seq,
 	define   = graph_define,
 	var      = graph_var,
 	expr     = graph_expr,
@@ -560,6 +587,7 @@ local function newgraph()
 	graph.obj_mt = makeobjmts(graph)
 	graph.objs   = makeobjtab(graph)
 	graph.seq_mt = makeseqmt(graph)
+	graph.seq    = makeseqtab(graph)
 	return graph
 end
 

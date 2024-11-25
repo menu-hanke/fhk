@@ -11,7 +11,7 @@ use crate::intern::IRef;
 use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, langerr, next, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
@@ -44,6 +44,31 @@ fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
     let name = pcx.intern.intern(&pcx.tmp[base..]);
     pcx.tmp.truncate(base);
     Ok(name)
+}
+
+fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(IRef<[u8]>, IRef<[u8]>)> {
+    let name = parse_name(pcx)?;
+    Ok(match check(pcx, Token::Dot)? {
+        true  => (name, parse_name(pcx)?),
+        false => (IRef::EMPTY, name)
+    })
+}
+
+fn implicittab(pcx: &mut Pcx) -> compile::Result<ObjRef<TAB>> {
+    let tab = pcx.data.tab;
+    if tab.is_nil() {
+        return syntaxerr(pcx, SyntaxError::BadImplicitTab);
+    }
+    Ok(tab)
+}
+
+fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
+    let (tab, var) = parse_dotname(pcx)?;
+    let tab = match tab == IRef::EMPTY {
+        true  => implicittab(pcx)?,
+        false => pcx.objs.tab(tab).get_or_create()
+    };
+    Ok(pcx.objs.var(tab, var).get_or_create())
 }
 
 fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
@@ -137,7 +162,8 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
                 _ => match pcx.data.bindings.iter().find(|b| b.name == name) {
                     Some(v) => Ok(v.value),
                     None => {
-                        let var = pcx.objs.var(pcx.data.tab, name).get_or_create();
+                        let tab = implicittab(pcx)?;
+                        let var = pcx.objs.var(tab, name).get_or_create();
                         parse_vget(pcx, var)
                     }
                 }
@@ -311,6 +337,7 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
         true  => parse_expr(pcx)?,
         false => ObjRef::NIL.cast()
     };
+    // pcx.data.tab is guaranteed to be set here because we came here from parse_model
     pcx.objs.push_args::<MOD>(
         MOD::new(IRef::EMPTY, pcx.data.tab, guard),
         cast_args(&pcx.tmp[vset_base..deco_base.cast::<ObjRef<VSET>>()])
@@ -512,6 +539,52 @@ fn parse_toplevel(pcx: &mut Pcx) -> compile::Result {
     }
 }
 
+/* ---- Expanded object refs ------------------------------------------------ */
+
+pub enum ExpandResult<O,N> {
+    Defined(ObjRef<O>),
+    Undefined(N)
+}
+
+fn expandtab(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
+    if let Some(tab) = pcx.objs.tab(name).get() {
+        return Ok(ExpandResult::Defined(tab));
+    }
+    // TODO: pushmacro+expand here
+    Ok(ExpandResult::Undefined(name))
+}
+
+fn expandvar(
+    pcx: &mut Pcx,
+    tab: ObjRef<TAB>,
+    name: IRef<[u8]>
+) -> compile::Result<ExpandResult<VAR, (IRef<[u8]>, IRef<[u8]>)>> {
+    if let Some(var) = pcx.objs.var(tab, name).get() {
+        return Ok(ExpandResult::Defined(var));
+    }
+    // TODO: pushmacro+expand here
+    Ok(ExpandResult::Undefined((pcx.objs[tab].name, name)))
+}
+
+pub fn parse_expand_tab(pcx: &mut Pcx) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
+    let name = parse_name(pcx)?;
+    expandtab(pcx, name)
+}
+
+pub fn parse_expand_var(
+    pcx: &mut Pcx
+) -> compile::Result<ExpandResult<VAR, (IRef<[u8]>, IRef<[u8]>)>> {
+    let (tab, name) = parse_dotname(pcx)?;
+    let table = match tab == IRef::EMPTY {
+        true  => pcx.data.tab,
+        false => match expandtab(pcx, tab)? {
+            ExpandResult::Defined(t) => t,
+            ExpandResult::Undefined(_) => return Ok(ExpandResult::Undefined((tab, name)))
+        }
+    };
+    expandvar(pcx, table, name)
+}
+
 /* -------------------------------------------------------------------------- */
 
 pub fn parse_def(pcx: &mut Pcx) -> compile::Result {
@@ -520,18 +593,6 @@ pub fn parse_def(pcx: &mut Pcx) -> compile::Result {
 
 pub fn parse_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     parse_binop(pcx, 0)
-}
-
-pub fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
-    let mut name = parse_name(pcx)?;
-    let table = if check(pcx, Token::Dot)? {
-        let tab = pcx.objs.tab(name).get_or_create();
-        name = parse_name(pcx)?;
-        tab
-    } else {
-        pcx.data.tab
-    };
-    Ok(pcx.objs.var(table, name).get_or_create())
 }
 
 pub fn parse_template(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {

@@ -86,7 +86,8 @@ pub enum SyntaxError {
     ExpectedValue,
     CapNameInTemplate,
     CapPosInBody,
-    UndefCap
+    UndefCap,
+    BadImplicitTab
 }
 
 impl SyntaxError {
@@ -98,7 +99,8 @@ impl SyntaxError {
             ExpectedValue      => "expected value",
             CapNameInTemplate  => "named capture not allowed in templates",
             CapPosInBody       => "positional capture not allowed in macro body",
-            UndefCap           => "undefined capture"
+            UndefCap           => "undefined capture",
+            BadImplicitTab     => "implicit table not allowed here"
         }
     }
 
@@ -718,7 +720,7 @@ impl Phase for Parser {
             lex: Default::default(),
             scope: ScopeId(0),
             bindings: Default::default(),
-            tab: ObjRef::GLOBAL,
+            tab: ObjRef::NIL.cast(),
             marg: Default::default(),
             macros: Default::default(),
             chain: Default::default(),

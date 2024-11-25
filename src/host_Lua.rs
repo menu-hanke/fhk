@@ -13,7 +13,7 @@ use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::IRef;
 use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, RESET, TAB};
-use crate::parse::{parse_def, parse_expr, parse_template, parse_vref};
+use crate::parse::{parse_def, parse_expand_tab, parse_expand_var, parse_expr, parse_template, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
 use crate::image::fhk_vmcall_native as fhk_vmcall;
@@ -87,10 +87,6 @@ extern "C" fn fhk_objnum(G: &fhk_Graph) -> ObjRef {
     G.objs.end()
 }
 
-extern "C" fn fhk_settab(G: &mut fhk_Graph, tab: fhk_ObjRef<TAB>) {
-    G.data.tab = tab;
-}
-
 unsafe fn slice_from_raw_parts<'a,T>(src: *const T, num: usize) -> &'a [T] {
     core::slice::from_raw_parts(match num { 0 => core::ptr::dangling(), _ => src }, num)
 }
@@ -102,24 +98,39 @@ enum Source<'a> {
 }
 
 // options here must match host.lua
-const PARSE_DEF: c_int = 0;
-const PARSE_EXPR: c_int = 1;
-const PARSE_VREF: c_int = 2;
-const PARSE_TEMPLATE: c_int = 3;
-fn doparse(G: &mut fhk_Graph, source: Source, what: c_int) -> fhk_Result {
+const PARSE_DEF: c_int      = 0;
+const PARSE_EXPR: c_int     = 1;
+const PARSE_TEMPLATE: c_int = 2;
+const PARSE_TAB: c_int      = 3;
+const PARSE_VAR: c_int      = 4;
+const PARSE_CREATE: c_int   = 0x8; // flag to OR with PARSE_TAB or PARSE_VAR
+fn doparse(G: &mut fhk_Graph, tab: fhk_ObjRef<TAB>, source: Source, what: c_int) -> fhk_Result {
     parse(
         G,
         match source { Source::String(s) => s, Source::Template(..) => &[] },
         |pcx| {
-            pcx.data.tab = ObjRef::GLOBAL;
+            pcx.data.tab = tab;
             if let Source::Template(template, captures) = source {
                 pushtemplate(pcx, template, captures)?;
             }
-            match what {
+            match what&0x7 {
                 PARSE_DEF => parse_def(pcx).map(|_| 0),
                 PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
-                PARSE_VREF => parse_vref(pcx).map(|o| zerocopy::transmute!(o)),
                 PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
+                PARSE_TAB => Ok(match parse_expand_tab(pcx)? {
+                    ExpandResult::Defined(o) => zerocopy::transmute!(o),
+                    ExpandResult::Undefined(n) if (what & PARSE_CREATE) != 0 =>
+                        zerocopy::transmute!(pcx.objs.tab(n).get_or_create()),
+                    ExpandResult::Undefined(_) => 0
+                }),
+                PARSE_VAR => Ok(match parse_expand_var(pcx)? {
+                    ExpandResult::Defined(o) => zerocopy::transmute!(o),
+                    ExpandResult::Undefined((t,v)) if (what & PARSE_CREATE) != 0 => {
+                        let tab = pcx.objs.tab(t).get_or_create();
+                        zerocopy::transmute!(pcx.objs.var(tab,v).get_or_create())
+                    },
+                    ExpandResult::Undefined(_) => 0
+                }),
                 _ => unreachable!()
             }
         }
@@ -128,44 +139,23 @@ fn doparse(G: &mut fhk_Graph, source: Source, what: c_int) -> fhk_Result {
 
 unsafe extern "C" fn fhk_parse(
     G: &mut fhk_Graph,
+    tab: fhk_ObjRef<TAB>,
     src: *const c_char,
     len: usize,
     what: c_int
 ) -> fhk_Result {
-    doparse(G, Source::String(slice_from_raw_parts(src as _, len)), what)
+    doparse(G, tab, Source::String(slice_from_raw_parts(src as _, len)), what)
 }
 
 unsafe extern "C" fn fhk_tparse(
     G: &mut fhk_Graph,
+    tab: fhk_ObjRef<TAB>,
     template: fhk_SeqRef,
     caps: *const fhk_SeqRef,
     num: usize,
     what: c_int
 ) -> fhk_Result {
-    doparse(G, Source::Template(template, slice_from_raw_parts(caps, num)), what)
-}
-
-fn getobj<T, F>(entry: LookupEntry<'_, T, F>, create: bool) -> fhk_Result
-    where T: ?Sized + ObjType, F: FnOnce() -> ObjRef<T>
-{
-    match (entry, create) {
-        (LookupEntry::Occupied(idx), _) => zerocopy::transmute!(idx),
-        (LookupEntry::Vacant(e), true)  => zerocopy::transmute!(e.create()),
-        (LookupEntry::Vacant(_), false) => -2,
-    }
-}
-
-extern "C" fn fhk_gettab(G: &mut fhk_Graph, name: fhk_SeqRef, create: bool) -> fhk_Result {
-    getobj(G.objs.tab(name), create)
-}
-
-extern "C" fn fhk_getvar(
-    G: &mut fhk_Graph,
-    tab: fhk_ObjRef<TAB>,
-    name: fhk_SeqRef,
-    create: bool
-) -> fhk_Result {
-    getobj(G.objs.var(tab, name), create)
+    doparse(G, tab, Source::Template(template, slice_from_raw_parts(caps, num)), what)
 }
 
 extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
@@ -276,11 +266,8 @@ define_api! {
     char *(*fhk_buf)(fhk_Graph *);
     fhk_Obj *(*fhk_objs)(fhk_Graph *);
     uint32_t (*fhk_objnum)(fhk_Graph *);
-    void (*fhk_settab)(fhk_Graph *, int32_t);
-    int32_t (*fhk_parse)(fhk_Graph *, const char *, size_t, int);
-    int32_t (*fhk_tparse)(fhk_Graph *, int32_t, int32_t *, size_t, int);
-    int32_t (*fhk_gettab)(fhk_Graph *, int32_t, bool);
-    int32_t (*fhk_getvar)(fhk_Graph *, int32_t, int32_t, bool);
+    int32_t (*fhk_parse)(fhk_Graph *, int32_t, const char *, size_t, int);
+    int32_t (*fhk_tparse)(fhk_Graph *, int32_t, int32_t, int32_t *, size_t, int);
     void (*fhk_getstr)(fhk_Graph *, uint32_t);
     int32_t (*fhk_newquery)(fhk_Graph *, int32_t, int32_t *, size_t);
     int32_t (*fhk_newreset)(fhk_Graph *, int32_t *, size_t);
