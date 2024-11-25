@@ -1610,8 +1610,15 @@ fn emititer(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
     match lcx.objs[expr].mark {
         EXPR_ONE => itervalue(lcx, loop_, expr),
         _ => {
-            // TODO: emitvalue + iterate
-            todo!()
+            debug_assert!(lcx.objs[lcx.objs[expr].ann].op == Obj::TTEN);
+            let TTEN { elem, dim, .. } = lcx.objs[lcx.objs[expr].ann.cast()];
+            // TODO: the implementation is analoguous for non-pri types (you just emit multiple
+            // values, need support in emittensorloop)
+            debug_assert!(lcx.objs[elem].op == Obj::TPRI);
+            let ty = Primitive::from_u8(lcx.objs[elem.cast::<TPRI>()].ty).to_ir();
+            let value = emitvalue(lcx, &mut loop_.head, expr);
+            let len = emitshapelen(&lcx.data.func, value+1, dim as _);
+            emittensorloop(&lcx.data.func, loop_, ty, value, len).1
         }
     }
 }
