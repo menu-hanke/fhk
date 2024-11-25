@@ -1925,11 +1925,14 @@ fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
 
 /* ---- Queries ------------------------------------------------------------- */
 
-// TODO: need to emit availability check here too.
 fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
     let mut ctr = InsId::START;
     let mut ret: PhiId = 0.into();
     let objs = Access::borrow(&lcx.objs);
+    let fail = lcx.data.func.code.push(Ins::ABORT());
+    for &value in &objs[query].value {
+        emitcheck(lcx, &mut ctr, value, fail);
+    }
     for &value in &objs[query].value {
         let mut v = emitvalue(lcx, &mut ctr, value);
         for _ in 0..decomposition_size(&lcx.objs, value.erase()) {
@@ -2050,6 +2053,7 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                 }
                 sig.finish_returns().add_arg(IRT_IDX).finish_args();
                 let func = lcx.ir.funcs.push(func);
+                trace!(LOWER "QUERY {:?} func: {:?}", obj, func);
                 emittemplate(lcx, func, Template::Query(obj.cast()));
             },
             Obj::FUNC => todo!(),

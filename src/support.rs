@@ -2,7 +2,7 @@
 
 use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
-use cranelift_codegen::ir::{AbiParam, InstBuilder};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, TrapCode};
 use cranelift_codegen::isa::CallConv;
 use enumset::EnumSetType;
 use hashbrown::hash_table::Entry;
@@ -11,7 +11,7 @@ use hashbrown::HashTable;
 use crate::bump::{self, Aligned, Bump, BumpRef};
 use crate::emit::{self, block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
 use crate::hash::fxhash;
-use crate::image::Instance;
+use crate::image::{fhk_vmexit, Instance};
 use crate::index::InvalidValue;
 use crate::ir::Type;
 use crate::mcode::{Label, MCode};
@@ -92,6 +92,7 @@ macro_rules! define_suppfuncs {
 define_suppfuncs! {
     DSINIT { _pad: u8 };
     ALLOC { _pad: u8 };
+    ABORT { _pad: u8 };
     SWAP { _pad: u8 };
     // TRAMPOLINE { pub n: u8, _pad: u16, pub args: BumpRef<[Arg]>, pub func: FuncPtr };
     // TODO: vector arithmetic, memcpy, traps, etc.
@@ -173,7 +174,8 @@ impl SupportFuncs {
 
 const SIG_DSINIT: &Signature = &signature!(Fast PTR I32 I32); // (slots, num, size)
 const SIG_ALLOC: &Signature = &signature!(Fast I64 I64 -> PTR); // (bytes, align) -> mem
-const SIG_SWAP: &Signature = &signature!(emit::NATIVE_CALLCONV, PTR I64 -> I64);
+const SIG_ABORT: &Signature = &signature!(NATIVE_CALLCONV,);
+const SIG_SWAP: &Signature = &signature!(NATIVE_CALLCONV, PTR I64 -> I64);
 
 fn ty2param(param: &mut Vec<AbiParam>, ty: &[Type]) {
     param.extend(ty.iter().map(|&t| AbiParam::new(irt2cl(t))));
@@ -198,6 +200,7 @@ impl SupportFuncs {
         let si = match SuppFunc::from_u8(self[supp].sf) {
             DSINIT => SIG_DSINIT,
             ALLOC  => SIG_ALLOC,
+            ABORT  => SIG_ABORT,
             SWAP   => SIG_SWAP
         };
         sig2cl(sig, si);
@@ -311,6 +314,24 @@ fn supp_alloc(ecx: &mut Ecx) {
     emit.fb.ins().return_(&[ptr]);
 }
 
+/* ---- ABORT --------------------------------------------------------------- */
+
+const SIG_ABORT_FF: &Signature = &signature!(NATIVE_CALLCONV, PTR);
+unsafe extern "C" fn sfunc_abort(vmctx: &mut Instance) -> ! {
+    vmctx.host.set_error(b"query aborted (no suitable model)");
+    fhk_vmexit(vmctx)
+}
+
+fn supp_abort(ecx: &mut Ecx) {
+    let emit = &mut *ecx.data;
+    let sigref = emit.fb.ctx.func.import_signature(newsig(SIG_ABORT_FF));
+    let fptr = emit.fb.ins().iconst(irt2cl(Type::PTR), sfunc_abort as i64);
+    let vmctx = emit.fb.vmctx();
+    emit.fb.ins().call_indirect(sigref, fptr, &[vmctx]);
+    // the call_indirect doesn't return. this trap is here just to satisfy cranelift.
+    emit.fb.ins().trap(TrapCode::User(0));
+}
+
 /* -------------------------------------------------------------------------- */
 
 pub fn emitsupport(ecx: &mut Ecx, supp: SuppRef) {
@@ -319,6 +340,7 @@ pub fn emitsupport(ecx: &mut Ecx, supp: SuppRef) {
     match SuppFunc::from_u8(emit.supp[supp].sf) {
         DSINIT => supp_dsinit(ecx),
         ALLOC  => supp_alloc(ecx),
+        ABORT  => supp_abort(ecx),
         SWAP   => unreachable!() // asm function
     }
 }

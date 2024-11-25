@@ -3,7 +3,6 @@
 use core::arch::global_asm;
 use core::marker::PhantomPinned;
 use core::mem::offset_of;
-use core::pin::Pin;
 use core::u64;
 
 use cfg_if::cfg_if;
@@ -76,9 +75,9 @@ fhk_vmexit:
 
 #[allow(improper_ctypes)]
 extern "sysv64" {
-    pub fn fhk_vmcall(vmctx: Pin<&mut Instance>, result: *mut u8, mcode: *const u8) -> i32;
+    pub fn fhk_vmcall(vmctx: *mut Instance, result: *mut u8, mcode: *const u8) -> i32;
     #[cold]
-    pub fn fhk_vmexit(vmctx: Pin<&mut Instance>) -> !;
+    pub fn fhk_vmexit(vmctx: *mut Instance) -> !;
 }
 
 cfg_if! {

@@ -279,6 +279,7 @@ define_opcodes! {
     RET.FX;
     TRET.FX   V F;                // args func
     UB.FX;
+    ABORT.FX; // (add reason/message here if needed)
 
 /* -- Data instructions --------------*/
 
@@ -347,7 +348,7 @@ impl Opcode {
 
     pub fn is_control(self) -> bool {
         use Opcode::*;
-        (JMP|GOTO|IF|RET|TRET|UB).contains(self)
+        (JMP|GOTO|IF|RET|TRET|UB|ABORT).contains(self)
     }
 
     pub fn num_v(self) -> usize {

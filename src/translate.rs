@@ -7,7 +7,7 @@ use zerocopy::Unalign;
 use crate::bump::BumpRef;
 use crate::lang::Lang;
 use crate::mem::SizeClass;
-use crate::support::{ALLOC, DSINIT};
+use crate::support::{ABORT, ALLOC, DSINIT};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
@@ -109,11 +109,28 @@ fn ins_ret(ecx: &mut Ecx) {
     ecx.data.fb.ins().return_(&[]);
 }
 
+fn coldblock(emit: &mut Emit) {
+    // cranelift doesn't allow marking the entry block as cold
+    if emit.block != BlockId::START {
+        emit.fb.ctx.func.layout.set_cold(block2cl(emit.block));
+    }
+}
+
 fn ins_ub(ecx: &mut Ecx) {
     // TODO: call an rt function and abort.
     // execution of this instruction is always a compiler bug.
     let emit = &mut *ecx.data;
-    emit.fb.ctx.func.layout.set_cold(emit.fb.block);
+    coldblock(emit);
+    emit.fb.ins().trap(TrapCode::User(0));
+}
+
+fn ins_abort(ecx: &mut Ecx) {
+    let emit = &mut *ecx.data;
+    coldblock(emit);
+    let abort = emit.supp.instantiate(&mut ecx.mcode, &ABORT::new());
+    let abort = emit.fb.importsupp(&emit.supp, abort.cast());
+    emit.fb.ins().call(abort, &[]);
+    // the call above doesn't return. this trap is here just to satisfy cranelift.
     emit.fb.ins().trap(TrapCode::User(0));
 }
 
@@ -385,6 +402,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             RET => ins_ret(ecx),
             TRET => todo!(),
             UB => ins_ub(ecx),
+            ABORT => ins_abort(ecx),
             PHI => ins_phi(ecx, id),
             KINT | KINT64 => ins_kintx(ecx, id),
             KFP64 => ins_kfp64(ecx, id),

@@ -8,7 +8,6 @@ else
 	libname = "libfhk.so"
 end
 local target = os.getenv("FHK_TARGET") or "debug"
-local dump = os.getenv("FHK_DUMP") or ""
 local fhk = assert(package.loadlib("../target/"..target.."/"..libname, "luaopen_fhk"))()
 
 ---- asserts -------------------------------------------------------------------
@@ -83,34 +82,42 @@ local function test_query(T, tab, ...)
 	return query
 end
 
-local function test_result(T, results)
-	local exprs, values = {}, {}
-	for e,v in pairs(results) do
-		table.insert(exprs, e)
-		table.insert(values, v)
-	end
-	table.insert(T.results, {query=test_query(T, "global", unpack(exprs)), true_=values})
-end
-
 local function test_compile(T)
 	if not T.image then
-		if dump:match("o") then
-			-- XXX move this after compile when the compiler actually works
-			io.stderr:write(T.G:dump(dump), "\n")
-		end
 		T.image = assert(T.G:compile())
 	end
+	return T.image
 end
 
 local function test_newinstance(T, prev, mask)
-	return T.image:newinstance(T.alloc, nil, prev, mask)
+	return test_compile(T):newinstance(T.alloc, nil, prev, mask)
 end
 
-local function test_checkresults(T)
-	test_compile(T)
+local function test_result(T, results)
+	local query = T.G:newquery("global")
+	local true_ = {}
+	for e,v in pairs(results) do
+		query:add(e)
+		table.insert(true_, v)
+	end
 	local inst = test_newinstance(T)
-	for _,r in ipairs(T.results) do
-		check({r.query.query(inst):unpack()}, r.true_)
+	check({query.query(inst):unpack()}, true_)
+end
+
+local function test_fail(T, expr, message)
+	local query = T.G:newquery("global")
+	if type(expr) == "table" then
+		for _,e in ipairs(expr) do
+			query:add(e)
+		end
+	else
+		query:add(expr)
+	end
+	local inst = test_newinstance(T)
+	local ok, err = pcall(query.query, inst)
+	assert(not ok, "query was supposed to fail but didn't")
+	if not err:match(message) then
+		error(string.format("bad error message: %s", err))
 	end
 end
 
@@ -131,12 +138,12 @@ local function bind(self,f) return function(...) return f(self, ...) end end
 local function testnew()
 	local env = setmetatable({
 		allocs  = {},
-		results = {},
 		G       = fhk.newgraph(),
 		check   = check
 	}, {__index=_G})
 	env.query = bind(env, test_query)
 	env.result = bind(env, test_result)
+	env.fail = bind(env, test_fail)
 	env.compile = bind(env, test_compile)
 	env.newinstance = bind(env, test_newinstance)
 	env.alloc = ffi.cast("void *(*)(void *,size_t,size_t)", bind(env, test_alloc))
@@ -184,9 +191,6 @@ local function testrun(T, fname)
 	fp:close()
 	if #buf > 0 then
 		flush(T, buf, what)
-	end
-	if #T.results > 0 then
-		test_checkresults(T)
 	end
 end
 
