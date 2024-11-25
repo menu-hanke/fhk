@@ -343,12 +343,12 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
         let var = parse_vref(pcx)?;
         pcx.objs[var].mark = 0;
         if check(pcx, Token::LBracket)? {
-            todo!(); // TODO: parse subset
+            if true { todo!(); } // TODO: parse subset
             consume(pcx, Token::RBracket)?;
         }
         pcx.tmp.push(pcx.objs.push(VSET::new(var, ObjRef::NIL.cast())));
         match pcx.data.token {
-            Token::Comma => { next(pcx)?; todo!("handle multiple outputs"); continue; },
+            Token::Comma => { next(pcx)?; if true { todo!("handle multiple outputs"); } continue; },
             Token::Eq    => { next(pcx)?; break },
             _            => return tokenerr(pcx, Token::Comma | Token::Eq)
         }
@@ -427,7 +427,7 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     Ok(())
 }
 
-fn parse_func(pcx: &mut Pcx) -> compile::Result {
+fn parse_func(_pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
 
@@ -578,15 +578,15 @@ fn parse_macro_var(pcx: &mut Pcx) -> compile::Result {
     Ok(())
 }
 
-fn parse_macro_table(pcx: &mut Pcx) -> compile::Result {
+fn parse_macro_table(_pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
 
-fn parse_macro_model(pcx: &mut Pcx) -> compile::Result {
+fn parse_macro_model(_pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
 
-fn parse_macro_func(pcx: &mut Pcx) -> compile::Result {
+fn parse_macro_func(_pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
 

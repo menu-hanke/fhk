@@ -5,7 +5,6 @@ use core::mem::{transmute, ManuallyDrop};
 use zerocopy::IntoBytes;
 
 use crate::bump::{Bump, BumpRef};
-use crate::dl::DynLibs;
 use crate::emit::Emit;
 use crate::finalize::FinalizerBuilder;
 use crate::host::HostCtx;
@@ -80,8 +79,6 @@ pub struct Ccx<P=Absent, O=RW, I=RW> {
     pub tmp: Bump,
     // interned byte strings (names, templates, extfuncs etc)
     pub intern: Intern,
-    // dynamic library handles
-    pub dynlibs: DynLibs,
     // finalizers
     pub fin: FinalizerBuilder,
     // vmctx memory layout information
@@ -119,7 +116,6 @@ impl Ccx {
             perm: Default::default(),
             tmp: Default::default(),
             intern,
-            dynlibs: Default::default(),
             fin: Default::default(),
             data: Default::default(),
             mcode: Default::default(),

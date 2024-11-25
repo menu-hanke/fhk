@@ -1,11 +1,7 @@
 //! Dynamic library loading.
 
-use core::ffi::c_void;
 use core::ops::Deref;
 use core::ptr::NonNull;
-
-use crate::hash::HashMap;
-use crate::intern::{Intern, IRef};
 
 // invariant: never hand out `&mut Lib`.
 // then we can treat Lib as pinned.
@@ -28,14 +24,6 @@ impl Deref for LibBox {
     fn deref(&self) -> &Lib {
         unsafe { &*self.0.as_ptr() }
     }
-}
-
-impl Lib {
-
-    pub fn sym(&self, name: &[u8]) -> *const c_void {
-        todo!()
-    }
-
 }
 
 // macro_rules! dynlib {
@@ -94,6 +82,7 @@ impl Lib {
 // pub(crate) use dynlib;
 
 #[cfg(unix)]
+#[allow(dead_code)]
 mod target {
 
     use core::ffi::c_void;
@@ -142,20 +131,4 @@ mod target {
 #[cfg(windows)]
 mod target {
     /* TODO */
-}
-
-#[derive(Default)]
-pub struct DynLibs {
-    // both dlopen and LoadLibrary* already do their own refcounting,
-    // but we cache the handle here so that we don't have to keep count of
-    // how many handles we need to close for each library.
-    libs: HashMap<IRef<[u8]>, LibBox>
-}
-
-impl DynLibs {
-
-    pub fn get_or_open(&mut self, constants: &Intern, name: IRef<[u8]>) -> Option<&Lib> {
-        todo!()
-    }
-
 }

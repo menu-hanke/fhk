@@ -32,7 +32,6 @@ type fhk_Image = Image;
 type fhk_Instance = Instance;
 type fhk_ObjRef<T=Obj> = ObjRef<T>;
 type fhk_SeqRef = IRef<[u8]>;
-type fhk_Operator = Operator;
 type fhk_Result = i32;
 type fhk_Alloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut u8;
 

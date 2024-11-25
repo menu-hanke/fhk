@@ -2,7 +2,6 @@
 
 use crate::bitmap::bitmap_array;
 use crate::index::{index, IndexArray};
-use crate::ir::Type;
 use crate::obj::{ObjRef, TAB};
 
 pub type Offset = u32;
@@ -154,11 +153,6 @@ impl Cursor {
         let ptr = self.align(align);
         self.ptr += size;
         ptr
-    }
-
-    pub fn alloc_type(&mut self, type_: Type) -> usize {
-        let size = type_.size();
-        self.alloc(size, size)
     }
 
 }

@@ -189,7 +189,6 @@ impl<I: Index+InvalidValue> IndexOption<I> {
 // method taking &self. handing out refs from &mut self is fine though.
 #[repr(transparent)]
 pub struct IndexValueVec<I: Index, T>(UnsafeCell<IndexVec<I, T>>);
-pub type ValueVec<T> = IndexValueVec<usize, T>;
 
 impl<I: Index, T> Default for IndexValueVec<I, T> {
     fn default() -> Self {
@@ -241,10 +240,6 @@ impl<I: Index, T> IndexValueVec<I, T> {
 
 // SAFETY for all unsafe blocks here: NO REFS HANDED TO OUTSIDE WORLD.
 impl<I: Index, T: Clone> IndexValueVec<I, T> {
-
-    pub fn get(&self, index: I) -> Option<T> {
-        todo!()
-    }
 
     pub fn at(&self, index: I) -> T {
         (unsafe { &*self.0.get() })[index].clone()

@@ -374,11 +374,6 @@ impl Operator {
     }
 
     // depends on ORDER NAMEDOBJ
-    fn has_name_raw(op: u8) -> bool {
-        op <= Self::FUNC as u8
-    }
-
-    // depends on ORDER NAMEDOBJ
     fn has_name_and_tab_raw(op: u8) -> bool {
         op <= Self::MOD as u8
     }

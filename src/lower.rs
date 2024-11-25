@@ -228,7 +228,7 @@ const IRT_ARM: Type = Type::I8;
 const INS_FLATIDX: InsId = zerocopy::transmute!(1u16);
 
 // expr obj.mark:
-const EXPR_NONE: u8 = 0;  // no uses
+// const EXPR_NONE: u8 = 0;  // no uses
 const EXPR_ONE: u8 = 1;   // one use
 const EXPR_MANY: u8 = 2;  // many uses
 

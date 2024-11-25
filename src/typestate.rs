@@ -1,170 +1,8 @@
 //! Small type state library.
 
-/* ---- Type states --------------------------------------------------------- */
-
-macro_rules! typestate {
-    (@ignore($($_:tt)*) $($v:tt)*) => { $($v)* };
-    (
-        $(#[$($attr:tt)*])*
-        $vis:vis struct $name:ident
-        $(< $($lt:lifetime),* $(,)? $($generic:ident $(=$default:ty)?),* >)?
-        ($inner:ty)
-    ) => {
-
-        #[repr(transparent)]
-        $(#[$($attr)*])*
-        $vis struct $name $(< $($lt,)* $($generic $(=$default)?),* >)?
-        (
-            $inner,
-            $(
-                //$( core::marker::PhantomData<&$lt ()>, )*
-                $( core::marker::PhantomData<fn(&$generic)>, )*
-            )?
-        );
-
-        impl $(< $($lt,)* $($generic),* >)? $name $(< $($lt,)* $($generic),* >)? {
-
-            #[allow(dead_code)]
-            $vis fn new(inner: $inner) -> Self {
-                Self(
-                    inner,
-                    $(
-                        //$( crate::typestate::typestate!(@ignore($lt) core::marker::PhantomData),)*
-                        $( crate::typestate::typestate!(@ignore($generic) core::marker::PhantomData)),*
-                    )?
-                )
-            }
-
-            #[allow(dead_code)]
-            $vis fn into_inner(cref: Self) -> $inner {
-                cref.0
-            }
-
-            // safety: uphold whatever invariants the type states are supposed to maintain
-            #[allow(dead_code)]
-            $vis unsafe fn from_ref<'__ts_ref>(r: &'__ts_ref $inner) -> &'__ts_ref Self {
-                core::mem::transmute(r)
-            }
-
-            // safety: same as from_ref
-            #[allow(dead_code)]
-            $vis unsafe fn from_mut_ref<'__ts_ref>(r: &'__ts_ref mut $inner) -> &'__ts_ref mut Self {
-                core::mem::transmute(r)
-            }
-
-            // safety: same as from_ref + pointer lifetime
-            #[allow(dead_code)]
-            $vis unsafe fn from_ptr<'__ts_ref>(p: *const $inner) -> &'__ts_ref Self {
-                Self::from_ref(&*p)
-            }
-
-            // safety: same as from_ref + pointer lifetime
-            #[allow(dead_code)]
-            $vis unsafe fn from_mut_ptr<'__ts_ref>(p: *mut $inner) -> &'__ts_ref mut Self {
-                Self::from_mut_ref(&mut *p)
-            }
-
-        }
-
-        impl $(< $($lt,)* $($generic),* >)? core::ops::Deref
-                for $name $(< $($lt,)* $($generic),* >)? {
-            type Target = $inner;
-            fn deref(&self) -> &$inner {
-                unsafe { core::mem::transmute(self) }
-            }
-        }
-
-        impl $(< $($lt,)* $($generic),* >)? core::ops::DerefMut
-                for $name $(< $($lt,)* $($generic),* >)? {
-            fn deref_mut(&mut self) -> &mut $inner {
-                unsafe { core::mem::transmute(self) }
-            }
-        }
-
-    };
-}
-
 use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::{Deref, DerefMut};
-
-pub(crate) use typestate;
-
-/* ---- Boxed version ------------------------------------------------------- */
-
-// NOTE: this does not deallocate memory.
-// this is intentional so that you can embed the struct.
-// you're supposed to use this with ManuallyDrop or MaybeUninit.
-
-macro_rules! typestate_box {
-    (
-        $(#[$($attr:tt)*])*
-        $vis:vis struct $name:ident
-        $(< $($lt:lifetime),* $(,)? $($generic:ident $(=$default:ty)?),* >)?
-        ($inner:ty)
-    ) => {
-
-        #[repr(transparent)]
-        $(#[$($attr)*])*
-        $vis struct $name $(< $($lt,)* $($generic $(=$default)?),* >)?
-        (
-            core::ptr::NonNull<$inner>,
-            $(
-                $( core::marker::PhantomData<fn(&$generic)>, )*
-            )?
-        );
-
-        impl $(< $($lt,)* $($generic),* >)? $name $(< $($lt,)* $($generic),* >)? {
-
-            #[allow(dead_code)]
-            $vis unsafe fn from_ptr(inner: *mut $inner) -> Self {
-                Self(
-                    core::ptr::NonNull::new_unchecked(inner),
-                    $(
-                        $( crate::typestate::typestate!(@ignore($generic) core::marker::PhantomData)),*
-                    )?
-                )
-            }
-
-            #[allow(dead_code)]
-            $vis fn leak(inner: alloc::boxed::Box<$inner>) -> Self {
-                unsafe { Self::from_ptr(alloc::boxed::Box::leak(inner)) }
-            }
-
-            #[allow(dead_code)]
-            $vis fn into_ptr(self) -> *mut $inner {
-                core::mem::ManuallyDrop::new(self).0.as_ptr()
-            }
-
-        }
-
-        impl $(< $($lt,)* $($generic),* >)? core::ops::Deref
-                for $name $(< $($lt,)* $($generic),* >)? {
-            type Target = $inner;
-            fn deref(&self) -> &$inner {
-                unsafe { self.0.as_ref() }
-            }
-        }
-
-        impl $(< $($lt,)* $($generic),* >)? core::ops::DerefMut
-                for $name $(< $($lt,)* $($generic),* >)? {
-            fn deref_mut(&mut self) -> &mut $inner {
-                unsafe { self.0.as_mut() }
-            }
-        }
-
-        impl $(< $($lt,)* $($generic),* >)? Drop for $name $(< $($lt,)* $($generic),* >)? {
-            fn drop(&mut self) {
-                unsafe { core::ptr::drop_in_place(self.0.as_mut()) }
-            }
-        }
-
-    };
-}
-
-pub(crate) use typestate_box;
-
-/* ---- Read/write access --------------------------------------------------- */
 
 pub struct RW;
 pub struct R<'a>(PhantomData<*mut &'a ()>);
@@ -215,15 +53,11 @@ impl<T> DerefMut for Access<T,RW> {
     }
 }
 
-/* -------------------------------------------------------------------------- */
-
 // markers for using typestate for partial borrows.
 #[derive(Clone, Copy, Default)]
 pub struct Present;
 #[derive(Clone, Copy, Default)]
 pub struct Absent;
-
-/* ---- Typestate unions ---------------------------------------------------- */
 
 macro_rules! typestate_union {
     (

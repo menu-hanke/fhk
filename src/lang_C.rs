@@ -235,7 +235,7 @@ struct Field {
 enum CExpr {
     Input(u16, CType),        // value : ctype
     ScalarOutput(u16, CType), // out : ctype
-    TensorOutput(u16),        // out[...] : ctype
+    _TensorOutput(u16),        // out[...] : ctype (TODO)
     Ptr(u16),                 // :struct { ... } *
     Struct(AllocLayout)       // :struct { ... }      (details in ps.fields)
 }
@@ -406,7 +406,7 @@ fn parse_struct(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
                 let ofs = putfield(&mut layout, ctypelayout(ctype));
                 ps.fields.push(&mut pcx.tmp, Field { ofs, data: idx as _, tag: TAG_OUTPUT_SCALAR });
             },
-            CExpr::TensorOutput(idx) => {
+            CExpr::_TensorOutput(idx) => {
                 let ofs = putfield(&mut layout, ctypelayout(CType::VOID_PTR));
                 ps.fields.push(&mut pcx.tmp, Field { ofs, data: idx as _, tag: TAG_OUTPUT_TENSOR });
             },
@@ -495,7 +495,7 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
                 // TODO: report error (out parameter is not a pointer)
                 todo!()
             },
-            CExpr::TensorOutput(idx) => {
+            CExpr::_TensorOutput(idx) => {
                 ps.args.push(&mut pcx.tmp, Value::from_data_tag(idx, TAG_OUTPUT_TENSOR));
                 ps.sig.push(&mut pcx.tmp, CType::VOID_PTR);
             },
@@ -621,14 +621,13 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                 debug_assert!(lcx.objs[ann].op == Obj::TPRI);
                 let havepri = Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty);
                 let needpri = ctype.primitive();
-                let mut input = input;
                 if havepri.to_ir() != needpri.to_ir() {
                     if indir > 0 {
                         // TODO: report error (invalid parameter type)
                         todo!()
                     }
                     // TODO: perform scalar conversion
-                    input = todo!()
+                    todo!()
                 }
                 match ctype.indir().cmp(&indir) {
                     Ordering::Less => {
@@ -638,7 +637,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                     Ordering::Equal => { /* perfect */ },
                     Ordering::Greater => {
                         // TODO: auto box input
-                        input = todo!()
+                        todo!()
                     }
                 }
             }

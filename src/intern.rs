@@ -247,11 +247,11 @@ impl Intern {
         self.intern_consume_from(base).cast()
     }
 
-    pub fn intern_range(&mut self, range: Range<usize>) -> IRef<[u8]> {
+    pub fn intern_range(&mut self, _range: Range<usize>) -> IRef<[u8]> {
         todo!()
     }
 
-    pub fn find<T>(&self, value: &T) -> Option<IRef<T>>
+    pub fn find<T>(&self, _value: &T) -> Option<IRef<T>>
         where T: ?Sized + bump::IntoBytes
     {
         todo!()

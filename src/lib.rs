@@ -26,7 +26,6 @@ mod link;
 mod lower;
 mod mcode;
 mod mem;
-mod minivec;
 mod mmap;
 mod obj;
 mod parse;

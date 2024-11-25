@@ -5,7 +5,7 @@ use core::fmt::{Debug, Write};
 use core::iter::zip;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
-use core::ops::{Deref, DerefMut, Range, RangeTo};
+use core::ops::{Deref, DerefMut, Range};
 use core::slice;
 
 use alloc::vec::Vec;
@@ -167,21 +167,6 @@ impl<I: Index> Bitmap<I> {
         unsafe { core::mem::transmute(raw) }
     }
 
-}
-
-// note: it doesn't really make sense to implement Index for other Range types (except for usize
-// ranges), because that would offset the indices, which isn't really something you ever want to do
-impl<I: Index> core::ops::Index<RangeTo<I>> for Bitmap<I> {
-    type Output = Bitmap<I>;
-    fn index(&self, index: RangeTo<I>) -> &Bitmap<I> {
-        todo!()
-    }
-}
-
-impl<I: Index> core::ops::IndexMut<RangeTo<I>> for Bitmap<I> {
-    fn index_mut(&mut self, index: RangeTo<I>) -> &mut Bitmap<I> {
-        todo!()
-    }
 }
 
 pub struct BitmapIterOnes<'a> {

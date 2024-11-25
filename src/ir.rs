@@ -12,7 +12,6 @@ use crate::index::{index, IndexValueVec, IndexVec};
 use crate::lang::Lang;
 use crate::mcode::MCodeData;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
-use crate::minivec::MiniIndexValueVec;
 use crate::obj::{ObjRef, QUERY};
 use crate::support::DynSlot;
 
@@ -577,7 +576,7 @@ pub struct Func {
     pub code: Code,
     pub ret: PhiId, // one past last return value
     pub arg: PhiId, // one past last argument
-    pub phis: MiniIndexValueVec<PhiId, Phi>,
+    pub phis: IndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
     // TODO: box size
 }

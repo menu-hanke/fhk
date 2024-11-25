@@ -394,7 +394,7 @@ impl<W: Aligned> Bump<W> {
         BumpRef(ptr/T::ALIGN as u32, PhantomData)
     }
 
-    pub fn write_range<T>(&mut self, range: Range<BumpRef<T>>) -> BumpRef<T>
+    pub fn write_range<T>(&mut self, _range: Range<BumpRef<T>>) -> BumpRef<T>
         where T: FromBytes + IntoBytes
     {
         todo!()
@@ -429,13 +429,6 @@ impl<W: Aligned> Bump<W> {
             self.align(W::ALIGN);
         }
         BumpRef(ofs / I::Item::ALIGN as u32, PhantomData)
-    }
-
-    pub fn extend_write<'a,T,I>(&mut self, iter: I) -> BumpRef<T>
-        where I: IntoIterator<Item=&'a T>,
-              T: 'a + ?Sized + Aligned + IntoBytes + Immutable
-    {
-        todo!()
     }
 
     pub fn end(&self) -> BumpRef<W> {

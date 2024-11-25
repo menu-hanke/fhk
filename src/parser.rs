@@ -36,7 +36,6 @@ struct Macro {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Namespace {
     Var,
-    Func,
     Table,
     Snippet,
     // the following are only used for debug messages:
@@ -190,7 +189,6 @@ fn nsname(ns: Namespace) -> &'static str {
     use Namespace::*;
     match ns {
         Var      => "var",
-        Func     => "func",
         Table    => "table",
         Snippet  => "snippet",
         Capture  => "capture",
@@ -204,7 +202,7 @@ fn traceback(pcx: &mut Pcx) {
         pcx.host.buf.push_str(nsname(frame.ns));
         pcx.host.buf.push(' ');
         match frame.ns {
-            Var | Func | Table | Snippet => {
+            Var | Table | Snippet => {
                 let macro_ = &pcx.data.macros[zerocopy::transmute!(frame.this)];
                 if macro_.table_pattern != IRef::EMPTY {
                     stringify(
