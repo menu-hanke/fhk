@@ -16,9 +16,14 @@ macro_rules! define_intrinsics {
             $(define_intrinsics!(@scheme $scheme)),*
         ];
 
-        const INTRINSIC_FUNC: phf::Map<&[u8], Intrinsic> = phf::phf_map! {
-            $( $( $func => Intrinsic::$name, )? )*
-        };
+        impl Intrinsic {
+            pub fn from_func(name: &[u8]) -> Option<Intrinsic> {
+                match name {
+                    $($($func => Some(Intrinsic::$name),)?)*
+                    _ => None
+                }
+            }
+        }
     };
 }
 
@@ -68,10 +73,6 @@ impl Intrinsic {
         // FIXME replace with core::mem::variant_count when it stabilizes
         assert!(raw < <Intrinsic as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
         unsafe { core::mem::transmute(raw) }
-    }
-
-    pub fn from_func(name: &[u8]) -> Option<Intrinsic> {
-        INTRINSIC_FUNC.get(name).cloned()
     }
 
     pub fn is_broadcast(self) -> bool {
