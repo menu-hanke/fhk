@@ -10,36 +10,49 @@ use hashbrown::HashTable;
 use crate::bump::{self, Aligned, Bump, BumpRef, PackedSliceDst};
 use crate::hash::fxhash;
 
-const PTR_BITS: usize = 27;
-
 /*
- * layout:
+ * +-------+------+
+ * | 31..4 | 3..0 |
+ * +-------+------+
+ * |  end  | size |
+ * +-------+------+
  *
- *   +------+--------+-------+
- *   |  31  | 30..28 | 27..0 |
- *   +======+========+=======+
- *   | mode |  size  |  end  |
- *   +------+--------+-------+
- *
- * where
- *
- *   +--------------+-----------------------------------+
- *   |     mode     | string length                     |
- *   +==============+===================================+
- *   | 0 (smallref) | 1+size                            |
- *   +--------------+-----------------------------------+
- *   | 1 (bigref)   | length is stored as `size` bytes  |
- *   |              | right after `end` (unaligned)     |
- *   +--------------+-----------------------------------+
+ * size 1..8 -> smallref of `size`
+ *      9..0 -> bigref of `-size`
  */
+#[derive(Clone, Copy, PartialEq, Eq, Hash,
+    zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+struct RawRef(u32);
+
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
-pub struct IRef<T: ?Sized>(u32, PhantomData<T>);
+pub struct IRef<T: ?Sized>(RawRef, PhantomData<T>);
 
 pub struct Intern {
     bump: Bump<u8>,
-    tab: HashTable<IRef<[u8]>>,
+    tab: HashTable<RawRef>,
     base: BumpRef<u8>
+}
+
+impl RawRef {
+
+    const SIZE_BITS: usize = 4;
+    const MAX_SMALL: u32 = 8;
+    const EMPTY: Self = Self(0);
+
+    const fn pack(end: u32, size: u32) -> Self {
+        Self((end << Self::SIZE_BITS) | size)
+    }
+
+    fn end(self) -> u32 {
+        self.0 >> Self::SIZE_BITS
+    }
+
+    fn raw_size(self) -> u32 {
+        self.0 & 0xf
+    }
+
 }
 
 impl<T: ?Sized> Clone for IRef<T> {
@@ -60,11 +73,13 @@ impl<T: ?Sized> Eq for IRef<T> {}
 
 impl<T: ?Sized> Hash for IRef<T> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0)
+        self.0.hash(state)
     }
 }
 
 impl<T: ?Sized> IRef<T> {
+
+    pub const EMPTY: Self = Self(RawRef::EMPTY, PhantomData);
 
     pub fn cast<U: ?Sized>(self) -> IRef<U> {
         zerocopy::transmute!(self)
@@ -75,13 +90,13 @@ impl<T: ?Sized> IRef<T> {
 impl<T: ?Sized + Aligned> IRef<T> {
 
     pub fn to_bump_sized(self, size: usize) -> BumpRef<T> {
-        BumpRef::from_offset(refend(self.0) as usize - size)
+        BumpRef::from_offset(self.0.end() as usize - size)
     }
 
-    pub fn to_bump_small_unchecked(self) -> BumpRef<T> {
-        debug_assert!((refsize(self.0) as i32) >= 0);
-        self.to_bump_sized(refsize(self.0) as usize + 1)
-    }
+    // pub fn to_bump_small_unchecked(self) -> BumpRef<T> {
+    //     debug_assert!((refsize(self.0) as i32) >= 0);
+    //     self.to_bump_sized(refsize(self.0) as usize + 1)
+    // }
 
 }
 
@@ -93,117 +108,79 @@ impl<T: Aligned> IRef<T> {
 
 }
 
-// note: you must pass size = seq len - 1
-const fn smallref(ptr: u32, size: u32) -> u32 {
-    ptr | (size << PTR_BITS)
-}
-
-const fn bigref(ptr: u32, size: u32) -> u32 {
-    ptr | ((!size) << PTR_BITS)
-}
-
 impl<T: ?Sized> IRef<T> {
 
     // public for hardcoding constant references (eg. Ccx::SEQ_GLOBAL).
     // extremely easy to misuse.
-    pub const fn small(ptr: u32, size: u32) -> Self {
-        Self(smallref(ptr, size), PhantomData)
+    pub const fn small_from_end_size(end: u32, size: u32) -> Self {
+        Self(RawRef::pack(end, size), PhantomData)
     }
 
-    const fn big(ptr: u32, size: u32) -> Self {
-        Self(bigref(ptr, size), PhantomData)
+    // const fn big(ptr: u32, size: u32) -> Self {
+    //     Self(bigref(ptr, size), PhantomData)
+    // }
+
+}
+
+unsafe fn bigsize(mut end: *const u8, mut raw_size: usize) -> usize {
+    let mut shift = 0;
+    let mut size = 0;
+    loop {
+        size |= (*end as usize) << shift;
+        raw_size += 1;
+        if raw_size == 0x10 { return size }
+        end = end.add(1);
+        shift += 8;
     }
-
-    pub const EMPTY: Self = Self::big(0, 0);
-
 }
 
-fn refend(r: u32) -> u32 {
-    r & ((1 << PTR_BITS) - 1)
+unsafe fn bigbytes<'a>(data: *const u8, end: usize, raw_size: usize) -> &'a [u8] {
+    let end = data.add(end);
+    let size = bigsize(end, raw_size);
+    core::slice::from_raw_parts(end.sub(size), size)
 }
 
-// big ref   => bitwise NOT of size of seq len
-// small ref => seq len - 1
-fn refsize(r: u32) -> u32 {
-    ((r as i32) >> PTR_BITS) as _
-}
-
-// safety: ref must be in bounds
-unsafe fn smallmatch(data: &[u8], r: u32, bytes: &[u8]) -> bool {
-    let size = refsize(r) as usize;
-    if size == bytes.len().wrapping_sub(1) {
-        let end = refend(r) as usize;
-        data.get_unchecked(end-(size+1)..end) == bytes
+unsafe fn bytesmatch(data: *const u8, r: RawRef, bytes: &[u8]) -> bool {
+    let raw_size = r.raw_size() as usize;
+    let end = r.end() as usize;
+    if bytes.len() <= RawRef::MAX_SMALL as _ {
+        // if `r` is big then the first comparison is always false
+        raw_size == bytes.len()
+            && bytes == core::slice::from_raw_parts(data.add(end-raw_size), raw_size)
     } else {
-        // either `r` is big, or `r` small with wrong size
-        false
+        raw_size > RawRef::MAX_SMALL as _ && bytes == bigbytes(data, end, raw_size)
     }
 }
 
-unsafe fn bigreflen(data: &[u8], end: usize, size: usize) -> usize {
-    let mut ptr = end + size;
-    let mut len = 0;
-    while ptr > end {
-        len = (len << 8) | (*data.get_unchecked(ptr) as usize);
-        ptr -= 1;
-    }
-    len
-}
-
-unsafe fn bigrefdata(data: &[u8], end: usize, size: usize) -> &[u8] {
-    data.get_unchecked(end-bigreflen(data, end, size)..end)
-}
-
-// safety: ref must be in bounds
-unsafe fn bigmatch(data: &[u8], r: u32, bytes: &[u8]) -> bool {
-    let size = refsize(r);
-    if (size as i32) < 0 {
-        bigrefdata(data, refend(r) as _, (!size) as _) == bytes
+unsafe fn refdata<'a>(data: *const u8, r: RawRef) -> &'a [u8] {
+    let raw_size = r.raw_size() as usize;
+    let end = r.end() as usize;
+    let ep = data.add(end);
+    let size = if raw_size <= RawRef::MAX_SMALL as _ {
+        raw_size
     } else {
-        // `r` is small
-        false
-    }
-}
-
-fn issmallbytes(len: usize) -> bool {
-    len.wrapping_sub(1) < 8
-}
-
-unsafe fn bytesmatch(data: &[u8], r: u32, bytes: &[u8]) -> bool {
-    if issmallbytes(bytes.len()) {
-        smallmatch(data, r, bytes)
-    } else {
-        bigmatch(data, r, bytes)
-    }
-}
-
-unsafe fn dyndata(r: u32, data: &[u8]) -> &[u8] {
-    let size = refsize(r);
-    let end = refend(r) as usize;
-    if (size as i32) >= 0 {
-        data.get_unchecked(end-(size as usize + 1)..end)
-    } else {
-        bigrefdata(data, end, (!size) as _)
-    }
+        bigsize(ep, raw_size)
+    };
+    core::slice::from_raw_parts(ep.sub(size), size)
 }
 
 // safety: tab and bump must come from the same intern table
 unsafe fn entry<'tab, 'short>(
-    tab: &'tab mut HashTable<IRef<[u8]>>,
+    tab: &'tab mut HashTable<RawRef>,
     bump: &'short [u8],
     bytes: &'short [u8],
     align: u32
-) -> Entry<'tab, IRef<[u8]>> {
+) -> Entry<'tab, RawRef> {
     tab.entry(
         fxhash(bytes),
         // note: this tests that the *end* is aligned, which works as long as size is a multiple
         // of alignment.
-        |r| r.0 & (align - 1) == 0 && bytesmatch(bump, r.0, bytes),
-        |r| fxhash(dyndata(r.0, bump))
+        |&r| r.end() & (align - 1) == 0 && bytesmatch(bump.as_ptr(), r, bytes),
+        |&r| fxhash(refdata(bump.as_ptr(), r))
     )
 }
 
-fn writebiglen(data: &mut Bump<u8>, mut len: usize) -> u32 {
+fn writebigsize(data: &mut Bump<u8>, mut len: usize) -> u32 {
     let mut bytes = 0;
     loop {
         data.push(len as u8);
@@ -213,42 +190,40 @@ fn writebiglen(data: &mut Bump<u8>, mut len: usize) -> u32 {
     }
 }
 
-fn newref(bump: &mut Bump<u8>, len: usize) -> u32 {
+fn newref(bump: &mut Bump<u8>, len: usize) -> RawRef {
     let end = bump.end().offset() as _;
-    match issmallbytes(len) {
-        true  => smallref(end, len as u32 - 1),
-        false => bigref(end, writebiglen(bump, len))
-    }
+    let size = if len <= RawRef::MAX_SMALL as _ {
+        len as _
+    } else {
+        0x10 - writebigsize(bump, len)
+    };
+    RawRef::pack(end, size)
 }
 
-fn internbytes(intern: &mut Intern, bytes: &[u8], align: u32) -> IRef<[u8]> {
+fn internbytes(intern: &mut Intern, bytes: &[u8], align: u32) -> RawRef {
     match unsafe { entry(&mut intern.tab, intern.bump.as_slice(), bytes, align) } {
         Entry::Occupied(e) => *e.get(),
         Entry::Vacant(e) => {
             intern.bump.align(align as _);
             intern.bump.write(bytes);
             intern.base = intern.bump.end();
-            *e.insert(IRef(newref(&mut intern.bump, bytes.len()), PhantomData)).get()
+            *e.insert(newref(&mut intern.bump, bytes.len())).get()
         }
     }
 }
 
-fn reflen(data: &[u8], r: u32) -> usize {
-    let end = refend(r) as usize;
-    let size = refsize(r);
-    if (size as i32) >= 0 {
-        size as usize + 1
+fn reflen(data: &[u8], end: usize, raw_size: usize) -> usize {
+    if raw_size <= RawRef::MAX_SMALL as _ {
+        raw_size
     } else {
-        let size = (!size) as usize;
-        // STRICT inequality here, because data[end+size] is the last length byte.
-        assert!(end+size < data.len());
-        unsafe { bigreflen(data, end, size) }
+        assert!(end + (0x10 - raw_size) <= data.len());
+        unsafe { bigsize(data.as_ptr().add(end), raw_size) }
     }
 }
 
-fn refrange(data: &[u8], r: u32) -> Range<usize> {
-    let end = refend(r) as usize;
-    end - reflen(data, r) .. end
+fn refrange(data: &[u8], r: RawRef) -> Range<usize> {
+    let end = r.end() as usize;
+    end - reflen(data, end, r.raw_size() as _) .. end
 }
 
 impl Intern {
@@ -262,7 +237,7 @@ impl Intern {
                 size_of_val(value)
             )
         };
-        internbytes(self, bytes, T::ALIGN as _).cast()
+        IRef(internbytes(self, bytes, T::ALIGN as _), PhantomData)
     }
 
     pub fn intern_collect<T>(&mut self, values: impl IntoIterator<Item=T>) -> IRef<[T]>
@@ -303,11 +278,11 @@ impl Intern {
         &self.bump
     }
 
-    pub fn ref_to_bump<T>(&self, r: IRef<T>) -> BumpRef<T>
-        where T: ?Sized + Aligned
-    {
-        r.to_bump_sized(reflen(self.bump.as_slice(), r.0))
-    }
+    // pub fn ref_to_bump<T>(&self, r: IRef<T>) -> BumpRef<T>
+    //     where T: ?Sized + Aligned
+    // {
+    //     r.to_bump_sized(reflen(self.bump.as_slice(), r.0))
+    // }
 
     pub fn write<T>(&mut self, value: &T)
         where T: ?Sized + Aligned + bump::IntoBytes
@@ -339,13 +314,13 @@ impl Intern {
                 // from the hashtable.
                 assert!(cursor >= self.base);
                 self.bump.truncate(cursor);
-                *e.get()
+                IRef(*e.get(), PhantomData)
             },
             Entry::Vacant(e) => {
                 let len = self.bump.end().offset() - cursor.offset();
                 let r = newref(&mut self.bump, len);
                 self.base = cursor;
-                *e.insert(IRef(r, PhantomData)).get()
+                IRef(*e.insert(r).get(), PhantomData)
             }
         }
     }
@@ -355,7 +330,7 @@ impl Intern {
 impl Default for Intern {
     fn default() -> Self {
         let mut tab = HashTable::new();
-        tab.insert_unique(fxhash(&[0; 0]), IRef::EMPTY, |_| unreachable!());
+        tab.insert_unique(fxhash(&[0; 0]), RawRef::EMPTY, |_| unreachable!());
         Self { tab, bump: Default::default(), base: BumpRef::zero() }
     }
 }

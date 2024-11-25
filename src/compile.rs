@@ -104,12 +104,12 @@ pub struct CompilePhase<'a, P, T: PhaseMarker> {
 
 impl Ccx {
 
-    pub const SEQ_GLOBAL: IRef<[u8]> = IRef::small(11, 4);
+    pub const SEQ_GLOBAL: IRef<[u8]> = IRef::small_from_end_size(11, 5);
 
     pub fn new(host: HostCtx) -> Self {
         let mut intern = Intern::default();
         let global_str = intern.intern("global");
-        debug_assert!(global_str == IRef::small(6, 6-1));
+        debug_assert!(global_str == IRef::small_from_end_size(6, 6));
         intern.write(&(Token::Ident as u8));
         intern.write(global_str.as_bytes()); // must be unaligned
         let global_seq = intern.intern_consume_from(BumpRef::from_offset(6));
