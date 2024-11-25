@@ -70,12 +70,13 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
     let insert = ctx.perm.align_for::<Slot>();
     let mut slot: SlotId = 0.into();
     // order must match collect
-    for func in &mut ctx.ir.funcs.raw {
+    for (fid, func) in ctx.ir.funcs.pairs_mut() {
         match &mut func.kind {
             FuncKind::Bundle(Bundle { scl, slots, dynslots, check, .. }) => {
                 let bitmap = slotdefs[slot].value;
                 *check = bitmap;
                 *slots = insert.end();
+                trace!(MEM "{:?} bitmap {:#04x}:{}", fid, bitmap.byte(), bitmap.bit());
                 if scl.is_dynamic() {
                     // alloc dynamic slot data for BINIT
                     let base = slot;
@@ -96,8 +97,9 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                 for phi in index::iter_span(func.ret) {
                     insert.push(match func.phis.at(phi).type_ {
                         Type::FX => Default::default(),
-                        _ => {
+                        ty => {
                             let s = slotdefs[slot].value;
+                            trace!(MEM "{:?} {:?} {:#04x} {}", fid, phi, s.byte(), ty.name());
                             slot += 1;
                             s
                         }
