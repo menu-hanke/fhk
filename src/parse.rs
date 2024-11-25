@@ -27,6 +27,9 @@ fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
     if pcx.data.token == Token::Apostrophe {
         save(pcx);
         next(pcx)?;
+        // canonicalize subscripted names to curly brackets, no matter whether brackets are used
+        // or what kind.
+        pcx.tmp.push(Token::LCurly as u8);
         if (Token::LParen | Token::LBracket | Token::LCurly).contains(pcx.data.token) {
             let mut parens = ParenCounter::default();
             parens.token(pcx.data.token);
@@ -40,6 +43,7 @@ fn parse_name(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
             save(pcx);
         }
         next(pcx)?; // skip subscript token or closing parenthesis
+        pcx.tmp.push(Token::RCurly as u8);
     }
     let name = pcx.intern.intern(&pcx.tmp[base..]);
     pcx.tmp.truncate(base);
@@ -74,6 +78,8 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
 fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
     const IDENT: u8 = Token::Ident as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
+    const LCURLY: u8 = Token::LCurly as _;
+    const RCURLY: u8 = Token::RCurly as _;
     let name @ [IDENT, _, _, _, _, rest @ .. ] = pcx.intern.get_slice(name.cast())
         else { return None };
     let stem: [u8; 4] = name[1..5].try_into().unwrap();
@@ -87,8 +93,8 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
         };
     }
     if stem == b"load" {
-        let tail @ [APOSTROPHE, IDENT, _, _, _, _] = rest else { return None };
-        let ty: [u8; 4] = tail[2..].try_into().unwrap();
+        let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
+        let ty: [u8; 4] = tail[3..7].try_into().unwrap();
         let pri = pcx.objs.push(TPRI::new(Primitive::from_name(
                     pcx.intern.get_slice(zerocopy::transmute!(ty)))? as u8)).erase();
         let ann = match args.len() {
