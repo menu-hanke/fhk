@@ -20,6 +20,7 @@ use crate::image::fhk_vmcall_native as fhk_vmcall;
 
 type lua_State = c_void;
 
+#[cfg_attr(windows, link(name="lua51"))]
 extern "C-unwind" {
     fn luaL_loadbuffer(L: *mut lua_State, buff: *const u8, sz: usize, name: *const c_char) -> c_int;
     fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int);

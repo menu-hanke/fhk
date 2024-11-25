@@ -5,7 +5,7 @@ use core::mem::take;
 use crate::compile::{self, Ccx, Phase};
 use crate::image::Image;
 use crate::mcode::{MCode, Reloc, Sym};
-use crate::mmap::{mmap, Mmap};
+use crate::mmap::{Mmap, Prot};
 use crate::support::NativeFunc;
 use crate::trace::trace;
 use crate::typestate::Absent;
@@ -34,7 +34,7 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
     let code: &[u8] = mcode.code.as_slice();
     let data: &[u8] = mcode.data.bump().as_slice();
     // TODO this can really fail and should set an error insted of unwrapping
-    let mut map = mmap(code.len() + data.len(), Mmap::READ | Mmap::WRITE).unwrap();
+    let mut map = Mmap::new(code.len() + data.len(), Prot::Read | Prot::Write).unwrap();
     let mem = map.as_mut_slice();
     mem[..code.len()].copy_from_slice(code);
     mem[code.len()..].copy_from_slice(data);
@@ -54,8 +54,8 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
         }
     }
     // protect data first so that any overlap is still executable
-    map.protect(code.len()..code.len()+data.len(), Mmap::READ);
-    map.protect(0..code.len(), Mmap::READ | Mmap::EXEC);
+    map.protect(code.len()..code.len()+data.len(), Prot::Read.into());
+    map.protect(0..code.len(), Prot::Read | Prot::Exec);
     trace!(
         LINK "code is at {:#x}..{:#x} ({} bytes)",
         map.base() as usize, map.base() as usize + code.len(), code.len(),

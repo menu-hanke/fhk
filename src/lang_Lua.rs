@@ -18,7 +18,7 @@ use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::{decomposition, decomposition_size, reserve, CLcx};
-use crate::mmap::{mmap, Mmap};
+use crate::mmap::{Mmap, Prot};
 use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP, TVAR};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
@@ -658,7 +658,7 @@ impl Language for Lua {
     }
 
     fn finish_emit(self, ccx: &mut Ccx<Emit>) -> compile::Result {
-        let stack = match mmap(CORO_STACK, Mmap::READ | Mmap::WRITE) {
+        let stack = match Mmap::new(CORO_STACK, Prot::Read | Prot::Write) {
             Some(stack) => stack,
             None => {
                 // TODO: report error

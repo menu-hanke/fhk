@@ -82,10 +82,13 @@ extern "sysv64" {
 
 cfg_if! {
     if #[cfg(any(windows, all(target_os="macos", target_arch="aarch64")))] {
-        pub unsafe extern "C" fn fhk_vmcall_native(vmctx: &Pin<Instance>, mcode: *const u8) -> i32 {
-            fhk_vmcall(vmctx, mcode)
+        pub unsafe extern "C" fn fhk_vmcall_native(
+            vmctx: *mut Instance,
+            result: *mut u8,
+            mcode: *const u8
+        ) -> i32 {
+            fhk_vmcall(vmctx, result, mcode)
         }
-        pub use fhk_vmcall_native;
     } else {
         pub use fhk_vmcall as fhk_vmcall_native;
     }
@@ -170,7 +173,6 @@ fhk_swap_init:
     mov [rsi+48], rax
     mov [rdi], rsi
     jmp fhk_swap
-    ret
 1:
     mov rdi, rcx
     jmp rdx
@@ -180,6 +182,104 @@ fhk_swap_init:
 // coro[rdi] -> vmctx[rax]
 fhk_swap_instance:
     mov rax, [rdi]
+    mov rax, [rax]
+    ret
+");
+
+#[cfg(all(target_arch="x86_64", windows))]
+global_asm!("
+.p2align 4
+.global fhk_swap
+// (coro[rcx], ret_out[rdx]) -> ret_in[rax]
+fhk_swap:
+    sub rsp, 168 // 8 padding + 160 xmm regs
+    vmovaps [rsp],     xmm6
+    vmovaps [rsp+16],  xmm7
+    vmovaps [rsp+32],  xmm8
+    vmovaps [rsp+48],  xmm9
+    vmovaps [rsp+64],  xmm10
+    vmovaps [rsp+80],  xmm11
+    vmovaps [rsp+96],  xmm12
+    vmovaps [rsp+112], xmm13
+    vmovaps [rsp+128], xmm14
+    vmovaps [rsp+144], xmm15
+    push rbx
+    push rbp
+    push rdi
+    push rsi
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [rcx]   // rax = coro.sp
+    mov [rcx], rsp   // coro.sp = rsp
+    mov rsp, rax     // swap to coro stack
+    mov rax, rdx     // rax = return value on coro stack
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rsi
+    pop rdi
+    pop rbp
+    pop rbx
+    vmovaps xmm6,  [rsp]
+    vmovaps xmm7,  [rsp+16]
+    vmovaps xmm8,  [rsp+32]
+    vmovaps xmm9,  [rsp+48]
+    vmovaps xmm10, [rsp+64]
+    vmovaps xmm11, [rsp+80]
+    vmovaps xmm12, [rsp+96]
+    vmovaps xmm13, [rsp+112]
+    vmovaps xmm14, [rsp+128]
+    vmovaps xmm15, [rsp+144]
+    add rsp, 168
+    ret
+
+.global fhk_swap_exit
+// coro[rcx] -> ret[rax]
+fhk_swap_exit:
+    sub rsp, 168 // 8 padding + 160 xmm regs
+    vmovaps [rsp],     xmm6
+    vmovaps [rsp+16],  xmm7
+    vmovaps [rsp+32],  xmm8
+    vmovaps [rsp+48],  xmm9
+    vmovaps [rsp+64],  xmm10
+    vmovaps [rsp+80],  xmm11
+    vmovaps [rsp+96],  xmm12
+    vmovaps [rsp+112], xmm13
+    vmovaps [rsp+128], xmm14
+    vmovaps [rsp+144], xmm15
+    push rbx
+    push rbp
+    push rdi
+    push rsi
+    push r12
+    push r13
+    push r14
+    push r15
+    mov rax, [rcx]   // rax = coro.sp
+    mov [rcx], rsp   // coro.sp = rsp
+    mov r15, [rax]   // r15 = vmctx
+    jmp fhk_vmexit
+
+.global fhk_swap_init
+// (coro[rcx], stack[rdx], func[r8], ctx[r9])
+fhk_swap_init:
+    sub rdx, 240     // 64 (gprs) + 168 (xmm regs) + 8 (return address)
+    lea rax, [rip+1f]
+    mov [rdx+232], rax
+    mov [rcx], rdx
+    jmp fhk_swap
+1:
+    mov rcx, r9
+    call r8          // this must never return
+    ud2
+
+.global fhk_swap_instance
+// coro[rcx] -> vmctx[rax]
+fhk_swap_instance:
+    mov rax, [rcx]
     mov rax, [rax]
     ret
 ");
@@ -205,7 +305,6 @@ extern "C" {
     #[allow(improper_ctypes)]
     pub fn fhk_swap_instance(coro: usize) -> *mut Instance;
 }
-
 
 impl Image {
 
