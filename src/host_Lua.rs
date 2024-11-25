@@ -96,7 +96,10 @@ extern "C" fn fhk_objnum(G: &fhk_Graph) -> ObjRef {
 }
 
 unsafe fn slice_from_raw_parts<'a,T>(src: *const T, num: usize) -> &'a [T] {
-    core::slice::from_raw_parts(match num { 0 => core::ptr::dangling(), _ => src }, num)
+    core::slice::from_raw_parts(
+        match num { 0 => core::mem::transmute(align_of::<T>()), _ => src },
+        num
+    )
 }
 
 #[derive(Clone, Copy)]
