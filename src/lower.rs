@@ -10,7 +10,6 @@ use enumset::{EnumSet, EnumSetType};
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Bump, BumpPtr, BumpRef};
 use crate::compile::{self, Ccx, Phase};
-use crate::dataflow::{Dataflow, DataflowSystem};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
@@ -2064,7 +2063,8 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
 //   for each explicit reset r and func F:
 //     (1) r ∈ R(F) if node(F) ∈ r,   where node(F) is the node F was generated from.
 //   for each pair of functions F, G:
-//     (2) R(G) ⊂  R(F) if F calls G
+//     (2) R(G) ⊂ R(F) if F calls G
+//     (3) R(G) = R(F) if F initializes G
 fn computereset(ccx: &mut Ccx<Lower, R>) {
     let mut mat: BitMatrix<FuncId, ResetId> = Default::default();
     mat.resize(ccx.ir.funcs.end(), ResetId::MAXNUM.into());
@@ -2098,33 +2098,42 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
             }
         }
     }
-    // construct call graph
-    let mut df: Dataflow<FuncId> = Default::default();
+    // construct constraints
+    #[repr(C)]
+    #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+    struct Con { f: FuncId, g: FuncId } // R(G) ⊂ R(F)
+    let base = ccx.tmp.end();
+    let con = ccx.tmp.align_for::<Con>();
     for (f, func) in ccx.ir.funcs.pairs() {
-        df.push();
         for (_, ins) in func.code.pairs() {
-            if (Opcode::CALLB|Opcode::CALLBI).contains(ins.opcode()) {
-                let (_, _, g) = ins.decode_CALLB();
-                if f != g {
-                    df.raw_inputs().push(g);
-                }
+            match ins.opcode() {
+                Opcode::CALLB|Opcode::CALLBI => {
+                    let (_, _, g) = ins.decode_CALLB();
+                    if f != g {
+                        con.push(Con { f, g });
+                    }
+                },
+                Opcode::BINIT => {
+                    let (_, g) = ins.decode_BINIT();
+                    con.push(Con { f, g });
+                    con.push(Con { f:g, g:f });
+                },
+                _ => {}
             }
         }
     }
-    // we won't be calling compute_uses() so push the dummy end node manually
-    df.push();
     // solve the system
-    let mut solver: DataflowSystem<FuncId> = Default::default();
-    solver.resize(ccx.ir.funcs.end());
-    solver.queue_all(ccx.ir.funcs.end());
-    while let Some(f) = solver.poll() {
-        for &g in df.inputs(f) {
-            let [fr, gr] = mat.get_rows_mut([f,g]);
+    let con: &[Con] = &ccx.tmp[base.cast_up()..];
+    loop {
+        let mut fixpoint = true;
+        for &Con {f, g} in con {
+            let [fr, gr] = mat.get_rows_mut([f, g]);
             if !gr.is_subset(fr) {
+                fixpoint = false;
                 fr.union(gr);
-                solver.queue(f);
             }
         }
+        if fixpoint { break }
     }
     // update ir
     for (id, func) in ccx.ir.funcs.pairs_mut() {
