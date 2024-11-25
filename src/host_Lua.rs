@@ -87,15 +87,34 @@ extern "C" fn fhk_objnum(G: &fhk_Graph) -> ObjRef {
     G.objs.end()
 }
 
-unsafe extern "C" fn fhk_gettemplate(
+extern "C" fn fhk_settab(G: &mut fhk_Graph, tab: fhk_ObjRef<TAB>) {
+    G.data.tab = tab;
+}
+
+unsafe fn slice_from_raw_parts<'a,T>(src: *const T, num: usize) -> &'a [T] {
+    core::slice::from_raw_parts(match num { 0 => core::ptr::dangling(), _ => src }, num)
+}
+
+// options here must match host.lua
+const PARSE_DEF: c_int = 0;
+const PARSE_EXPR: c_int = 1;
+const PARSE_TEMPLATE: c_int = 2;
+unsafe extern "C" fn fhk_parse(
     G: &mut fhk_Graph,
     src: *const c_char,
-    len: usize
+    len: usize,
+    what: c_int
 ) -> fhk_Result {
-    match parse(G, core::slice::from_raw_parts(src as _, len), |pcx| parse_template(pcx)) {
-        Err(_) => -1,
-        Ok(seq) => zerocopy::transmute!(seq)
-    }
+    parse(
+        G,
+        slice_from_raw_parts(src as _, len),
+        |pcx| match what {
+            PARSE_DEF => parse_def(pcx).map(|_| 0),
+            PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
+            PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
+            _ => unreachable!()
+        }
+    ).unwrap_or(-1)
 }
 
 extern "C" fn fhk_substitute(
@@ -150,39 +169,19 @@ extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
 //     todo!()
 // }
 
-unsafe extern "C" fn fhk_parse(
-    G: &mut fhk_Graph,
-    tab: fhk_ObjRef<TAB>,
-    src: *const c_char,
-    len: usize
-) -> fhk_Result {
-    G.data.tab = tab;
-    match parse(G, core::slice::from_raw_parts(src as _, len), parse_expr) {
-        Err(_) => -1,
-        Ok(idx) => zerocopy::transmute!(idx)
-    }
-}
-
 unsafe extern "C" fn fhk_newquery(
     G: &mut fhk_Graph,
     tab: fhk_ObjRef<TAB>,
     values: *const fhk_ObjRef<EXPR>,
     num: usize
 ) -> fhk_ObjRef<QUERY> {
-    G.objs.push_args(QUERY::new(tab, 0), core::slice::from_raw_parts(values, num))
+    G.objs.push_args(QUERY::new(tab, 0), slice_from_raw_parts(values, num))
 }
 
 // extern "C" fn fhk_args(G: &mut fhk_Graph, node: fhk_ObjRef, ptr: *mut *mut fhk_ObjRef) -> fhk_Result {
 //     // put ref in ptr, return size
 //     todo!()
 // }
-
-unsafe extern "C" fn fhk_define(G: &mut fhk_Graph, src: *const c_char, len: usize) -> fhk_Result {
-    match parse(G, core::slice::from_raw_parts(src as _, len), parse_def) {
-        Ok(_) => 0,
-        Err(_) => -1
-    }
-}
 
 extern "C" fn fhk_dumpobjs(G: &mut fhk_Graph) {
     G.host.buf.clear();
@@ -240,6 +239,7 @@ macro_rules! define_api {
 typedef struct fhk_Graph fhk_Graph;
 typedef struct fhk_Image fhk_Image;
 typedef struct fhk_Instance fhk_Instance;
+typedef union fhk_Obj { uint32_t raw; struct { uint8_t n; uint8_t op; uint8_t mark; uint8_t data; } obj; } fhk_Obj;
 typedef void *(fhk_Alloc)(void *, size_t, size_t);",
             stringify! {
                 typedef struct {
@@ -257,17 +257,16 @@ define_api! {
     void (*fhk_destroygraph)(fhk_Graph *);
     void (*fhk_destroyimage)(fhk_Image *);
     char *(*fhk_buf)(fhk_Graph *);
-    uint32_t *(*fhk_objs)(fhk_Graph *);
+    fhk_Obj *(*fhk_objs)(fhk_Graph *);
     uint32_t (*fhk_objnum)(fhk_Graph *);
-    int32_t (*fhk_gettemplate)(fhk_Graph *, const char *, size_t);
+    void (*fhk_settab)(fhk_Graph *, int32_t);
+    int32_t (*fhk_parse)(fhk_Graph *, const char *, size_t, int);
     int32_t (*fhk_substitute)(fhk_Graph *, int32_t, int32_t *, size_t);
     int32_t (*fhk_gettab)(fhk_Graph *, int32_t, bool);
     int32_t (*fhk_getvar)(fhk_Graph *, int32_t, int32_t, bool);
     void (*fhk_getstr)(fhk_Graph *, uint32_t);
-    int32_t (*fhk_parse)(fhk_Graph *, int32_t, const char *, size_t);
     int32_t (*fhk_newquery)(fhk_Graph *, int32_t, int32_t *, size_t);
     // int32_t (*fhk_args)(fhk_Graph *, int32_t, int32_t *, size_t);
-    int32_t (*fhk_define)(fhk_Graph *, const char *, size_t);
     void (*fhk_dumpobjs)(fhk_Graph *);
     int32_t (*fhk_compile)(fhk_Graph *, fhk_Image **);
     void *(*fhk_mcode)(fhk_Image *);

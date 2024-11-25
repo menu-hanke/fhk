@@ -4,7 +4,8 @@ require "table.clear"
 require "table.new"
 local tensor, API, OP_NAMEPTR, OP_NAMEOFS, OP_FDESC, OP_FOFS, OP_NUM = ...
 local API = ffi.cast("fhk_Api *", API)
-local NODE_NIL = 0
+
+---- String buffer management --------------------------------------------------
 
 local function getstrbuf(graph)
 	return ffi.string(API.fhk_buf(graph.G))
@@ -14,6 +15,27 @@ local function getstr(graph, str)
 	API.fhk_getstr(graph.G, str)
 	return getstrbuf(graph)
 end
+
+---- Parse API -----------------------------------------------------------------
+
+local function checkres(graph, x)
+	if x == -1 then
+		return nil, getstrbuf(graph)
+	else
+		return x
+	end
+end
+
+-- must match host_Lua.rs
+local PARSE_DEF = 0
+local PARSE_EXPR = 1
+local PARSE_TEMPLATE = 2
+
+local function checkparse(graph, src, what)
+	return assert(checkres(graph, API.fhk_parse(graph.G, src, #src, what)))
+end
+
+---- Object management ---------------------------------------------------------
 
 -- ORDER FIELDTYPE
 local FT_SPEC = 0
@@ -58,7 +80,11 @@ local function getgraph(x)
 end
 
 local function getobjproto(obj)
-	return getmetatable(obj).proto
+	local mt = getmetatable(obj)
+	if not mt then return end
+	local opdef = mt.opdef
+	if not opdef then return end
+	return opdef.proto
 end
 
 local function isobj(x)
@@ -69,40 +95,24 @@ local function isseq(x)
 	return type(x) == "table" and getmetatable(x).seq
 end
 
-local function isvalidobj(graph, idx)
-	if idx < graph.num then
+local function isvalidobj(graph, i)
+	if i < graph.num then
 		return true
 	end
 	graph.num = API.fhk_objnum(graph.G)
-	return idx < graph.num
+	return i < graph.num
 end
 
 local function getobjptr(obj)
-	return API.fhk_objs(getgraph(obj).G) + obj.idx
-end
-
-local fhk_Obj = ffi.typeof [[
-	union {
-		uint32_t raw;
-		struct {
-			uint8_t n;
-			uint8_t op;
-			uint8_t mark;
-			uint8_t data;
-		} obj;
-	}
-]]
-
-local function raw2obj(raw)
-	return fhk_Obj(raw).obj
+	return API.fhk_objs(getgraph(obj).G) + obj.i
 end
 
 local function fget_spec(obj)
-	return raw2obj(getobjptr(obj)[0]).data
+	return getobjptr(obj).obj.data
 end
 
 local function fget_lit(obj, i)
-	return getobjptr(obj)[i]
+	return getobjptr(obj)[i].raw
 end
 
 local function fget_name(obj, i)
@@ -115,10 +125,10 @@ end
 
 local function fget_vlit(obj, i)
 	local ptr = getobjptr(obj)
-	local n = raw2obj(ptr[0]).n - i
+	local n = ptr.obj.n - i
 	local values = table.new(n, 0)
 	for j=1, n do
-		values[j] = ptr[i+j-1]
+		values[j] = ptr[i+j-1].raw
 	end
 	return values
 end
@@ -141,8 +151,9 @@ local FTGETTER = {
 	[FT_VREF] = fget_vref
 }
 
-local function makeproto(fields)
-	local proto = table.new(0, #fields)
+local function makeproto(fields, name)
+	local proto = table.new(0, #fields+1)
+	proto.op = function() return name end
 	for _,f in ipairs(fields) do
 		local idx = f.idx
 		local get = FTGETTER[f.ft]
@@ -174,16 +185,12 @@ do
 			})
 			ofs = ofs + 1 + len
 		end
+		local name = ffi.string(OP_NAMEPTR+OP_NAMEOFS[i], OP_NAMEOFS[i+1]-OP_NAMEOFS[i])
 		OPDEF[i] = {
-			name   = ffi.string(OP_NAMEPTR+OP_NAMEOFS[i], OP_NAMEOFS[i+1]-OP_NAMEOFS[i]),
 			fields = fields,
-			proto  = makeproto(fields)
+			proto  = makeproto(fields, name)
 		}
 	end
-end
-
-local function objtypeof(x)
-	return OPDEF[getmetatable(x).opno].name
 end
 
 local function obj__index(self, name)
@@ -198,8 +205,7 @@ end
 local function makeobjmt(graph, opno)
 	return {
 		graph   = graph,
-		proto   = OPDEF[opno].proto,
-		opno    = opno,
+		opdef   = OPDEF[opno],
 		__index = obj__index
 	}
 end
@@ -212,15 +218,29 @@ local function makeobjmts(graph)
 	return obj_mt
 end
 
-local function objtab__index(self, idx)
+local function objtab__index(self, i)
 	local graph = getgraph(self)
-	if not isvalidobj(graph, idx) then
+	if not isvalidobj(graph, i) then
 		return
 	end
-	local op = raw2obj(API.fhk_objs(graph.G)[idx]).op
-	local obj = setmetatable({idx=idx}, graph.obj_mt[op])
-	rawset(self, idx, obj)
+	local op = API.fhk_objs(graph.G)[i].obj.op
+	local obj = setmetatable({i=i}, graph.obj_mt[op])
+	rawset(self, i, obj)
 	return obj
+end
+
+local function obj_refs(obj)
+	local refs = {}
+	for _,f in pairs(getmetatable(obj).opdef.fields) do
+		if f.ft == FT_REF then
+			table.insert(refs, fget_ref(obj, f.idx))
+		elseif f.ft == FT_VREF then
+			for _,v in ipairs(fget_vref(obj, f.idx)) do
+				table.insert(refs, v)
+			end
+		end
+	end
+	return refs
 end
 
 local function makeobjtab(graph)
@@ -230,8 +250,25 @@ local function makeobjtab(graph)
 	})
 end
 
+local function objtab__next(self, i)
+	local o = self[i]
+	if o then
+		i = i + API.fhk_objs(getgraph(self).G)[i].obj.n
+		o = self[i]
+		if o then
+			return i, o
+		end
+	end
+end
+
+local function graph_opairs(graph)
+	-- this skips NIL, which is exactly what we want
+	return objtab__next, graph.objs, 0
+end
+
+
 local function seq__tostring(seq)
-	return getstr(getgraph(seq), seq.idx)
+	return getstr(getgraph(seq), seq.i)
 end
 
 local function makeseqmt(graph)
@@ -242,52 +279,14 @@ local function makeseqmt(graph)
 	}
 end
 
-local function checkbuf(graph, n)
-	local bufsz = graph.bufsz
-	if n > bufsz then
-		repeat bufsz = 2*bufsz until n <= bufsz
-		graph.buf = ffi.new("int32_t[?]", bufsz)
-		graph.bufsz = bufsz
-	end
-end
-
-local function setbuf(graph, values)
-	checkbuf(graph, #values)
-	for i=1, #values do
-		graph.buf[i-1] = values[i]
-	end
-	return graph.buf, #values
-end
-
-local function setbufo(graph, objs)
-	checkbuf(graph, #objs)
-	for i=1, #objs do
-		graph.buf[i-1] = objs[i].idx
-	end
-	return graph.buf, #objs
-end
-
-local function checkres(graph, x)
-	if x == -1 then
-		return nil, getstrbuf(graph)
-	else
-		return x
-	end
-end
-
-local function defcreate(create)
-	if create == nil then return true else return create end
-end
+---- Parsing -------------------------------------------------------------------
 
 local function gettemplate(graph, src)
 	if isseq(src) then return src end
 	if isobj(src) then
 		error("TODO: return ObjRef name")
 	end
-	return setmetatable(
-		{idx=assert(checkres(graph, API.fhk_gettemplate(graph.G, src, #src)))},
-		graph.seq_mt
-	)
+	return setmetatable({i=checkparse(graph, src, PARSE_TEMPLATE)}, graph.seq_mt)
 end
 
 -- local function substitute(graph, template, arg1, ...)
@@ -301,9 +300,13 @@ end
 -- 		API.fhk_substitute(graph.G, template, setbuf(graph, args)))))
 -- end
 
+local function defcreate(create)
+	if create == nil then return true else return create end
+end
+
 local function gettab(graph, tab, create)
 	if isobj(tab) then return tab end
-	tab = API.fhk_gettab(graph.G, gettemplate(graph, tab).idx, defcreate(create))
+	tab = API.fhk_gettab(graph.G, gettemplate(graph, tab).i, defcreate(create))
 	if tab >= 0 then return graph.objs[tab] end
 end
 
@@ -328,54 +331,14 @@ end
 -- 	-- TODO
 -- end
 
-local function query_add(query, expr)
-	table.insert(
-		query.values,
-		query.graph.objs[assert(checkres(graph,
-			API.fhk_parse(query.graph.G, query.tab.idx, expr, #expr)))]
-	)
-end
-
-local query_mt = {
-	add = query_add
-}
-query_mt.__index = query_mt
-
-local function graph_newquery(graph, tab)
-	local query = setmetatable({
-		graph  = graph,
-		tab    = gettab(graph, tab),
-		values = {}
-	}, query_mt)
-	table.insert(graph.queries, query)
-	return query
-end
-
-local reset_mt = {
-
-}
-reset_mt.__index = reset_mt
-
-local function graph_newreset(graph)
-	local reset = setmetatable({
-		graph = graph,
-		nodes = {}
-	}, reset_mt)
-	table.insert(graph.resets, reset)
-	return reset
-end
-
-local function image_newinstance(image, alloc, udata, prev, mask)
-	return API.fhk_newinstance(image.ptr, alloc, udata or nil, prev or nil, mask or 1)
-end
-
-local image_mt = {
-	newinstance = image_newinstance
-}
-image_mt.__index = image_mt
-
 local function graph_define(graph, src)
-	assert(checkres(graph, API.fhk_define(graph.G, src, #src)))
+	checkparse(graph, src, PARSE_DEF)
+end
+
+local function graph_expr(graph, tab, src)
+	if isobj(src) then return src end
+	API.fhk_settab(graph.G, gettab(graph, tab, true).i)
+	return graph.objs[checkparse(graph, src, PARSE_EXPR)]
 end
 
 local function graph_dump(graph, flags)
@@ -390,14 +353,37 @@ local function graph_dump(graph, flags)
 	return buf:get()
 end
 
+---- Queries -------------------------------------------------------------------
+
+local function query_add(query, expr)
+	query.vnum = query.vnum+1
+	query.values[query.vnum] = graph_expr(query.graph, query.tab, expr)
+	return string.format("v%d", query.vnum)
+end
+
+local query_mt = {
+	add = query_add
+}
+query_mt.__index = query_mt
+
+local function graph_newquery(graph, tab)
+	local query = setmetatable({
+		graph  = graph,
+		tab    = gettab(graph, tab),
+		values = {},
+		vnum   = 0
+	}, query_mt)
+	table.insert(graph.queries, query)
+	return query
+end
+
 local function ann2ct(obj)
 	if obj.ann then
 		obj = obj.ann
 	end
-	local aty = objtypeof(obj)
-	if aty == "TPRI" then
+	if obj.op == "TPRI" then
 		return PRI_CT[obj.ty]
-	elseif aty == "TTEN" then
+	elseif obj.op == "TTEN" then
 		return tensor.ctypeof(ann2ct(obj.elem), obj.dim)
 	else
 		error("bad type annotation")
@@ -428,7 +414,7 @@ local function queryctype(query)
 		ffi.typeof(tostring(buf), unpack(args)),
 		{
 			__index = {
-				unpack = queryunpack(#query.obj.value)
+				unpack = queryunpack(query.vnum)
 			}
 		}
 	)
@@ -455,9 +441,55 @@ local function compilequery(query, image)
 	query.query = queryfunc(ct, mcode)
 end
 
+---- Resets --------------------------------------------------------------------
+
+local reset_mt = {
+
+}
+reset_mt.__index = reset_mt
+
+local function graph_newreset(graph)
+	local reset = setmetatable({
+		graph = graph,
+		nodes = {}
+	}, reset_mt)
+	table.insert(graph.resets, reset)
+	return reset
+end
+
+---- Instances -----------------------------------------------------------------
+
+local function image_newinstance(image, alloc, udata, prev, mask)
+	return API.fhk_newinstance(image.ptr, alloc, udata or nil, prev or nil, mask or 1)
+end
+
+local image_mt = {
+	newinstance = image_newinstance
+}
+image_mt.__index = image_mt
+
+---- Compilation ---------------------------------------------------------------
+
+local function checkbuf(graph, n)
+	local bufsz = graph.bufsz
+	if n > bufsz then
+		repeat bufsz = 2*bufsz until n <= bufsz
+		graph.buf = ffi.new("int32_t[?]", bufsz)
+		graph.bufsz = bufsz
+	end
+end
+
+local function setbufo(graph, objs)
+	checkbuf(graph, #objs)
+	for i=1, #objs do
+		graph.buf[i-1] = objs[i].i
+	end
+	return graph.buf, #objs
+end
+
 local function graph_compile(graph)
 	for _,query in ipairs(graph.queries) do
-		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.idx, setbufo(graph, query.values))]
+		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbufo(graph, query.values))]
 	end
 	local image = ffi.new("fhk_Image *[1]");
 	assert(checkres(graph, API.fhk_compile(graph.G, image)))
@@ -468,14 +500,18 @@ local function graph_compile(graph)
 	end
 	setmetatable(graph, image_mt)
 	table.clear(graph)
-	graph.ptr = ptr
+	graph.ptr = ffi.gc(ptr, API.fhk_destroyimage)
 	return graph
 end
 
+--------------------------------------------------------------------------------
+
 local graph_mt = {
+	opairs   = graph_opairs,
+	define   = graph_define,
+	expr     = graph_expr,
 	newquery = graph_newquery,
 	newreset = graph_newreset,
-	define   = graph_define,
 	dump     = graph_dump,
 	compile  = graph_compile
 }
@@ -497,5 +533,6 @@ local function newgraph()
 end
 
 return {
-	newgraph = newgraph
+	newgraph = newgraph,
+	refs     = obj_refs
 }
