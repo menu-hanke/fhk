@@ -13,47 +13,59 @@ local fhk = assert(package.loadlib("../target/"..target.."/"..libname, "luaopen_
 
 ---- asserts -------------------------------------------------------------------
 
-local function near(x, tol)
-	-- consider: need relative tolerance here?
-	tol = tol or 1e-6
-	return function(v)
-		return math.abs(x-v) <= tol
+local function equal(a, b, tol)
+	if type(a) ~= type(b) then
+		return false
 	end
-end
-
-local function veceq(tab, v)
-	if #tab ~= #v then
-		return false, string.format("expected %d items, got %d", #tab, #v)
-	end
-	local mismatch = {}
-	for i=1, #v do
-		if tab[i] ~= v[i-1] then
-			table.insert(mismatch, string.format("    [%d]: %g ~= %g\n", i-1, tab[i], v[i-1]))
+	if type(a) == "number" then
+		if tol then
+			return math.abs(a-b) <= tol
+		else
+			return a == b
 		end
 	end
-	if #mismatch > 0 then
-		return false, string.format("mismatched elements: \n%s", table.concat(mismatch))
-	else
-		return true
+	if #a ~= #b then
+		return false
 	end
+	for i=1, #a do
+		if not equal(a[i], b[i]) then
+			return false
+		end
+	end
+	return true
 end
 
-local function scalareq(x, y)
-	if x == y then
-		return true
-	else
-		return false, string.format("%s ~= %s", x, y)
-	end
-end
-
-local function check(computed, true_)
-	for i,r in ipairs(true_) do
-		if type(computed[i]) == "cdata" then
-			assert(veceq(r, computed[i]))
-		elseif type(r) == "number" or type(r) == "boolean" then
-			assert(scalareq(computed[i], r))
+local function prettyprint(tab)
+	local buf = buffer.new()
+	buf:put("[")
+	for i=1, #tab do
+		local v = tab[i]
+		buf:put(" ")
+		if type(v) == "table" then
+			puttab(buf, v)
 		else
-			assert(r(computed[i]))
+			buf:put(v)
+		end
+	end
+	buf:put("]")
+	return tostring(buf)
+end
+
+local function check(computed, true_, tol)
+	for i,t in ipairs(true_) do
+		local c = computed[i]
+		if type(c) == "cdata" then
+			c = c:totable()
+		end
+		local ok
+		if type(t) == "function" then
+			ok = t(c)
+		else
+			ok = equal(t,c,tol)
+		end
+		if not ok then
+			error(string.format("bad result!\ncomputed: %s\ntrue    : %s\n",
+				prettyprint(c), prettyprint(t)))
 		end
 	end
 end

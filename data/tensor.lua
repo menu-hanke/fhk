@@ -54,7 +54,7 @@ local function maketotab(n)
 	local buf = buffer.new()
 	buf:put("return function(self)\nlocal tab0 = {}\n")
 	for i=0, n-1 do
-		buf:putf("for i%d=0, self.n[%d] do\n", i, i)
+		buf:putf("for i%d=0, self.n[%d]-1 do\n", i, i)
 		if i == n-1 then
 			buf:putf("tab%d[i%d+1] = self:get(", i, i)
 			for j=0, n-1 do
@@ -65,8 +65,20 @@ local function maketotab(n)
 		else
 			buf:putf("local tab%d = {}\ntab%d[i%d] = tab%d\n", i+1, i, i, i+1)
 		end
+		buf:put("end\n")
 	end
 	buf:put("return tab0\nend\n")
+	return load(buf)()
+end
+
+local function makeshape(n)
+	local buf = buffer.new()
+	buf:put("return function(self)\nreturn ")
+	for i=0, n-1 do
+		if i>0 then buf:put(",") end
+		buf:putf("self.n[%d]", i)
+	end
+	buf:put("\nend")
 	return load(buf)()
 end
 
@@ -81,7 +93,7 @@ local function puttab(buf, tab)
 			buf:put(v)
 		end
 	end
-	buf:put("]")
+	buf:put(" ]")
 end
 
 local function tensor__tostring(tensor)
@@ -91,12 +103,15 @@ local function tensor__tostring(tensor)
 end
 
 local function newmetatype(e, n)
+	local shape = makeshape(n)
 	local mt = {
 		__index = {
 			get     = makegetter(e, n),
-			totable = maketotab(n)
+			totable = maketotab(n),
+			shape   = shape
 		},
-		__tostring = tensor__tostring
+		__len      = shape,
+		__tostring = tensor__tostring,
 	}
 	return mt
 end
@@ -108,7 +123,7 @@ end
 -- struct layout here must match query memory layout.
 local function ctypeof(e, n)
 	e = ffi.typeof(e)
-	if (not n) or n == 0 or not metadata(e) then return e end
+	if (not n) or n == 0 then return e end
 	local ctk = ctkey(e, n)
 	local ct = CTYPES[ctk]
 	if ct then return ct end
