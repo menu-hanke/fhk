@@ -272,8 +272,8 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
         pcx.objs[vset].value = pcx.data.tmpref.pop().unwrap().cast();
     }
     let guard = match pcx.data.token {
-        Token::Where => todo!(),
-        _            => ObjRef::NIL.cast()
+        Token::Where => { next(pcx)?; parse_expr(pcx)? },
+        _ => ObjRef::NIL.cast()
     };
     pcx.objs.push(&MOD::new(
             InternRef::EMPTY,

@@ -1013,21 +1013,42 @@ fn emitlogic(func: &FuncBuilder, ctr: &mut InsId, left: InsId, right: InsId, op:
     func.code.push(Ins::PHI(Type::B1, merge, phi))
 }
 
+fn emitcmp(func: &FuncBuilder, left: InsId, right: InsId, op: Intrinsic, ty: Primitive) -> InsId {
+    let opcode = match (op, ty.is_unsigned()) {
+        (Intrinsic::LT, true)  => Opcode::ULT,
+        (Intrinsic::LT, false) => Opcode::LT,
+        (Intrinsic::LE, true)  => Opcode::ULE,
+        (Intrinsic::LE, false) => Opcode::LE,
+        _ => unreachable!()
+    };
+    func.code.push(
+        Ins::new(opcode, Type::B1)
+            .set_a(zerocopy::transmute!(left))
+            .set_b(zerocopy::transmute!(right))
+    )
+}
+
 // args passed in ctx.data.tmp_ins
-fn emitscalarintrinsic(ctx: &Ctx, ctr: &mut InsId, f: Intrinsic, ty: Type) -> InsId {
+fn emitscalarintrinsic(
+    ctx: &Ctx,
+    ctr: &mut InsId,
+    f: Intrinsic,
+    args: &[ObjRef<EXPR>],
+    ty: Type
+) -> InsId {
     use Intrinsic::*;
-    let args = &ctx.data.tmp_ins;
+    let argv = &ctx.data.tmp_ins;
     match f {
-        OR|AND => emitlogic(&ctx.data.func, ctr, args.at(0), args.at(1), f),
-        ADD   => ctx.data.func.code.push(Ins::ADD(ty, args.at(0), args.at(1))),
-        SUB   => ctx.data.func.code.push(Ins::SUB(ty, args.at(0), args.at(1))),
-        MUL   => ctx.data.func.code.push(Ins::MUL(ty, args.at(0), args.at(1))),
+        OR|AND => emitlogic(&ctx.data.func, ctr, argv.at(0), argv.at(1), f),
+        ADD   => ctx.data.func.code.push(Ins::ADD(ty, argv.at(0), argv.at(1))),
+        SUB   => ctx.data.func.code.push(Ins::SUB(ty, argv.at(0), argv.at(1))),
+        MUL   => ctx.data.func.code.push(Ins::MUL(ty, argv.at(0), argv.at(1))),
         DIV   => todo!(), // handle signedness
-        POW   => ctx.data.func.code.push(Ins::POW(ty, args.at(0), args.at(1))),
-        EQ    => ctx.data.func.code.push(Ins::EQ(args.at(0), args.at(1))),
-        NE    => ctx.data.func.code.push(Ins::NE(args.at(0), args.at(1))),
-        LT    => todo!(), // handle signedness
-        LE    => todo!(), // handle signedness
+        POW   => ctx.data.func.code.push(Ins::POW(ty, argv.at(0), argv.at(1))),
+        EQ    => ctx.data.func.code.push(Ins::EQ(argv.at(0), argv.at(1))),
+        NE    => ctx.data.func.code.push(Ins::NE(argv.at(0), argv.at(1))),
+        LT|LE => emitcmp(&ctx.data.func, argv.at(0), argv.at(1), f,
+            vtypeann(&ctx.objs, args[0].erase()).pri),
         UNM   => todo!(), // name it consistently UNM? NEG?
         EXP   => todo!(), // ir intrinsic call?
         LOG   => todo!(), // ir intrinsic call?
@@ -1084,7 +1105,7 @@ fn scalarintrinsic(
             for &arg in args {
                 ctx.data.tmp_ins.push(emitvalue(ctx, ctr, arg));
             }
-            emitscalarintrinsic(ctx, ctr, f, ty)
+            emitscalarintrinsic(ctx, ctr, f, args, ty)
         }
     }
 }
@@ -1108,7 +1129,7 @@ fn broadcastintrinsic(
         // tensor[tensor[U,N],M] or ... you get the idea)
         todo!()
     }
-    emitscalarintrinsic(ctx, &mut loop_.body, f, vty.pri.to_ir())
+    emitscalarintrinsic(ctx, &mut loop_.body, f, args, vty.pri.to_ir())
 }
 
 fn emitvget1(ctx: &Ctx, ctr: &mut InsId, vget: &VGET) -> InsId {

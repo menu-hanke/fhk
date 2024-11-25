@@ -33,6 +33,11 @@ impl Primitive {
         PRI2IR[self as usize]
     }
 
+    pub fn is_unsigned(self) -> bool {
+        use Primitive::*;
+        (U8|U16|U32|U64).contains(self)
+    }
+
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
