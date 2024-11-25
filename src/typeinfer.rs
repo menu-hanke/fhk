@@ -804,6 +804,19 @@ fn visitall(tcx: &mut Tcx) {
     }
 }
 
+fn canondim(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
+    use TypeRepr::*;
+    let mut ty = sub[tv];
+    ty = match ty.unpack() {
+        Var(i) if i == tv => Type::dim(0),
+        Var(i) => canondim(sub, i),
+        Dim(_) => return ty,
+        _ => unreachable!()
+    };
+    sub[tv] = ty;
+    ty
+}
+
 // * eliminate type variables
 // * multi pri => widest type
 // * tensor<t, 0> => t
@@ -822,10 +835,7 @@ fn canonty(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
         },
         Con(Constructor::TENSOR, base) => {
             canonty(sub, base);
-            if sub[base+1] == Type::var(base+1) {
-                sub[base+1] = Type::dim(0);
-            }
-            if canonty(sub, base+1) == Type::dim(0) {
+            if canondim(sub, base+1) == Type::dim(0) {
                 sub[base]
             } else {
                 return ty;
