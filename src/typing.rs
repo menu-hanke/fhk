@@ -4,17 +4,40 @@ use enumset::EnumSetType;
 
 use crate::ir::Type;
 
-#[derive(EnumSetType, Debug)]
-#[repr(u8)]
-pub enum Primitive {
-    // ORDER PRI
-    // numeric types first, in order of assignment preference
-    F64, F32,
-    I64, I32, I16, I8,
-    U64, U32, U16, U8,
-    B1,
-    PTR,
-    STR,
+macro_rules! define_primitives {
+    ($($name:ident $lname:literal;)*) => {
+        #[derive(EnumSetType, Debug)]
+        #[repr(u8)]
+        pub enum Primitive {
+            $($name),*
+        }
+        impl Primitive {
+            pub fn from_name(name: &[u8]) -> Option<Self> {
+                match name {
+                    $($lname => Some(Self::$name),)*
+                    _ => None
+                }
+            }
+        }
+    };
+}
+
+// ORDER PRI
+// numeric types first, in order of assignment preference
+define_primitives! {
+    F64 b"f64";
+    F32 b"f32";
+    I64 b"i64";
+    I32 b"i32";
+    I16 b"i16";
+    I8  b"i8";
+    U64 b"u64";
+    U32 b"u32";
+    U16 b"u16";
+    U8  b"u8";
+    B1  b"b1";
+    PTR b"ptr";
+    STR b"str";
 }
 
 impl Primitive {
@@ -77,6 +100,7 @@ pub enum SchemeBytecode {
     Con(Constructor),  // [-n, +1] apply constructor
     PriNum,            // [-1], apply PRI_NUM constraint
     PriBool,           // [-1], apply PRI_B1 constraint
+    PriPtr,            // [-1], apply PRI_PTR constraint
     Gen(u8)            // [+1], push generic
 }
 
@@ -91,7 +115,8 @@ impl SchemeBytecode {
             Con(con) => con as u8,
             PriNum   => CON_VARIANT_COUNT,
             PriBool  => CON_VARIANT_COUNT+1,
-            Gen(i)   => CON_VARIANT_COUNT+2+i
+            PriPtr   => CON_VARIANT_COUNT+2,
+            Gen(i)   => CON_VARIANT_COUNT+3+i
         }
     }
 
@@ -106,8 +131,10 @@ impl SchemeBytecode {
             PriNum
         } else if raw == CON_VARIANT_COUNT+1 {
             PriBool
+        } else if raw == CON_VARIANT_COUNT+2 {
+            PriPtr
         } else {
-            Gen(raw - CON_VARIANT_COUNT-2)
+            Gen(raw - CON_VARIANT_COUNT-3)
         }
     }
 

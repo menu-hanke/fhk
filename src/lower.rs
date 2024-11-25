@@ -974,6 +974,7 @@ fn emitscalarintrinsic(
         LOG   => todo!(), // ir intrinsic call?
         NOT   => todo!(),
         CONV  => todo!(),
+        LOAD  => lcx.data.func.code.push(Ins::LOAD(ty, argv[0])),
         _     => unreachable!() // non-scalar
     }
 }

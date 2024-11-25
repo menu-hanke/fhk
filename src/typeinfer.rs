@@ -411,11 +411,12 @@ fn instantiate(scheme: &Scheme, tvar: &mut IndexVec<TypeVar, Type>, work: &mut V
     }
     for &ins in scheme.bytecode() {
         match SchemeBytecode::decode(ins) {
-            SchemeBytecode::PriNum | SchemeBytecode::PriBool => {
+            bc @ (SchemeBytecode::PriNum | SchemeBytecode::PriBool | SchemeBytecode::PriPtr) => {
                 let tv: TypeVar = zerocopy::transmute!(work.pop().unwrap());
-                let cst = match ins == SchemeBytecode::PriNum.encode() {
-                    true  => Type::pri(PRI_NUM),
-                    false => Type::pri(Primitive::B1)
+                let cst = match bc {
+                    SchemeBytecode::PriNum  => Type::pri(PRI_NUM),
+                    SchemeBytecode::PriBool => Type::pri(Primitive::B1),
+                    _ /* PriPtr */          => Type::pri(Primitive::PTR)
                 };
                 unify(tvar, tv, cst);
             },

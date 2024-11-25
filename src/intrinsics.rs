@@ -54,6 +54,8 @@ define_intrinsics! {
     CONV   b"conv" :: [t u n : [(Tensor t n)] -> (Tensor u n)];
     // SPLAT          :: [];
     REP            :: [t n m : [(Tensor t n)] -> (Tensor t m)];
+    // memory
+    LOAD   b"load" :: [t.PriPtr u : [t] -> u];
 }
 
 impl Intrinsic {
