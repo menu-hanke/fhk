@@ -7,11 +7,11 @@ use enumset::{enum_set, EnumSet};
 
 use crate::bump::BumpRef;
 use crate::compile;
-use crate::intern::{Intern, IRef};
+use crate::intern::IRef;
 use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, MOD, TPRI, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, Obj, ObjRef, CALLN, CALLX, DIM, EXPR, GET, KINT, LOAD, MOD, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, langerr, next, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
@@ -58,29 +58,35 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
     Ok(pcx.objs.var(table, name).get_or_create())
 }
 
-fn checkintrinsic(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<CALLN>> {
+fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
     const IDENT: u8 = Token::Ident as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
     let name @ [IDENT, _, _, _, _, rest @ .. ] = pcx.intern.get_slice(name.cast())
         else { return None };
     let stem: [u8; 4] = name[1..5].try_into().unwrap();
-    let stem: IRef<[u8]> = zerocopy::transmute!(stem);
-    let intrin = Intrinsic::from_func(pcx.intern.get_slice(stem))?;
-    let ann = match intrin {
-        Intrinsic::LOAD => {
-            let tail @ [APOSTROPHE, IDENT, _, _, _, _] = rest else { return None };
-            let ty: [u8; 4] = tail[2..].try_into().unwrap();
-            let ty: IRef<[u8]> = zerocopy::transmute!(ty);
-            pcx.objs.push(TPRI::new(Primitive::from_name(pcx.intern.get_slice(ty))? as u8)).erase()
-        },
-        _ => {
-            if !rest.is_empty() {
-                return None;
-            }
-            ObjRef::NIL
-        }
-    };
-    Some(pcx.objs.push_args(CALLN::new(intrin as _, ann), &pcx.tmp[base.cast_up()..]))
+    let stem: &[u8] = pcx.intern.get_slice(zerocopy::transmute!(stem));
+    let args: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
+    if let Some(intrin) = Intrinsic::from_func(stem) {
+        return match rest.is_empty() {
+            true => Some(pcx.objs.push_args::<CALLN>(CALLN::new(intrin as _, ObjRef::NIL), args)
+                .cast()),
+            false => None
+        };
+    }
+    if stem == b"load" {
+        let tail @ [APOSTROPHE, IDENT, _, _, _, _] = rest else { return None };
+        let ty: [u8; 4] = tail[2..].try_into().unwrap();
+        let pri = pcx.objs.push(TPRI::new(Primitive::from_name(
+                    pcx.intern.get_slice(zerocopy::transmute!(ty)))? as u8)).erase();
+        let ann = match args.len() {
+            1 => pri,
+            n => pcx.objs.push(TTEN::new(n as u8 - 1, pri)).erase()
+        };
+        // TODO: allow some special syntax eg. `_` here to elide the size when returning
+        // a full table variable.
+        return Some(pcx.objs.push_args::<LOAD>(LOAD::new(ann, args[0]), &args[1..]).cast());
+    }
+    None
 }
 
 fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
@@ -92,8 +98,8 @@ fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> 
         if !check(pcx, Token::Comma)? { break }
     }
     consume(pcx, Token::RParen)?;
-    let expr = match checkintrinsic(pcx, name, base) {
-        Some(expr) => expr.cast(),
+    let expr = match builtincall(pcx, name, base) {
+        Some(expr) => expr,
         None => todo!("user function call")
     };
     pcx.tmp.truncate(base);

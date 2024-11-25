@@ -16,7 +16,7 @@ use crate::intrinsics::Intrinsic;
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, SizeClass};
-use crate::obj::{cast_args, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, MOD, QUERY, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, QUERY, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::Primitive;
@@ -485,6 +485,17 @@ fn emitcallvm(func: &Func, idx: InsId, node: FuncId, inline: bool) -> InsId {
 
 fn emitcallvm1(func: &Func, idx: InsId, node: FuncId) -> InsId {
     emitcallvm(func, idx, node, idx == INS_FLATIDX)
+}
+
+// TODO: think of something smarter for indexing in general.
+// doing it this way prevents type narrowing.
+fn emitarrayptr(func: &Func, base: InsId, mut idx: InsId, ty: Type) -> InsId {
+    let size = ty.size();
+    if size > 1 {
+        let size = func.code.push(Ins::KINT(IRT_IDX, size as _));
+        idx = func.code.push(Ins::MUL(IRT_IDX, idx, size));
+    }
+    func.code.push(Ins::ADDP(base, idx))
 }
 
 fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var> {
@@ -974,7 +985,6 @@ fn emitscalarintrinsic(
         LOG   => todo!(), // ir intrinsic call?
         NOT   => todo!(),
         CONV  => todo!(),
-        LOAD  => lcx.data.func.code.push(Ins::LOAD(ty, argv[0])),
         _     => unreachable!() // non-scalar
     }
 }
@@ -1104,7 +1114,7 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(_) => todo!(),
+        ObjectRef::LOAD(&LOAD { ref dims, .. }) => emitvalues(lcx, ctr, dims),
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(&CALLN { func, ref args, .. }) => {
@@ -1225,7 +1235,12 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                     },
                     ObjectRef::VGET(o) => emitvget1(lcx, ctr, o),
                     ObjectRef::IDX(_) => todo!(),
-                    ObjectRef::LOAD(_) => todo!(),
+                    ObjectRef::LOAD(&LOAD { ann, addr, ref dims, .. }) => {
+                        debug_assert!(dims.is_empty());
+                        debug_assert!(lcx.objs[ann].op == Obj::TPRI);
+                        let addr = emitvalue(lcx, ctr, addr);
+                        lcx.data.func.code.push(Ins::LOAD(ty, addr))
+                    },
                     ObjectRef::FREF(_) => todo!(),
                     ObjectRef::CALL(_) => todo!(),
                     ObjectRef::CALLN(&CALLN { func, ref args, .. }) =>
@@ -1234,6 +1249,12 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                 }
             },
             ObjectRef::TTEN(cty) => /* vector value */ {
+                if let ObjectRef::LOAD(_) = o {
+                    // note: this depends on the fact that load.addr and load.dims are consecutive
+                    // in memory.
+                    return emitvalues(lcx, ctr, cast_args_raw(
+                        &objs.get_raw(expr.erase())[obj_index_of!(LOAD,addr)..]));
+                }
                 if let ObjectRef::VGET(vget) = o {
                     // special case: scalar load of a vector variable is already materialized.
                     if vget.ann == lcx.objs[vget.var].ann {
@@ -1272,7 +1293,19 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(_) => todo!(),
+        ObjectRef::LOAD(&LOAD { ann, addr, ref dims, .. }) => {
+            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
+            debug_assert!(lcx.objs[lcx.objs[ann.cast::<TTEN>()].elem].op == Obj::TPRI);
+            let addr = emitvalue(lcx, &mut loop_.head, addr);
+            let shape = emitvalues(lcx, &mut loop_.head, dims);
+            let len = emitshapelen(&lcx.data.func, shape, dims.len());
+            let zero = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+            let i = emitrangeloop(&lcx.data.func, loop_, IRT_IDX, zero, len);
+            let ty = Primitive::from_u8(
+                lcx.objs[lcx.objs[ann.cast::<TTEN>()].elem.cast::<TPRI>()].ty).to_ir();
+            let ptr = emitarrayptr(&lcx.data.func, addr, i, ty);
+            lcx.data.func.code.push(Ins::LOAD(ty, ptr))
+        },
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(&CALLN { ann, func, ref args, .. })
@@ -1294,6 +1327,22 @@ fn emitvalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
             let ins = computevalue(lcx, ctr, expr);
             lcx.data.expr.insert_unique_unchecked(expr, ins);
             ins
+        }
+    }
+}
+
+fn emitvalues(lcx: &mut Lcx, ctr: &mut InsId, exprs: &[ObjRef<EXPR>]) -> InsId {
+    match exprs {
+        &[] => InsId::INVALID.into(),
+        &[v] => emitvalue(lcx, ctr, v),
+        vs => {
+            let base = reserve(&lcx.data.func, vs.len());
+            for (i,&v) in vs.iter().enumerate() {
+                let vv = emitvalue(lcx, ctr, v);
+                lcx.data.func.code.set(base + i as isize,
+                    Ins::MOV(lcx.data.func.code.at(vv).type_(), vv));
+            }
+            base
         }
     }
 }
@@ -1360,7 +1409,10 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, fail: InsId) {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(_) => todo!(),
+        ObjectRef::LOAD(&LOAD { addr, ref dims, .. }) => {
+            emitcheck(lcx, ctr, addr, fail);
+            emitcheckall(lcx, ctr, dims, fail);
+        },
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLN(CALLN { args, .. }) => emitcheckall(lcx, ctr, args, fail),
@@ -1533,11 +1585,7 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
                     for (j, &ty) in lcx.data.tmp_vty.iter().enumerate() {
                         let res = lcx.data.func.code.push(
                             Ins::RES(Type::PTR, call, vset.ret + j as isize));
-                        // TODO: think of something smarter for indexing in general.
-                        // doing it this way prevents type narrowing.
-                        let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
-                        let offset = lcx.data.func.code.push(Ins::MUL(IRT_IDX, ofs, size));
-                        let ptr = lcx.data.func.code.push(Ins::ADDP(res + j as isize, offset));
+                        let ptr = emitarrayptr(&lcx.data.func, res + j as isize, ofs, ty);
                         lcx.data.func.code.set(base + j as isize, Ins::LOAD(ty, ptr));
                     }
                     base
@@ -1628,6 +1676,8 @@ fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
     let model = &bump[model];
     for vset in &model.value {
         let value = lcx.objs[vset.obj].value;
+        // TODO: optimization: for full table VSET (ie. empty idx) return only the pointer,
+        // and on use load the shape from the tab instead
         let v = emitvalue(lcx, &mut ctr, value);
         for i in 0..decomposition_size(&lcx.objs, value.erase()) {
             let next = reserve(&lcx.data.func, 1);

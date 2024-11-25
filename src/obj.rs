@@ -101,6 +101,11 @@ pub fn cast_args<T: ?Sized, U: ?Sized>(args: &[ObjRef<T>]) -> &[ObjRef<U>] {
     unsafe { slice::from_raw_parts(args.as_ptr().cast(), args.len()) }
 }
 
+pub fn cast_args_raw<T: ?Sized>(args: &[u32]) -> &[ObjRef<T>] {
+    // same as above
+    unsafe { slice::from_raw_parts(args.as_ptr().cast(), args.len()) }
+}
+
 #[derive(EnumSetType)]
 #[repr(u8)]
 pub enum FieldType {
@@ -539,7 +544,8 @@ impl Objects {
             (CAT(a),   CAT(b))    => self.allequal(cast_args(&a.args), cast_args(&b.args)),
             (IDX(a),   IDX(b))    => self.equal(a.value.erase(), b.value.erase())
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
-            (LOAD(_),  LOAD(_))   => todo!(),
+            (LOAD(a),  LOAD(b))   => a.addr == b.addr
+                && self.allequal(cast_args(&a.dims), cast_args(&b.dims)),
             (GET(a),   GET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
             (FREF(_),  FREF(_))   => todo!(),
             (CALL(_),  CALL(_))   => todo!(),
