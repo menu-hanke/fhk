@@ -16,25 +16,6 @@ local function getstr(graph, str)
 	return getstrbuf(graph)
 end
 
----- Parse API -----------------------------------------------------------------
-
-local function checkres(graph, x)
-	if x == -1 then
-		return nil, getstrbuf(graph)
-	else
-		return x
-	end
-end
-
--- must match host_Lua.rs
-local PARSE_DEF = 0
-local PARSE_EXPR = 1
-local PARSE_TEMPLATE = 2
-
-local function checkparse(graph, src, what)
-	return assert(checkres(graph, API.fhk_parse(graph.G, src, #src, what)))
-end
-
 ---- Object management ---------------------------------------------------------
 
 -- ORDER FIELDTYPE
@@ -116,7 +97,7 @@ local function fget_lit(obj, i)
 end
 
 local function fget_name(obj, i)
-	return getstr(getgraph(obj), fget_lit(obj, i))
+	return setmetatable({i=fget_lit(obj, i)}, getgraph(obj).seq_mt)
 end
 
 local function fget_ref(obj, i)
@@ -151,9 +132,14 @@ local FTGETTER = {
 	[FT_VREF] = fget_vref
 }
 
+local function obj_next(obj)
+	return getgraph(obj).objs[obj.i + getobjptr(obj).obj.n]
+end
+
 local function makeproto(fields, name)
 	local proto = table.new(0, #fields+1)
 	proto.op = function() return name end
+	proto.next = obj_next
 	for _,f in ipairs(fields) do
 		local idx = f.idx
 		local get = FTGETTER[f.ft]
@@ -250,23 +236,6 @@ local function makeobjtab(graph)
 	})
 end
 
-local function objtab__next(self, i)
-	local o = self[i]
-	if o then
-		i = i + API.fhk_objs(getgraph(self).G)[i].obj.n
-		o = self[i]
-		if o then
-			return i, o
-		end
-	end
-end
-
-local function graph_opairs(graph)
-	-- this skips NIL, which is exactly what we want
-	return objtab__next, graph.objs, 0
-end
-
-
 local function seq__tostring(seq)
 	return getstr(getgraph(seq), seq.i)
 end
@@ -279,66 +248,107 @@ local function makeseqmt(graph)
 	}
 end
 
----- Parsing -------------------------------------------------------------------
-
-local function gettemplate(graph, src)
-	if isseq(src) then return src end
-	if isobj(src) then
-		error("TODO: return ObjRef name")
-	end
-	return setmetatable({i=checkparse(graph, src, PARSE_TEMPLATE)}, graph.seq_mt)
+local function objects_next(_, obj)
+	return obj.next
 end
 
--- local function substitute(graph, template, arg1, ...)
--- 	template = gettemplate(graph, template)
--- 	if arg1 == nil then return template end
--- 	local args = {}
--- 	for i,a in ipairs({arg1, ...}) do
--- 		args[i] = untagseq(gettemplate(graph, a))
--- 	end
--- 	return tagseq(assert(checkres(graph,
--- 		API.fhk_substitute(graph.G, template, setbuf(graph, args)))))
--- end
+-- note: skips NIL
+local function graph_objects(graph)
+	return objects_next, nil, graph.objs[0]
+end
+
+---- Parsing -------------------------------------------------------------------
+
+local function checkbuf(graph, n)
+	local bufsz = graph.bufsz
+	if n > bufsz then
+		repeat bufsz = 2*bufsz until n <= bufsz
+		graph.buf = ffi.new("int32_t[?]", bufsz)
+		graph.bufsz = bufsz
+	end
+end
+
+local function setbuf(graph, xs)
+	checkbuf(graph, #xs)
+	for i,x in ipairs(xs) do
+		graph.buf[i-1] = x
+	end
+	return graph.buf, #xs
+end
+
+local function checkres(graph, x)
+	if x == -1 then
+		return nil, getstrbuf(graph)
+	else
+		return x
+	end
+end
+
+-- must match host_Lua.rs
+local PARSE_DEF = 0
+local PARSE_EXPR = 1
+local PARSE_TEMPLATE = 2
+
+local function checkparse(graph, what, src, ...)
+	local res
+	local args = {...}
+	if #args > 0 or isseq(src) then
+		if isseq(src) then
+			src = src.i
+		elseif type(src) == "string" then
+			src = checkparse(graph, PARSE_TEMPLATE, src)
+		else
+			error("input must be a string or a template")
+		end
+		for i,a in ipairs(args) do
+			if type(a) == "string" then
+				args[i] = checkparse(graph, PARSE_TEMPLATE, a)
+			elseif isseq(a) then
+				args[i] = a.i
+			elseif isobj(a) then
+				args[i] = a.name.i
+			else
+				error("template argument must be a string or template")
+			end
+		end
+		local cap, n = setbuf(graph, args)
+		res = API.fhk_tparse(graph.G, src, cap, n, what)
+	else
+		res = API.fhk_parse(graph.G, src, #src, what)
+	end
+	return assert(checkres(graph, res))
+end
+
+local function graph_seq(graph, src, ...)
+	if isseq(src) and select("#", ...) == 0 and not arg1 then return src end
+	return setmetatable({i=checkparse(graph, PARSE_TEMPLATE, src, ...)}, graph.seq_mt)
+end
 
 local function defcreate(create)
 	if create == nil then return true else return create end
 end
 
-local function gettab(graph, tab, create)
+local function graph_tab(graph, tab, create)
 	if isobj(tab) then return tab end
-	tab = API.fhk_gettab(graph.G, gettemplate(graph, tab).i, defcreate(create))
+	tab = API.fhk_gettab(graph.G, graph_seq(graph, tab).i, defcreate(create))
 	if tab >= 0 then return graph.objs[tab] end
 end
 
--- local function getvar(graph, tab, var, create)
--- 	if isobj(var) then return var end
--- 	create = defcreate(create)
--- 	tab = gettab(graph, tab, create)
--- 	if not tab then return end
--- 	var = API.fhk_getvar(graph.G, tab, untagseq(gettemplate(graph, var)), create)
--- 	if var >= 0 then return var end
--- end
-
--- local function fhk_get(graph, name, op, create)
--- 	return API.fhk_get(graph.G, name, OP_ID[op], create or false)
--- end
-
--- local function fhk_new(graph, op, args)
--- 	return API.fhk_new(graph.G, OP_ID[op], setbuf(graph, args))
--- end
-
--- local function fhk_args(graph, node)
--- 	-- TODO
--- end
-
-local function graph_define(graph, src)
-	checkparse(graph, src, PARSE_DEF)
+local function graph_define(graph, src, ...)
+	checkparse(graph, PARSE_DEF, src, ...)
 end
 
-local function graph_expr(graph, tab, src)
+local function graph_var(graph, tab, name, create)
+	tab = graph_tab(graph, tab, create)
+	if not tab then return end
+	local var = API.fhk_getvar(graph.G, graph_seq(graph, name).i, tab.i, defcreate(create))
+	if var >= 0 then return graph.objs[var] end
+end
+
+local function graph_expr(graph, tab, src, ...)
 	if isobj(src) then return src end
-	API.fhk_settab(graph.G, gettab(graph, tab, true).i)
-	return graph.objs[checkparse(graph, src, PARSE_EXPR)]
+	API.fhk_settab(graph.G, graph_tab(graph, tab, true).i)
+	return graph.objs[checkparse(graph, PARSE_EXPR, src, ...)]
 end
 
 local function graph_dump(graph, flags)
@@ -369,7 +379,7 @@ query_mt.__index = query_mt
 local function graph_newquery(graph, tab)
 	local query = setmetatable({
 		graph  = graph,
-		tab    = gettab(graph, tab),
+		tab    = graph_tab(graph, tab),
 		values = {},
 		vnum   = 0
 	}, query_mt)
@@ -460,7 +470,7 @@ end
 ---- Instances -----------------------------------------------------------------
 
 local function image_newinstance(image, alloc, udata, prev, mask)
-	return API.fhk_newinstance(image.ptr, alloc, udata or nil, prev or nil, mask or 1)
+	return API.fhk_newinstance(image, alloc, udata or nil, prev or nil, mask or 1)
 end
 
 local image_mt = {
@@ -468,28 +478,18 @@ local image_mt = {
 }
 image_mt.__index = image_mt
 
+ffi.metatype("fhk_Image", image_mt)
+
 ---- Compilation ---------------------------------------------------------------
 
-local function checkbuf(graph, n)
-	local bufsz = graph.bufsz
-	if n > bufsz then
-		repeat bufsz = 2*bufsz until n <= bufsz
-		graph.buf = ffi.new("int32_t[?]", bufsz)
-		graph.bufsz = bufsz
-	end
-end
-
-local function setbufo(graph, objs)
-	checkbuf(graph, #objs)
-	for i=1, #objs do
-		graph.buf[i-1] = objs[i].i
-	end
-	return graph.buf, #objs
-end
-
 local function graph_compile(graph)
+	local values = {}
 	for _,query in ipairs(graph.queries) do
-		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbufo(graph, query.values))]
+		table.clear(values)
+		for i,v in ipairs(query.values) do
+			values[i] = v.i
+		end
+		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbuf(graph, values))]
 	end
 	local image = ffi.new("fhk_Image *[1]");
 	assert(checkres(graph, API.fhk_compile(graph.G, image)))
@@ -498,17 +498,16 @@ local function graph_compile(graph)
 	for _,query in ipairs(graph.queries) do
 		compilequery(query, base)
 	end
-	setmetatable(graph, image_mt)
-	table.clear(graph)
-	graph.ptr = ffi.gc(ptr, API.fhk_destroyimage)
-	return graph
+	return ffi.gc(ptr, API.fhk_destroyimage)
 end
 
 --------------------------------------------------------------------------------
 
 local graph_mt = {
-	opairs   = graph_opairs,
+	objects  = graph_objects,
+	seq      = graph_seq,
 	define   = graph_define,
+	var      = graph_var,
 	expr     = graph_expr,
 	newquery = graph_newquery,
 	newreset = graph_newreset,

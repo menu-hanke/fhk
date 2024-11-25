@@ -85,19 +85,18 @@ local function test_flush(T)
 end
 
 local function test_compile(T)
-	if not T.compiled then
+	if not T.image then
 		test_flush(T)
 		if dump:match("o") then
 			-- XXX move this after compile when the compiler actually works
 			io.stderr:write(T.G:dump(dump), "\n")
 		end
-		assert(T.G:compile())
-		T.compiled = true
+		T.image = assert(T.G:compile())
 	end
 end
 
 local function test_newinstance(T, prev, mask)
-	return T.G:newinstance(T.alloc, nil, prev, mask)
+	return T.image:newinstance(T.alloc, nil, prev, mask)
 end
 
 local function test_checkresults(T)

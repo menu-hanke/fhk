@@ -365,7 +365,11 @@ fn parse_func(pcx: &mut Pcx) -> compile::Result {
     todo!()
 }
 
-fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> compile::Result {
+fn parse_macro_body_rec(
+    pcx: &mut Pcx,
+    stop: EnumSet<Token>,
+    template: bool
+) -> compile::Result<u8> {
     let mut nextcap = 0;
     let mut parens = ParenCounter::default();
     while !(stop.contains(pcx.data.token) && parens.balanced()) {
@@ -466,10 +470,10 @@ fn parse_macro_body_rec(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> 
         }
         next(pcx)?;
     }
-    Ok(())
+    Ok(nextcap)
 }
 
-fn parse_macro_body(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> compile::Result {
+fn parse_macro_body(pcx: &mut Pcx, stop: EnumSet<Token>, template: bool) -> compile::Result<u8> {
     pcx.data.rec = true;
     let r = parse_macro_body_rec(pcx, stop, template);
     pcx.data.rec = false;

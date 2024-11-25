@@ -39,19 +39,21 @@ pub enum Namespace {
     Func,
     Table,
     Snippet,
-    Capture // only used for debug messages
+    // the following are only used for debug messages:
+    Capture,
+    Template
 }
 
 pub type TokenData = u32;
 
 struct Frame {
     base: u32,   // index of first capture
-    cursor: u32, // byte offset in pcx.strings
-    end: u32,    // byte offset in pcx.strings
+    cursor: u32, // byte offset in pcx.intern
+    end: u32,    // byte offset in pcx.intern
     lookahead: Option<Token>, // next token after this frame (only used for snippets)
     lookahead_data: TokenData, // next token data
     // only used for debug messages:
-    this: u32, // the macro or capture we are expanding
+    this: u32, // the macro, capture or template we are expanding
     ns: Namespace, // namespace of the macro we are expanding
 }
 
@@ -104,8 +106,8 @@ impl SyntaxError {
 
 #[derive(Clone, Copy)]
 pub enum SequenceType {
-    Pattern,
-    Body
+    Pattern,  // OpInsert is *not* followed by an index
+    Body      // OpInsert is followed by an index
 }
 
 const SPACE_BETWEEN: u64 = (1 << Token::Ident as u64)
@@ -182,12 +184,13 @@ pub fn stringify(buf: &mut ByteString, intern: &Intern, body: &[u8], sty: Sequen
 fn nsname(ns: Namespace) -> &'static str {
     use Namespace::*;
     match ns {
-        Model   => "model",
-        Var     => "var",
-        Func    => "func",
-        Table   => "table",
-        Snippet => "snippet",
-        Capture => "capture"
+        Model    => "model",
+        Var      => "var",
+        Func     => "func",
+        Table    => "table",
+        Snippet  => "snippet",
+        Capture  => "capture",
+        Template => "template"
     }
 }
 
@@ -221,6 +224,15 @@ fn traceback(pcx: &mut Pcx) {
                     &mut pcx.host.buf,
                     &pcx.intern,
                     &pcx.intern.bump().as_slice()[start as usize .. end as usize],
+                    SequenceType::Body
+                );
+            },
+            Template => {
+                let template: IRef<[u8]> = zerocopy::transmute!(frame.this);
+                stringify(
+                    &mut pcx.host.buf,
+                    &pcx.intern,
+                    &pcx.intern.get_slice(template),
                     SequenceType::Body
                 );
             }
@@ -475,12 +487,31 @@ fn pushmacro<'a, 'input>(
             });
             return parser.stack.last_mut();
         }
-        parser.captures.clear();
+        parser.captures.truncate(base as _);
         id = match macro_.next.unpack() {
             Some(id) => id,
             None     => return None
         };
     }
+}
+
+pub fn pushtemplate(pcx: &mut Pcx, template: IRef<[u8]>, cap: &[IRef<[u8]>]) -> compile::Result {
+    let parser = &mut *pcx.data;
+    let body = pcx.intern.get_range(template);
+    parser.stack.push(Frame {
+        base: parser.captures.len() as _,
+        cursor: body.start as _,
+        end: body.end as _,
+        lookahead: Some(parser.token),
+        lookahead_data: parser.tdata,
+        this: zerocopy::transmute!(template),
+        ns: Namespace::Template
+    });
+    parser.captures.extend(cap.iter().map(|&c| {
+        let Range { start, end } = pcx.intern.get_range(c);
+        start as u32 .. end as u32
+    }));
+    next(pcx)
 }
 
 fn snipname(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {

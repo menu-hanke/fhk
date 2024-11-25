@@ -14,7 +14,7 @@ use crate::intern::IRef;
 use crate::mem::applyreset;
 use crate::obj::{LookupEntry, Obj, ObjRef, ObjType, Operator, EXPR, QUERY, TAB};
 use crate::parse::{parse_def, parse_expr, parse_template};
-use crate::parser::{parse, stringify, Parser, SequenceType};
+use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
 use crate::image::fhk_vmcall_native as fhk_vmcall;
 
@@ -95,35 +95,51 @@ unsafe fn slice_from_raw_parts<'a,T>(src: *const T, num: usize) -> &'a [T] {
     core::slice::from_raw_parts(match num { 0 => core::ptr::dangling(), _ => src }, num)
 }
 
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    String(&'a [u8]),
+    Template(fhk_SeqRef, &'a [fhk_SeqRef])
+}
+
 // options here must match host.lua
 const PARSE_DEF: c_int = 0;
 const PARSE_EXPR: c_int = 1;
 const PARSE_TEMPLATE: c_int = 2;
+fn doparse(G: &mut fhk_Graph, source: Source, what: c_int) -> fhk_Result {
+    parse(
+        G,
+        match source { Source::String(s) => s, Source::Template(..) => &[] },
+        |pcx| {
+            if let Source::Template(template, captures) = source {
+                pushtemplate(pcx, template, captures)?;
+            }
+            match what {
+                PARSE_DEF => parse_def(pcx).map(|_| 0),
+                PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
+                PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
+                _ => unreachable!()
+            }
+        }
+    ).unwrap_or(-1)
+}
+
 unsafe extern "C" fn fhk_parse(
     G: &mut fhk_Graph,
     src: *const c_char,
     len: usize,
     what: c_int
 ) -> fhk_Result {
-    parse(
-        G,
-        slice_from_raw_parts(src as _, len),
-        |pcx| match what {
-            PARSE_DEF => parse_def(pcx).map(|_| 0),
-            PARSE_EXPR => parse_expr(pcx).map(|o| zerocopy::transmute!(o)),
-            PARSE_TEMPLATE => parse_template(pcx).map(|o| zerocopy::transmute!(o)),
-            _ => unreachable!()
-        }
-    ).unwrap_or(-1)
+    doparse(G, Source::String(slice_from_raw_parts(src as _, len)), what)
 }
 
-extern "C" fn fhk_substitute(
+unsafe extern "C" fn fhk_tparse(
     G: &mut fhk_Graph,
     template: fhk_SeqRef,
-    subs: *const fhk_SeqRef,
-    num: usize
+    caps: *const fhk_SeqRef,
+    num: usize,
+    what: c_int
 ) -> fhk_Result {
-    todo!()
+    doparse(G, Source::Template(template, slice_from_raw_parts(caps, num)), what)
 }
 
 fn getobj<T, F>(entry: LookupEntry<'_, T, F>, create: bool) -> fhk_Result
@@ -261,7 +277,7 @@ define_api! {
     uint32_t (*fhk_objnum)(fhk_Graph *);
     void (*fhk_settab)(fhk_Graph *, int32_t);
     int32_t (*fhk_parse)(fhk_Graph *, const char *, size_t, int);
-    int32_t (*fhk_substitute)(fhk_Graph *, int32_t, int32_t *, size_t);
+    int32_t (*fhk_tparse)(fhk_Graph *, int32_t, int32_t *, size_t, int);
     int32_t (*fhk_gettab)(fhk_Graph *, int32_t, bool);
     int32_t (*fhk_getvar)(fhk_Graph *, int32_t, int32_t, bool);
     void (*fhk_getstr)(fhk_Graph *, uint32_t);
