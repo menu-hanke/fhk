@@ -9,7 +9,8 @@ use crate::bytestring::ByteString;
 use crate::emit::{self, v2block};
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
-use crate::ir::{Code, Func, FuncId, Ins, InsId, Operand, PhiId, IR};
+use crate::ir::{Code, Func, FuncId, Ins, InsId, LangOp, Operand, PhiId, IR};
+use crate::lang::Lang;
 use crate::mem::{BreakpointId, Layout};
 use crate::obj::{FieldType, ObjRef, Objects};
 use crate::parser::{stringify, SequenceType};
@@ -116,7 +117,11 @@ fn dump_ins(buf: &mut ByteString, id: InsId, ins: Ins, values: Option<&emit::Val
         match op {
             Operand::X  => write!(buf, " {}", raw as i16),
             Operand::XX => { raw >>= 16; write!(buf, " {}", raw as i32) },
-            Operand::XF => write!(buf, " XF:{:x}", raw as u32),
+            Operand::L  => {
+                let LangOp { lang, op } = zerocopy::transmute!(raw as u16);
+                // TODO: also put opname here (add an opname() in trait language?)
+                write!(buf, " {}.{}", Lang::from_u8(lang).name(), op)
+            },
             Operand::V  => write!(buf, " {:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i}),
             Operand::C  => {
                 if let Some(values) = values {

@@ -12,8 +12,7 @@ pub trait Language: Sized {
     fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>>;
     fn lower_callx(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId;
     fn begin_emit(ccx: &mut Ccx) -> compile::Result<Self>;
-    fn emit_callx(ecx: &mut Ecx, id: InsId) -> compile::Result;
-    fn emit_res(ecx: &mut Ecx, id: InsId) -> compile::Result<cranelift_codegen::ir::Value>;
+    fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<cranelift_codegen::ir::Value>;
 }
 
 #[derive(Default)]
@@ -42,6 +41,15 @@ macro_rules! define_langs {
                         $name => Some(Lang::$name),
                     )*
                         _ => None
+                }
+            }
+
+            pub fn name(self) -> &'static str {
+                match self {
+                    $(
+                        $(#[$($meta)*])?
+                        Self::$name => stringify!($name),
+                    )*
                 }
             }
 
@@ -84,16 +92,8 @@ impl Lang {
         dispatch!(self, Lang => Lang::lower_callx(lcx, obj, func, inputs))
     }
 
-    pub fn emit_res(
-        self,
-        ecx: &mut Ecx,
-        id: InsId
-    ) -> compile::Result<cranelift_codegen::ir::Value> {
-        dispatch!(self, Lang => Lang::emit_res(ecx, id))
-    }
-
-    pub fn emit_callx(self, ecx: &mut Ecx, id: InsId) -> compile::Result {
-        dispatch!(self, Lang => Lang::emit_callx(ecx, id))
+    pub fn emit(self, ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<cranelift_codegen::ir::Value> {
+        dispatch!(self, Lang => Lang::emit(ecx, id, lop))
     }
 
 }

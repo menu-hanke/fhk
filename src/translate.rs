@@ -10,7 +10,7 @@ use crate::mem::SizeClass;
 use crate::support::{ALLOC, DSINIT};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, v2block, Ecx, Emit, MEM_RESULT};
-use crate::ir::{Bundle, FuncKind, InsId, Opcode, PhiId, Query, Type};
+use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::schedule::BlockId;
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
@@ -150,7 +150,7 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
             let ptr = ecx.data.fb.dataptr(data);
             ecx.data.fb.kload(type_, ptr)
         },
-        FX => unreachable!()
+        FX | LSV => unreachable!()
     };
     ecx.data.values[id] = value;
 }
@@ -270,11 +270,6 @@ fn ins_load(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = emit.fb.ins().load(ty, MemFlags::trusted(), emit.values[ptr], 0);
 }
 
-fn ins_callx(ecx: &mut Ecx, id: InsId) -> compile::Result {
-    let (_, func) = ecx.data.code[id].decode_CALLX();
-    Lang::from_u8(ecx.intern[func].lang).emit_callx(ecx, id)
-}
-
 fn ins_callb(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (idx, _, bundle) = emit.code[id].decode_CALLB();
@@ -294,18 +289,14 @@ fn ins_callb(ecx: &mut Ecx, id: InsId) {
     emit.fb.block = merge_block;
 }
 
-fn ins_res(ecx: &mut Ecx, id: InsId) -> compile::Result {
+fn ins_res(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
     let ty = ins.type_();
-    if ty == Type::FX { return Ok(()); }
+    if ty == Type::FX { return; }
     let (call, phi) = ins.decode_RES();
     let value = match emit.code[call].opcode() {
         Opcode::CALL => todo!(),
-        Opcode::CALLX => {
-            let (_, func) = emit.code[call].decode_CALLX();
-            Lang::from_u8(ecx.intern[func].lang).emit_res(ecx, id)?
-        },
         Opcode::CALLB | Opcode::CALLBI => {
             let (idx, _, bundle) = emit.code[call].decode_CALLB();
             let FuncKind::Bundle(Bundle { scl, slots, .. }) = ecx.ir.funcs[bundle].kind
@@ -318,7 +309,6 @@ fn ins_res(ecx: &mut Ecx, id: InsId) -> compile::Result {
         _ => unreachable!()
     };
     ecx.data.values[id] = value;
-    Ok(())
 }
 
 fn ins_binit(ecx: &mut Ecx, id: InsId) {
@@ -337,39 +327,47 @@ fn ins_binit(ecx: &mut Ecx, id: InsId) {
     emit.fb.ins().call(dsinit, &[tab, num, emit.values[size]]);
 }
 
+fn ins_lop(ecx: &mut Ecx, id: InsId) -> compile::Result {
+    let LangOp { lang, op } = ecx.data.code[id].decode_L();
+    ecx.data.values[id] = Lang::from_u8(lang).emit(ecx, id, op)?;
+    Ok(())
+}
+
 pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
     use Opcode::*;
     let ins = ecx.data.code[id];
-    match ins.opcode() {
-        NOP => { /* NOP */ },
-        JMP => ins_jmp(ecx, id),
-        GOTO => ins_goto(ecx, id),
-        IF => ins_if(ecx, id),
-        RET => ins_ret(ecx),
-        TRET => todo!(),
-        UB => ins_ub(ecx),
-        PHI => ins_phi(ecx, id),
-        KNOP => { /* NOP */ },
-        KINT | KINT64 => ins_kintx(ecx, id),
-        KFP64 => todo!(),
-        KSTR => todo!(),
-        MOV | MOVB | MOVF => ins_mov(ecx, id),
-        CONV => todo!(),
-        ADD | SUB | MUL | DIV => ins_arith(ecx, id),
-        ADDP => ins_addp(ecx, id),
-        POW => todo!(),
-        NEG => todo!(),
-        EQ | NE | LT | LE | ULT | ULE => ins_cmp(ecx, id),
-        ALLOC => ins_alloc(ecx, id),
-        STORE => ins_store(ecx, id),
-        LOAD => ins_load(ecx, id),
-        BOX => todo!(),
-        CALL => todo!(),
-        CALLX => ins_callx(ecx, id)?,
-        CALLB | CALLBI => ins_callb(ecx, id),
-        CARG => { /* NOP */ },
-        RES => ins_res(ecx, id)?,
-        BINIT => ins_binit(ecx, id),
+    if ins.type_() != Type::LSV {
+        match ins.opcode() {
+            NOP => { /* NOP */ },
+            JMP => ins_jmp(ecx, id),
+            GOTO => ins_goto(ecx, id),
+            IF => ins_if(ecx, id),
+            RET => ins_ret(ecx),
+            TRET => todo!(),
+            UB => ins_ub(ecx),
+            PHI => ins_phi(ecx, id),
+            KNOP => { /* NOP */ },
+            KINT | KINT64 => ins_kintx(ecx, id),
+            KFP64 => todo!(),
+            KSTR => todo!(),
+            MOV | MOVB | MOVF => ins_mov(ecx, id),
+            CONV => todo!(),
+            ADD | SUB | MUL | DIV => ins_arith(ecx, id),
+            ADDP => ins_addp(ecx, id),
+            POW => todo!(),
+            NEG => todo!(),
+            EQ | NE | LT | LE | ULT | ULE => ins_cmp(ecx, id),
+            ALLOC => ins_alloc(ecx, id),
+            STORE => ins_store(ecx, id),
+            LOAD => ins_load(ecx, id),
+            BOX => todo!(),
+            CALL => todo!(),
+            CALLB | CALLBI => ins_callb(ecx, id),
+            CARG => { /* NOP */ },
+            RES => ins_res(ecx, id),
+            BINIT => ins_binit(ecx, id),
+            LOV | LOVV | LOX | LOXX => ins_lop(ecx, id)?
+        }
     }
     Ok(())
 }

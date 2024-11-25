@@ -12,7 +12,7 @@ use crate::compile::{self, Ccx};
 use crate::emit::{cast_entitrefs, collectargs, irt2cl, Ecx, NATIVE_CALLCONV};
 use crate::index::InvalidValue;
 use crate::intern::IRef;
-use crate::ir::{ExtFunc, Func, Ins, InsId, Type};
+use crate::ir::{Func, Ins, InsId, LangOp, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::{self, CLcx};
@@ -20,6 +20,10 @@ use crate::obj::{Obj, ObjRef, CALLX, EXPR, TPRI, TTEN};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
 use crate::typing::Primitive;
+
+const LOP_CFUNC: u8 = 0;
+const LOP_CCALL: u8 = 1;
+const LOP_CRES:  u8 = 2;
 
 #[derive(Default)]
 pub struct C;
@@ -112,10 +116,9 @@ impl CType {
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct CFunc {
-    ext: ExtFunc,
     what: u8,
     ret: CType,
-    _pad: u8,
+    _pad: [u8; 2],
     args: IRef<[CType]>,
 }
 
@@ -529,11 +532,10 @@ fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALLX> {
     let func = {
         let args = pcx.intern.intern(ps.sig.as_slice(&pcx.tmp));
         let func = CFunc {
-            ext: ExtFunc::new(Lang::C),
             what: match ps.sym { Some(_) => CFunc::SYM, _ => CFunc::PTR },
             ret: ps.ret,
             args,
-            _pad: 0
+            _pad: Default::default()
         };
         match ps.sym {
             None             => pcx.intern.intern(&func),
@@ -679,9 +681,14 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                 },
                 _ /* RETURN */ => {
                     let o: &ReturnOutput = zerocopy::transmute_ref!(o);
-                    // XXX: should this have its own opcode?
-                    func.code.set(cursor,
-                        Ins::RES(CPrimitive::from_u8(o.pri).to_ir(), callins, 0.into()));
+                    func.code.set(
+                        cursor,
+                        Ins::LOV(
+                            CPrimitive::from_u8(o.pri).to_ir(),
+                            callins,
+                            LangOp::new(Lang::C, LOP_CRES)
+                        )
+                    );
                     cursor += 1;
                 }
             }
@@ -708,16 +715,18 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
     if lcx.intern[call.func].what == CFunc::PTR {
         args = func.code.push(Ins::CARG(args, inputs[0]));
     }
-    func.code.set(callins, Ins::CALLX(Type::FX, args, call.func.cast()));
+    let funcref = func.code.push(Ins::LOXX(Type::LSV,
+            LangOp::new(Lang::C, LOP_CFUNC), zerocopy::transmute!(call.func)));
+    func.code.set(callins, Ins::LOVV(Type::FX, args, funcref, LangOp::new(Lang::C, LOP_CCALL)));
     outbase
 }
 
 /* ---- Emitting ------------------------------------------------------------ */
 
-fn emit_callx(ecx: &mut Ecx, id: InsId) -> compile::Result {
+fn emit_call(ecx: &mut Ecx, id: InsId) -> cranelift_codegen::ir::Value {
     let emit = &mut *ecx.data;
-    let (mut args, xf) = emit.code[id].decode_CALLX();
-    let func: &CFunc = &ecx.intern[xf.cast()];
+    let (mut args, cf) = emit.code[id].decode_VV();
+    let func: &CFunc = &ecx.intern[zerocopy::transmute!(emit.code[cf].bc())];
     let ptr = match func.what {
         CFunc::PTR => {
             let (ap, ptr) = emit.code[args].decode_CARG();
@@ -741,15 +750,14 @@ fn emit_callx(ecx: &mut Ecx, id: InsId) -> compile::Result {
     let argbase = argv.end();
     collectargs(emit, argv, args);
     let call = emit.fb.ins().call_indirect(sig, emit.values[ptr], cast_entitrefs(&argv[argbase..]));
-    emit.values[id] = cranelift_codegen::ir::Value::from_u32(call.as_u32());
-    Ok(())
+    cranelift_codegen::ir::Value::from_u32(call.as_u32())
 }
 
-fn emit_res(ecx: &mut Ecx, id: InsId) -> compile::Result<cranelift_codegen::ir::Value> {
+fn emit_res(ecx: &mut Ecx, id: InsId) -> cranelift_codegen::ir::Value {
     let emit = &mut *ecx.data;
-    let (call, _) = emit.code[id].decode_RES();
+    let call = emit.code[id].decode_V();
     let inst = cranelift_codegen::ir::Inst::from_u32(emit.values[call].as_u32());
-    Ok(emit.fb.ctx.func.dfg.inst_results(inst)[0])
+    emit.fb.ctx.func.dfg.inst_results(inst)[0]
 }
 
 /* -------------------------------------------------------------------------- */
@@ -795,15 +803,12 @@ impl Language for C {
         Ok(Default::default())
     }
 
-    fn emit_callx(ecx: &mut Ecx, id: InsId) -> compile::Result {
-        let base = ecx.tmp.end();
-        emit_callx(ecx, id)?;
-        ecx.tmp.truncate(base);
-        Ok(())
-    }
-
-    fn emit_res(ecx: &mut Ecx, id: InsId) -> compile::Result<cranelift_codegen::ir::Value> {
-        emit_res(ecx, id)
+    fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<cranelift_codegen::ir::Value> {
+        Ok(match lop {
+            LOP_CCALL => emit_call(ecx, id),
+            LOP_CRES  => emit_res(ecx, id),
+            _ => unreachable!()
+        })
     }
 
 }

@@ -57,9 +57,33 @@ macro_rules! define_types {
     };
 }
 
-// ORDER IRT
+// tl;dr of type semantics:
+//   * i8, i16, i32, i64, f32, f64 are exactly what you'd expect. in particular they are just dumb
+//     values and any instruction taking one of these must *not* care about where the value came
+//     from, eg. it's always correct to replace an instruction producing one of these with
+//     a MOV, or any other instruction sequence that produces the same value.
+//   * b1 is also a dumb value, but it has funny semantics when stored to memory. sometimes (eg.
+//     bundle bitmaps) it's stored as a 1-bit value with a mask, colocated with other b1's.
+//     in a register it's just a normal int. zero=false, any nonzero=true.
+//   * fx is also a dumb value. however, it has no machine representation, it just represent that
+//     "something happened". but because it's a dumb value, it can be replaced with any other
+//     instruction sequence that makes the same thing happen. eg. STORE -> LOAD can be replaced
+//     with STORE -> MOVF -> LOAD. any instruction using an FX value must *not* care about the
+//     instruction sequence that produced the FX value. (but it of course can assume that whatever
+//     "something happens" represented by the FX value has happened).
+//     (TODO: CARG and RES are not "dumb" currently. they should be changed to use LSV instead.)
+//   * lsv is the only type that is *not* a dumb value. it's *not* ok to replace lsv instruction
+//     sequences with eg. MOVs. the instruction consuming an lsv value *can* look at the
+//     instruction sequence that produced the lsv. however, lsv instructions, like any other
+//     instructions, are still subject to dce and cse. lsv is intended for embedding
+//     language-specific data into the IR, eg. call argument structure for scripting languages.
+//     lsv instructions are not compiled by the clif translator. their interpretation is left
+//     up to the language-specific instructions. however, they are scheduled like any other
+//     instruction. lsv-producing generic instructions (eg. arithmetic) are subject to normal
+//     fold rules. language-specific instructions (LO*) are not subject to any fold rules.
 define_types! {
-    FX   0;
+    FX   0;  // side effect
+    LSV  0;  // language-specific value
     PTR  8;
     I8   1;
     I16  2;
@@ -87,6 +111,21 @@ impl Type {
 
 /* ---- Opcodes ------------------------------------------------------------- */
 
+#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C)]
+pub struct LangOp {
+    pub lang: u8,
+    pub op: u8
+}
+
+impl LangOp {
+
+    pub fn new(lang: Lang, op: u8) -> Self {
+        Self { lang: lang as _, op }
+    }
+
+}
+
 macro_rules! define_operands {
     ($(
         $name:ident: $type:ty;
@@ -110,13 +149,13 @@ define_operands! {
     C:  InsId;  // control
     P:  PhiId;  // phi
     F:  FuncId; // function
+    L:  LangOp; // language-specific opcode
     X:  u16;    // 16-bit literal
     XX: u32;    // 32-bit literal
-    XF: IRef<ExtFunc>; // external funcion
 }
 
 macro_rules! encode_at {
-    ($value:expr, $_:expr, $(XX)* $(XF)*) => {{
+    ($value:expr, $_:expr, $(XX)*) => {{
         let v: u32 = zerocopy::transmute!($value);
         (v as u64) << 32
     }};
@@ -127,7 +166,7 @@ macro_rules! encode_at {
 }
 
 macro_rules! decode_at {
-    ($ins:expr, $_:ident, $(XX)* $(XF)*) => { zerocopy::transmute!($ins.bc()) };
+    ($ins:expr, $_:ident, $(XX)*) => { zerocopy::transmute!($ins.bc()) };
     ($ins:expr, $field:ident, $_:ident) => { zerocopy::transmute!($ins.$field()) };
 }
 
@@ -262,13 +301,17 @@ define_opcodes! {
     BOX.PTR   V;                       // value (b=offset after layout)
 
     CALL.FX   V F,   decode_CALL;      // args func
-    CALLX     V XF,  decode_CALLX;     // args extfunc
     CALLB.FX  V V F, decode_CALLB;     // idx fx bundle  (NOT inlineable)
     CALLBI.FX V V F;                   // idx fx bundle  (inlineable)
     CARG.FX   V V,   decode_CARG;      // arg next
     RES       V P,   decode_RES;       // call phi
 
     BINIT.FX  V F,   decode_BINIT;     // size bundle
+
+    LOV       V L,   decode_LOV;
+    LOVV      V V L, decode_LOVV;
+    LOX       L X,   decode_LOX;
+    LOXX      L XX,  decode_LOXX;
 
 }
 
@@ -460,6 +503,18 @@ impl Ins {
         }
     }
 
+    // it's a bit ugly but oh well
+    pub fn decode_L(self) -> LangOp {
+        match self.opcode() {
+            Opcode::LOV => zerocopy::transmute!(self.b()),
+            Opcode::LOVV => zerocopy::transmute!(self.c()),
+            _ /* LOX | LOXX */ => {
+                debug_assert!((Opcode::LOX|Opcode::LOXX).contains(self.opcode()));
+                zerocopy::transmute!(self.a())
+            }
+        }
+    }
+
     decode_fn!(pub fn decode_V -> V);
     decode_fn!(pub fn decode_VV -> V V);
 
@@ -607,16 +662,4 @@ impl<'a> SignatureBuilder<'a, Args> {
         self.func.arg = self.func.phis.end();
     }
 
-}
-
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C)]
-pub struct ExtFunc {
-    pub lang: u8,
-}
-
-impl ExtFunc {
-    pub fn new(lang: Lang) -> Self {
-        Self { lang: lang as _ }
-    }
 }

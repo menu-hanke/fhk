@@ -173,11 +173,11 @@ pub struct Lower<O=RW, F=RW> {
     objs: Access<HashMap<ObjRef, BumpRef<()>>, O>,
     expr: HashMap<ObjRef<EXPR>, InsId>,
     // TODO: remove the following tmp_* fields and use ccx.tmp instead:
-    tmp_ins: Vec<InsId>, // public for lower_callx
+    tmp_ins: Vec<InsId>,
     tmp_vty: Vec<Type>, // for emitvarvalue
     tmp_ty: Vec<Type>, // for expressions
     // current function:
-    func: Access<Func, F>, // public for lower_callx
+    func: Access<Func, F>,
     tab: BumpRef<Tab>,
 }
 

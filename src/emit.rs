@@ -225,7 +225,7 @@ pub fn irt2cl(irt: Type) -> cranelift_codegen::ir::Type {
         F32 => types::F32,
         F64 => types::F64,
         B1  => types::I8,
-        FX  => unreachable!()
+        FX|LSV => unreachable!()
     }
 }
 
