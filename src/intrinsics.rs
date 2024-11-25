@@ -2,7 +2,7 @@
 
 use enumset::EnumSetType;
 
-use crate::typing::{scheme, Scheme};
+use crate::typing::{scheme, Scheme, PRI_IDX, PRI_NUM};
 
 macro_rules! define_intrinsics {
     (@scheme [$($scheme:tt)*]) => { &scheme!($($scheme)*) };
@@ -27,39 +27,20 @@ macro_rules! define_intrinsics {
     };
 }
 
-const LOGIC: &Scheme = scheme![t.PriBool : [t t] -> t];
-const CMP: &Scheme = scheme![t n b.PriBool : [(Tensor t n) (Tensor t n)] -> (Tensor b n)];
-const ARITH: &Scheme = scheme![t.PriNum n : [(Tensor t n) (Tensor t n)] -> (Tensor t n)];
-const FPMATH: &Scheme = scheme![t.PriNum n : [(Tensor t n)] -> (Tensor t n)];
+// x
+
+const FPMATH: &Scheme = scheme![t.PRI_NUM n : [(Tensor t n)] -> (Tensor t n)];
 
 define_intrinsics! {
-    // binary operators ORDER BINOP
-    OR             :: LOGIC;
-    AND            :: LOGIC;
-    ADD            :: ARITH;
-    SUB            :: ARITH;
-    MUL            :: ARITH;
-    DIV            :: ARITH;
-    POW            :: [t.PriNum u.PriNum n : [(Tensor t n) (Tensor u n)] -> (Tensor t n)];
-    EQ             :: CMP;
-    NE             :: CMP;
-    LT             :: CMP;
-    LE             :: CMP;
-    // unary math
-    UNM            :: [t.PriNum n : [(Tensor t n)] -> (Tensor t n)];
-    EXP    b"exp"  :: FPMATH;
-    LOG    b"log"  :: FPMATH;
-    // unary logic
-    NOT            :: [t.PriBool n : [(Tensor t n)] -> (Tensor t n)];
-    // logic
-    // SELECT      :: [(T:{B1}, U) : (Func U T U U)];
-    // vector math
-    SUM    b"sum"  :: [t n : [(Tensor t n)] -> t];
-    // types
-    CONV   b"conv" :: [t u n : [(Tensor t n)] -> (Tensor u n)];
-    SPREAD         :: [t : [t] -> t];
-    // SPLAT          :: [];
-    REP            :: [t n m : [(Tensor t n)] -> (Tensor t m)];
+    UNM             :: [t.PRI_NUM n : [(Tensor t n)] -> (Tensor t n)];
+    EXP    b"exp"   :: FPMATH;
+    LOG    b"log"   :: FPMATH;
+    NOT             :: [t.B1 n : [(Tensor t n)] -> (Tensor t n)];
+    SUM    b"sum"   :: [t n : [(Tensor t n)] -> t];
+    WHICH  b"which" :: [t.B1 u.PRI_IDX n : [(Tensor t n)] -> (Tensor u n)];
+    CONV   b"conv"  :: [t u n : [(Tensor t n)] -> (Tensor u n)];
+    REP    b"rep"   :: [t n m : [(Tensor t n)] -> (Tensor t m)];
+    SPREAD          :: [t : [t] -> t];
 }
 
 impl Intrinsic {

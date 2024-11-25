@@ -190,18 +190,29 @@ fn latevisit(
     pos .. pos + n as isize
 }
 
-fn lateschedule(gcm: &mut Gcm) {
+fn lateschedule(gcm: &mut Gcm, code: &Code) {
     for id in index::iter_span(gcm.dfg.end()) {
-        latevisit(
-            &mut gcm.ins,
-            &mut gcm.place,
-            &gcm.blocks,
-            &gcm.dfg,
-            &gcm.cmat,
-            &mut gcm.work_u16,
-            id
-        );
+        if code.at(id).opcode() == Opcode::PHI {
+            gcm.work_u16.push(zerocopy::transmute!(id));
+        } else {
+            latevisit(
+                &mut gcm.ins,
+                &mut gcm.place,
+                &gcm.blocks,
+                &gcm.dfg,
+                &gcm.cmat,
+                &mut gcm.work_u16,
+                id
+            );
+        }
     }
+    for &phi in &gcm.work_u16 {
+        let phi: InsId = zerocopy::transmute!(phi);
+        let ins = &mut gcm.ins[phi];
+        debug_assert!(ins.pos == InsIdP::INVALID.into());
+        ins.pos = gcm.place.push(ins.early);
+    }
+    gcm.work_u16.clear();
 }
 
 fn dominates(blocks: &IndexSlice<BlockId, Block>, a: BlockId, mut b: BlockId) -> bool {
@@ -245,7 +256,7 @@ fn collect(
     // since gcm.place is in reverse order, and block cursors start from the end,
     // place.data ends up in correct order.
     // after this, work[i] = position in output
-    gcm.work_u16.clear();
+    debug_assert!(gcm.work_u16.is_empty());
     for &place in &gcm.place.raw {
         let cursor: &mut u16 = &mut gcm.blocks[zerocopy::transmute!(place)].tmp;
         *cursor -= 1;
@@ -274,6 +285,7 @@ fn collect(
             out[zerocopy::transmute!(gcm.work_u16[p])] = ins;
         }
     }
+    gcm.work_u16.clear();
 }
 
 // a block i must take the phi j as a blockparam if either of the following is true:
@@ -401,7 +413,7 @@ pub fn compute_schedule(
     compute_controlflow(&func.code, &gcm.dfg, &mut gcm.solver_ins, &mut gcm.cmat,
         &mut gcm.work_bitmap);
     domtree(gcm);
-    lateschedule(gcm);
+    lateschedule(gcm, &func.code);
     collect(gcm, &func.code, out, values);
     computeparams(&mut gcm.blocks, func, out, &gcm.cfg, values, &mut gcm.solver_block, blockparams,
         &mut gcm.work_bitmap);

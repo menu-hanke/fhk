@@ -7,6 +7,6 @@ model t[i] {
 	rev = 2-i
 }
 
-model global v = t.x[...t.rev]
+model global v = t.x[t.rev]
 
 ### result { v={200, 100, 0} }

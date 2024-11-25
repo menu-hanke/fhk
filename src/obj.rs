@@ -331,12 +331,13 @@ define_ops! {
     VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
+    BINOP.binop { ann: ObjRef/*TY*/, left: ObjRef<EXPR>, right: ObjRef<EXPR> };
+    INTR.func   { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
     LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } shape: [ObjRef<EXPR>];
     NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
     GET.idx     { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     FREF        { ann: ObjRef/*TY*/, func: ObjRef/*FUNC|FNI*/ };
     CALL        { ann: ObjRef/*TY*/, func: ObjRef<EXPR> } args: [ObjRef<EXPR>];
-    CALLN.func  { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
     CALLX.lang  { ann: ObjRef/*TY*/, func: u32 } inputs: [ObjRef<EXPR>];
 }
 
@@ -400,6 +401,76 @@ impl Obj {
     pub fn ref_params(self) -> RefParamIter {
         RefParamIter { n: (self.n-1) as _, cur: 0, iter: self.operator().fields().into_iter() }
     }
+
+}
+
+// ORDER BINOP
+#[derive(EnumSetType)]
+pub enum BinOp {
+    OR,
+    AND,
+    ADD,
+    SUB,
+    MUL,
+    DIV,
+    POW,
+    EQ,
+    NE,
+    LT,
+    LE,
+}
+
+impl BinOp {
+
+    pub fn from_u8(raw: u8) -> Self {
+        // FIXME replace with core::mem::variant_count when it stabilizes
+        assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
+        unsafe { core::mem::transmute(raw) }
+    }
+
+}
+
+macro_rules! define_intrinsics {
+    ( $( $name:ident $($func:literal)? ;)* ) =>{
+        #[derive(EnumSetType)]
+        pub enum Intrinsic {
+            $($name),*
+        }
+
+        impl Intrinsic {
+            pub fn from_func(name: &[u8]) -> Option<Intrinsic> {
+                match name {
+                    $($($func => Some(Intrinsic::$name),)?)*
+                    _ => None
+                }
+            }
+        }
+    };
+}
+
+define_intrinsics! {
+    UNM;
+    NOT;
+    EXP     b"exp";
+    LOG     b"log";
+    SUM     b"sum";
+    WHICH   b"which";
+    CONV    b"conv";
+    REP     b"rep";
+}
+
+impl Intrinsic {
+
+    pub fn from_u8(raw: u8) -> Intrinsic {
+        // FIXME replace with core::mem::variant_count when it stabilizes
+        assert!(raw < <Intrinsic as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
+        unsafe { core::mem::transmute(raw) }
+    }
+
+     pub fn is_broadcast(self) -> bool {
+         use Intrinsic::*;
+         (UNM|NOT|EXP|LOG|CONV).contains(self)
+     }
 
 }
 
@@ -548,14 +619,17 @@ impl Objects {
             (CAT(a),   CAT(b))    => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
             (IDX(a),   IDX(b))    => self.equal(a.value.erase(), b.value.erase())
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
+            (BINOP(a), BINOP(b))  => a.binop == b.binop
+                && self.equal(a.left.erase(), b.left.erase())
+                && self.equal(a.right.erase(), b.right.erase()),
+            (INTR(a), INTR(b))    => a.func == b.func
+                && self.allequal(cast_args(&a.args), cast_args(&b.args)),
             (LOAD(a),  LOAD(b))   => a.addr == b.addr
                 && self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (GET(a),   GET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
             (FREF(_),  FREF(_))   => todo!(),
             (CALL(_),  CALL(_))   => todo!(),
-            (CALLN(a), CALLN(b))  => a.func == b.func
-                && self.allequal(cast_args(&a.args), cast_args(&b.args)),
             (CALLX(_), CALLX(_))  => todo!(),
             _ => false
         }

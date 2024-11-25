@@ -442,6 +442,13 @@ impl<W: Aligned> Bump<W> {
         BumpRef(self.len / W::ALIGN as u32, PhantomData)
     }
 
+    pub fn pop<T>(&mut self) -> Option<T>
+        where T: Get
+    {
+        // TODO: this also may need to re-align.
+        todo!()
+    }
+
 }
 
 // these functions require bump to be unaligned because they may lower alignment

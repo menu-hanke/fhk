@@ -45,7 +45,7 @@ use crate::index::Index;
 // 
 
 // TODO: implement me
-pub type MiniIndexVec<K,V> = crate::index::IndexVec<K,V>;
+pub type MiniIndexVec<K,V> = crate::index::IndexSlice<K,V>;
 pub type MiniIndexValueVec<K,V> = crate::index::IndexValueVec<K,V>;
 
 /* ---- Arrays -------------------------------------------------------------- */

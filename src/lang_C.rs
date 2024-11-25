@@ -15,11 +15,11 @@ use crate::intern::IRef;
 use crate::ir::{Func, Ins, InsId, LangOp, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
-use crate::lower::{self, CLcx};
+use crate::lower::CLcx;
 use crate::obj::{Obj, ObjRef, CALLX, EXPR, TPRI, TTEN};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
-use crate::typing::Primitive;
+use crate::typing::{Primitive, IRT_IDX};
 
 const LOP_CFUNC: u8 = 0;
 const LOP_CCALL: u8 = 1;
@@ -665,7 +665,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                     let mut len = inputs[o.input as usize];
                     for i in 1..o.dim {
                         len = func.code.push(
-                            Ins::MUL(lower::IRT_IDX, len, inputs[o.input as usize + i as usize]));
+                            Ins::MUL(IRT_IDX, len, inputs[o.input as usize + i as usize]));
                     }
                     // this can overalign and that's ok
                     let align = func.code.push(Ins::KINT(Type::I64, 8));
@@ -675,7 +675,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                     cursor += 1;
                     for i in 0..o.dim {
                         func.code.set(cursor,
-                            Ins::MOV(lower::IRT_IDX, inputs[o.input as usize + i as usize]));
+                            Ins::MOV(IRT_IDX, inputs[o.input as usize + i as usize]));
                         cursor += 1;
                     }
                 },

@@ -128,9 +128,11 @@ fn ins_phi(ecx: &mut Ecx, id: InsId) {
         return;
     }
     let (ctr, phi) = ins.decode_PHI();
+    // phi must be scheduled in the same block as its control instruction:
+    debug_assert!(emit.values[ctr].block() == emit.block);
     let idx = emit.blockparams[emit.block].popcount_leading(phi);
     emit.values[id] = InsValue::from_value(
-        emit.fb.ctx.func.dfg.block_params(emit.values[ctr].cl_block())[idx as usize]
+        emit.fb.ctx.func.dfg.block_params(block2cl(emit.block))[idx as usize]
     );
 }
 

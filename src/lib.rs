@@ -19,7 +19,6 @@ mod hash;
 mod image;
 mod index;
 mod intern;
-mod intrinsics;
 mod ir;
 mod layout;
 mod lex;

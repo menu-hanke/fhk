@@ -14,14 +14,13 @@ use crate::dataflow::{Dataflow, DataflowSystem};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
-use crate::intrinsics::Intrinsic;
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, Obj, ObjRef, ObjectRef, Objects, Operator, CALLN, CALLX, DIM, EXPR, GET, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
-use crate::typing::Primitive;
+use crate::typing::{Primitive, IRT_IDX};
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
@@ -222,8 +221,6 @@ pub type Lcx<'a, 'b, 'c> = Ccx<Lower<R<'a>, R<'b>>, R<'c>>;
 // the point of this is to tell the compiler that emitcallx won't replace the current phase data.
 pub type CLcx<'a, 'b, 'c> = Ccx<Access<Lower, R<'a>>, R<'b>, R<'c>>;
 
-// integer type used for indexing
-pub const IRT_IDX: Type = Type::I32;
 // integer type used for selecting models.
 // note: var.def only has 8 bits anyway, so this can't go higher
 const IRT_ARM: Type = Type::I8;
@@ -453,6 +450,10 @@ fn collectobjs(ctx: &mut Ccx<Lower>) {
         if obj.op == Obj::VSET {
             let var = ctx.objs[idx.cast::<VSET>()].var;
             ctx.objs[var].mark += 1;
+        } else if (obj.op, obj.data) == (Obj::INTR, Intrinsic::WHICH as _) {
+            // `which` cannot have its shape computed cheaply or be iterated,
+            // so always treat it has having many refs.
+            ctx.objs[idx].mark = EXPR_MANY;
         }
         for i in obj.ref_params() {
             let p: ObjRef = zerocopy::transmute!(ctx.objs.get_raw(idx)[i+1]);
@@ -967,25 +968,25 @@ fn idxanalyze(
 //      IF left ->tru ->ri
 // ri:  JMP right merge
 // tru: JMP (KINT 1) merge
-fn emitlogic(func: &Func, ctr: &mut InsId, left: InsId, right: InsId, op: Intrinsic) -> InsId {
-    debug_assert!((Intrinsic::AND | Intrinsic::OR).contains(op));
+fn emitlogic(func: &Func, ctr: &mut InsId, left: InsId, right: InsId, op: BinOp) -> InsId {
+    debug_assert!((BinOp::AND | BinOp::OR).contains(op));
     let merge = reserve(func, 1);
     let phi = func.phis.push(Phi::new(Type::B1));
     let mut ri = func.code.push(Ins::JMP(right, merge, phi));
-    let kbool = func.code.push(Ins::KINT(Type::B1, (op == Intrinsic::OR) as _));
+    let kbool = func.code.push(Ins::KINT(Type::B1, (op == BinOp::OR) as _));
     let mut other = func.code.push(Ins::JMP(kbool, merge, phi));
-    if op == Intrinsic::OR { (ri, other) = (other, ri); }
+    if op == BinOp::OR { (ri, other) = (other, ri); }
     func.code.set(*ctr, Ins::IF(left, ri, other));
     *ctr = merge;
     func.code.push(Ins::PHI(Type::B1, merge, phi))
 }
 
-fn emitcmp(func: &Func, left: InsId, right: InsId, op: Intrinsic, ty: Primitive) -> InsId {
+fn emitcmp(func: &Func, left: InsId, right: InsId, op: BinOp, ty: Primitive) -> InsId {
     let opcode = match (op, ty.is_unsigned()) {
-        (Intrinsic::LT, true)  => Opcode::ULT,
-        (Intrinsic::LT, false) => Opcode::LT,
-        (Intrinsic::LE, true)  => Opcode::ULE,
-        (Intrinsic::LE, false) => Opcode::LE,
+        (BinOp::LT, true)  => Opcode::ULT,
+        (BinOp::LT, false) => Opcode::LT,
+        (BinOp::LE, true)  => Opcode::ULE,
+        (BinOp::LE, false) => Opcode::LE,
         _ => unreachable!()
     };
     func.code.push(
@@ -995,28 +996,66 @@ fn emitcmp(func: &Func, left: InsId, right: InsId, op: Intrinsic, ty: Primitive)
     )
 }
 
+fn emitscalarbinop(
+    lcx: &mut Lcx,
+    ctr: &mut InsId,
+    op: BinOp,
+    ty: Primitive,
+    left: InsId,
+    right: InsId
+) -> InsId {
+    use BinOp::*;
+    let irt = ty.to_ir();
+    match op {
+        OR|AND => emitlogic(&lcx.data.func, ctr, left, right, op),
+        ADD   => lcx.data.func.code.push(Ins::ADD(irt, left, right)),
+        SUB   => lcx.data.func.code.push(Ins::SUB(irt, left, right)),
+        MUL   => lcx.data.func.code.push(Ins::MUL(irt, left, right)),
+        DIV   => todo!(), // handle signedness
+        POW   => lcx.data.func.code.push(Ins::POW(irt, left, right)),
+        EQ    => lcx.data.func.code.push(Ins::EQ(left, right)),
+        NE    => lcx.data.func.code.push(Ins::NE(left, right)),
+        LT|LE => emitcmp(&lcx.data.func, left, right, op, ty)
+    }
+}
+
+fn broadcastbinop(
+    lcx: &mut Lcx,
+    loop_: &mut LoopState,
+    op: BinOp,
+    ty: ObjRef,
+    left: ObjRef<EXPR>,
+    right: ObjRef<EXPR>
+) -> InsId {
+    let lhs = emitbroadcast(lcx, loop_, left);
+    let rhs = emitbroadcast(lcx, loop_, right);
+    match lcx.objs.get(ty) {
+        ObjectRef::TPRI(&TPRI { ty, .. }) => emitscalarbinop(lcx, &mut loop_.body, op,
+            Primitive::from_u8(ty), lhs, rhs),
+        t => {
+            debug_assert!(matches!(t, ObjectRef::TTEN(_)));
+            // TODO: this *can* be implemented by materializing it here.
+            // whether that's even useful is another question.
+            // but it makes sense from the type system perspective
+            // (+ :: (T,T) -> T regardless of whether T is scalar or tensor[U,N] or
+            // tensor[tensor[U,N],M] or ... you get the idea)
+            todo!()
+        }
+    }
+}
+
 // args passed in lcx.data.tmp_ins[base..]
 fn emitscalarintrinsic(
     lcx: &mut Lcx,
-    ctr: &mut InsId,
+    _ctr: &mut InsId,
     f: Intrinsic,
-    args: &[ObjRef<EXPR>],
-    ty: Type,
+    _args: &[ObjRef<EXPR>],
+    _ty: Type,
     base: usize
 ) -> InsId {
     use Intrinsic::*;
-    let argv = &lcx.data.tmp_ins[base..];
+    let _argv = &lcx.data.tmp_ins[base..];
     match f {
-        OR|AND => emitlogic(&lcx.data.func, ctr, argv[0], argv[1], f),
-        ADD   => lcx.data.func.code.push(Ins::ADD(ty, argv[0], argv[1])),
-        SUB   => lcx.data.func.code.push(Ins::SUB(ty, argv[0], argv[1])),
-        MUL   => lcx.data.func.code.push(Ins::MUL(ty, argv[0], argv[1])),
-        DIV   => todo!(), // handle signedness
-        POW   => lcx.data.func.code.push(Ins::POW(ty, argv[0], argv[1])),
-        EQ    => lcx.data.func.code.push(Ins::EQ(argv[0], argv[1])),
-        NE    => lcx.data.func.code.push(Ins::NE(argv[0], argv[1])),
-        LT|LE => emitcmp(&lcx.data.func, argv[0], argv[1], f,
-            Primitive::from_u8(lcx.objs[lcx.objs[args[0]].ann.cast::<TPRI>()].ty)),
         UNM   => todo!(), // name it consistently UNM? NEG?
         EXP   => todo!(), // ir intrinsic call?
         LOG   => todo!(), // ir intrinsic call?
@@ -1078,13 +1117,8 @@ fn broadcastintrinsic(
         ObjectRef::TPRI(&TPRI { ty, .. }) => {
             emitscalarintrinsic(lcx, &mut loop_.body, f, args, Primitive::from_u8(ty).to_ir(), base)
         },
-        t => {
-            debug_assert!(matches!(t, ObjectRef::TTEN(_)));
-            // TODO: this *can* be implemented by materializing it here.
-            // whether that's even useful is another question.
-            // but it makes sense from the type system perspective
-            // (+ :: (T,T) -> T regardless of whether T is scalar or tensor[U,N] or
-            // tensor[tensor[U,N],M] or ... you get the idea)
+        _ => {
+            // see comment in `broadcastbinop`
             todo!()
         }
     };
@@ -1151,17 +1185,23 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
+        ObjectRef::BINOP(&BINOP { left, right, .. }) => {
+            // TODO: this should really insert an assertion that both shapes indeed are equal.
+            let n = match objs[objs[left].ann].op {
+                Obj::TPRI => right,
+                _ /* TTEN */ => left
+            };
+            computeshape(lcx, ctr, n)
+        },
+        ObjectRef::INTR(&INTR { func, ref args, .. }) => {
+            let func = Intrinsic::from_u8(func);
+            debug_assert!(func.is_broadcast());
+            computeshape(lcx, ctr, args[0])
+        },
         ObjectRef::LOAD(LOAD { shape, .. }) | ObjectRef::NEW(NEW { shape, .. })
             => emitvalues(lcx, ctr, shape),
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLN(&CALLN { func, ref args, .. }) => {
-            debug_assert!(Intrinsic::from_u8(func).is_broadcast()
-                || Intrinsic::from_u8(func).is_annotation());
-            // TODO: in the case of multiple args, what SHOULD be done here is to compute the
-            // shape for all args, and trap if they don't match.
-            computeshape(lcx, ctr, args[0])
-        },
         ObjectRef::CALLX(_) => todo!(),
         _ => unreachable!()
     }
@@ -1269,14 +1309,85 @@ fn emitnew(lcx: &mut Lcx, ctr: &mut InsId, new: &NEW) -> InsId {
     out
 }
 
+// in pseudocode:
+//   (dim1, ..., dimN) = shape(expr)
+//   buf1 = alloc(dim1 * ... * dimN)
+//   ...
+//   bufN = alloc(dim1 * ... * dimN)
+//   num = 0
+//   for i1 in 0..dim1:
+//     ...
+//       for iN in 0..dimN:
+//         if next(expr):
+//           buf1[num] = i1
+//           ...
+//           bufN[num] = iN
+//           num = num+1
+//   return (buf1, ..., bufN, num)
+// (TODO: this only implements the 1D case.)
+fn emitwhich(lcx: &mut Lcx, ctr: &mut InsId, cty: &TTEN, expr: ObjRef<EXPR>) -> InsId {
+    debug_assert!(cty.dim == 1);
+    debug_assert!(lcx.objs[lcx.objs[expr].ann].op == Obj::TTEN);
+    let edim = lcx.objs[lcx.objs[expr].ann.cast::<TTEN>()].dim as usize;
+    debug_assert!(edim == 1);
+    // ND case: debug_assert!(decomposition_size(&lcx.objs, cty.elem) == edim);
+    let shape = computeshape(lcx, ctr, expr);
+    let lower = &mut *lcx.data;
+    let idxsize = lower.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
+    let size = lower.func.code.push(Ins::MUL(IRT_IDX, shape, idxsize));
+    let buf = lower.func.code.push(Ins::ALLOC(size, idxsize));
+    let bufphi = lower.func.phis.push(Phi::new(Type::PTR));
+    let l_storephi = lower.func.phis.push(Phi::new(Type::FX));
+    lower.func.phis.push(Phi::new(IRT_IDX)); // l_numphi, must be here
+    let r_storephi = lower.func.phis.push(Phi::new(Type::FX));
+    lower.func.phis.push(Phi::new(IRT_IDX)); // r_numphi, must be here
+    let nop = lower.func.code.push(Ins::NOP(Type::FX));
+    let zero = lower.func.code.push(Ins::KINT(IRT_IDX, 0)); // must be here for num init
+    let mut reduce = newreduce(&lower.func, *ctr, l_storephi, r_storephi, nop, 2);
+    let head = reserve(&lower.func, 1);
+    lower.func.code.set(reduce.loop_.head, Ins::JMP(buf, head, bufphi));
+    reduce.loop_.head = head;
+    let loop_store = reduce.value;
+    let loop_num = reduce.value+1;
+    let loop_buf = lower.func.code.push(Ins::PHI(Type::PTR, reduce.loop_.body, bufphi));
+    let i = emitrangeloop(&lower.func, &mut reduce.loop_, IRT_IDX, zero, shape);
+    let v = emititer(lcx, &mut reduce.loop_, expr);
+    let lower = &mut *lcx.data;
+    let loop_nextstore = lower.func.code.push(Ins::STORE(loop_buf, i));
+    let loop_nextbuf = lower.func.code.push(Ins::ADDP(loop_buf, idxsize));
+    let one = lower.func.code.push(Ins::KINT(IRT_IDX, 1));
+    let loop_nextnum = lower.func.code.push(Ins::ADD(IRT_IDX, loop_num, one));
+    let merge = reserve(&lower.func, 1);
+    let next_storephi = lower.func.phis.push(Phi::new(Type::FX));
+    let next_numphi = lower.func.phis.push(Phi::new(IRT_IDX));
+    let next_bufphi = lower.func.phis.push(Phi::new(Type::PTR));
+    let store_branch = lower.func.code.push(Ins::JMP(loop_nextstore, merge, next_storephi));
+    let store_branch = lower.func.code.push(Ins::JMP(loop_nextnum, store_branch, next_numphi));
+    let store_branch = lower.func.code.push(Ins::JMP(loop_nextbuf, store_branch, next_bufphi));
+    let skip_branch = lower.func.code.push(Ins::JMP(loop_store, merge, next_storephi));
+    let skip_branch = lower.func.code.push(Ins::JMP(loop_num, skip_branch, next_numphi));
+    let skip_branch = lower.func.code.push(Ins::JMP(loop_buf, skip_branch, next_bufphi));
+    lower.func.code.set(reduce.loop_.body, Ins::IF(v, store_branch, skip_branch));
+    reduce.loop_.body = merge;
+    let next = lower.func.code.push(Ins::PHI(Type::FX, merge, next_storephi));
+    lower.func.code.push(Ins::PHI(IRT_IDX, merge, next_numphi)); // next num, must be here.
+    let next_buf = lower.func.code.push(Ins::PHI(Type::PTR, merge, next_bufphi));
+    let tail = reserve(&lower.func, 1);
+    lower.func.code.set(reduce.loop_.tail, Ins::JMP(next_buf, tail, bufphi));
+    reduce.loop_.tail = tail;
+    *ctr = reduce.loop_.out;
+    let results = closereduce(&lower.func, reduce, next);
+    let out = lower.func.code.push(Ins::MOVF(Type::PTR, buf, results));
+    lower.func.code.push(Ins::MOV(IRT_IDX, results+1)); // num, must be out+1
+    out
+}
+
 fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
     let objs = Access::borrow(&lcx.objs);
     let ann = objs[expr].ann;
     match objs.get(expr.erase()) {
         ObjectRef::GET(o) => emitget(lcx, ctr, o),
         ObjectRef::CALLX(_) => emitcallx(lcx, ctr, expr.cast()),
-        ObjectRef::CALLN(&CALLN { func, ref args, .. }) if Intrinsic::from_u8(func).is_annotation()
-            => computevalue(lcx, ctr, args[0]),
         o => match objs.get(ann) {
             ObjectRef::TPRI(&TPRI { ty, .. }) => /* scalar value */ {
                 let ty = Primitive::from_u8(ty).to_ir();
@@ -1296,6 +1407,14 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                     },
                     ObjectRef::VGET(o) => emitvget1(lcx, ctr, o),
                     ObjectRef::IDX(_) => todo!(),
+                    ObjectRef::BINOP(&BINOP { binop, left, right, .. }) => {
+                        let lhs = emitvalue(lcx, ctr, left);
+                        let rhs = emitvalue(lcx, ctr, right);
+                        let pri = Primitive::from_u8(objs[objs[left].ann.cast::<TPRI>()].ty);
+                        emitscalarbinop(lcx, ctr, BinOp::from_u8(binop), pri, lhs, rhs)
+                    },
+                    ObjectRef::INTR(&INTR { func, ref args, .. }) =>
+                        scalarintrinsic(lcx, ctr, Intrinsic::from_u8(func), args, ty),
                     ObjectRef::LOAD(&LOAD { ann, addr, ref shape, .. }) => {
                         debug_assert!(shape.is_empty());
                         debug_assert!(lcx.objs[ann].op == Obj::TPRI);
@@ -1304,8 +1423,6 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                     },
                     ObjectRef::FREF(_) => todo!(),
                     ObjectRef::CALL(_) => todo!(),
-                    ObjectRef::CALLN(&CALLN { func, ref args, .. }) =>
-                        scalarintrinsic(lcx, ctr, Intrinsic::from_u8(func), args, ty),
                     _ => unreachable!()
                 }
             },
@@ -1318,6 +1435,11 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                 }
                 if let ObjectRef::NEW(new) = o {
                     return emitnew(lcx, ctr, new);
+                }
+                if let ObjectRef::INTR(&INTR { func, ref args, .. }) = o {
+                    if func == Intrinsic::WHICH as _ {
+                        return emitwhich(lcx, ctr, cty, args[0]);
+                    }
                 }
                 if let ObjectRef::VGET(vget) = o {
                     // special case: scalar load of a vector variable is already materialized.
@@ -1357,6 +1479,21 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
+        ObjectRef::BINOP(&BINOP { ann, binop, left, right, .. }) => {
+            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
+            broadcastbinop(lcx, loop_, BinOp::from_u8(binop), lcx.objs[ann.cast::<TTEN>()].elem,
+                left, right)
+        },
+        ObjectRef::INTR(&INTR { ann, func, ref args, .. }) => {
+            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
+            let func = Intrinsic::from_u8(func);
+            if func.is_broadcast() {
+                broadcastintrinsic(lcx, loop_, func, args, lcx.objs[ann.cast::<TTEN>()].elem)
+            } else {
+                // should go through emitvalue + iterate array.
+                unreachable!()
+            }
+        },
         ObjectRef::LOAD(&LOAD { ann, addr, shape: ref dims, .. }) => {
             debug_assert!(lcx.objs[ann].op == Obj::TTEN);
             debug_assert!(lcx.objs[lcx.objs[ann.cast::<TTEN>()].elem].op == Obj::TPRI);
@@ -1372,17 +1509,6 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
         },
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLN(&CALLN { ann, func, ref args, .. }) => {
-            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
-            let func = Intrinsic::from_u8(func);
-            if func.is_annotation() {
-                itervalue(lcx, loop_, args[0])
-            } else if func.is_broadcast() {
-                broadcastintrinsic(lcx, loop_, func, args, lcx.objs[ann.cast::<TTEN>()].elem)
-            } else {
-                unreachable!()
-            }
-        }
         ObjectRef::CALLX(_) => todo!(),
         _ => unreachable!()
     }
@@ -1420,9 +1546,10 @@ fn emitvalues(lcx: &mut Lcx, ctr: &mut InsId, exprs: &[ObjRef<EXPR>]) -> InsId {
 }
 
 fn emitshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
-    match lcx.objs[expr].mark {
-        EXPR_ONE => computeshape(lcx, ctr, expr),
-        _        => emitvalue(lcx, ctr, expr)+1
+    if lcx.objs[expr].mark == EXPR_ONE {
+        computeshape(lcx, ctr, expr)
+    } else {
+        emitvalue(lcx, ctr, expr)+1
     }
 }
 
@@ -1438,6 +1565,13 @@ fn emititer(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
             // TODO: emitvalue + iterate
             todo!()
         }
+    }
+}
+
+fn emitbroadcast(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
+    match lcx.objs[lcx.objs[expr].ann].op {
+        Obj::TPRI => emitvalue(lcx, &mut loop_.head, expr),
+        _ => emititer(lcx, loop_, expr)
     }
 }
 
@@ -1481,6 +1615,11 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, fail: InsId) {
         },
         ObjectRef::CAT(_) => todo!(),
         ObjectRef::IDX(_) => todo!(),
+        ObjectRef::BINOP(&BINOP { left, right, .. }) => {
+            emitcheck(lcx, ctr, left, fail);
+            emitcheck(lcx, ctr, right, fail);
+        },
+        ObjectRef::INTR(INTR { args, .. }) => emitcheckall(lcx, ctr, args, fail),
         ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
             emitcheck(lcx, ctr, addr, fail);
             emitcheckall(lcx, ctr, shape, fail);
@@ -1488,7 +1627,6 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, fail: InsId) {
         ObjectRef::NEW(NEW { shape, .. }) => emitcheckall(lcx, ctr, shape, fail),
         ObjectRef::GET(_) => todo!(),
         ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLN(CALLN { args, .. }) => emitcheckall(lcx, ctr, args, fail),
         ObjectRef::CALLX(CALLX { inputs, ..}) => emitcheckall(lcx, ctr, inputs, fail),
         _ => unreachable!()
     };

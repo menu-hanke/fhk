@@ -2,7 +2,7 @@
 
 use enumset::EnumSetType;
 
-use crate::ir::Type;
+use crate::ir::{self, Type};
 
 macro_rules! define_primitives {
     ($($name:ident $lname:literal;)*) => {
@@ -48,7 +48,7 @@ impl Primitive {
         unsafe { core::mem::transmute(raw) }
     }
 
-    pub fn to_ir(self) -> Type {
+    pub const fn to_ir(self) -> Type {
         const PRI2IR: &'static [Type] = {
             use Type::*;
             // ORDER PRI
@@ -95,116 +95,6 @@ impl Constructor {
 
 }
 
-#[derive(Clone, Copy)]
-pub enum SchemeBytecode {
-    Con(Constructor),  // [-n, +1] apply constructor
-    PriNum,            // [-1], apply PRI_NUM constraint
-    PriBool,           // [-1], apply PRI_B1 constraint
-    PriPtr,            // [-1], apply PRI_PTR constraint
-    Gen(u8)            // [+1], push generic
-}
-
-impl SchemeBytecode {
-
-    pub const fn encode(self) -> u8 {
-        use SchemeBytecode::*;
-        // FIXME replace with core::mem::variant_count when it stabilizes
-        const CON_VARIANT_COUNT: u8 = <Constructor as enumset::__internal::EnumSetTypePrivate>
-            ::VARIANT_COUNT as _;
-        match self {
-            Con(con) => con as u8,
-            PriNum   => CON_VARIANT_COUNT,
-            PriBool  => CON_VARIANT_COUNT+1,
-            PriPtr   => CON_VARIANT_COUNT+2,
-            Gen(i)   => CON_VARIANT_COUNT+3+i
-        }
-    }
-
-    pub fn decode(raw: u8) -> Self {
-        use SchemeBytecode::*;
-        // FIXME replace with core::mem::variant_count when it stabilizes
-        const CON_VARIANT_COUNT: u8 = <Constructor as enumset::__internal::EnumSetTypePrivate>
-            ::VARIANT_COUNT as _;
-        if raw < CON_VARIANT_COUNT {
-            Con(unsafe { core::mem::transmute(raw)} )
-        } else if raw == CON_VARIANT_COUNT {
-            PriNum
-        } else if raw == CON_VARIANT_COUNT+1 {
-            PriBool
-        } else if raw == CON_VARIANT_COUNT+2 {
-            PriPtr
-        } else {
-            Gen(raw - CON_VARIANT_COUNT-3)
-        }
-    }
-
-}
-
-// syntax:
-//   (Con a b c)   push a; push b; push c; apply Con;
-//   [...] -> b    emit (Func [...] b)
-//   []            emit (Unit)
-//   [a]           emit (Pair a (Unit))
-//   [a b]         emit (Pair a (Pair b (Unit)))
-macro_rules! scheme {
-    (@generics $idx:expr; ) => {};
-    (@generics $idx:expr; $generic:ident $($rest:ident)*) => {
-        const $generic: u8 = $idx;
-        $crate::typing::scheme!(@generics $idx+1; $($rest)*);
-    };
-    (@emit ($con:ident $($x:tt)*)) => {
-        $crate::concat::concat_slices!(
-            u8;
-            $( &$crate::typing::scheme!(@emit $x), )*
-            &[ $crate::typing::SchemeBytecode::Con($crate::typing::Constructor::$con).encode() ]
-        )
-    };
-    (@emit [$($arg:tt)*] -> $ret:tt) => {
-        $crate::typing::scheme!(@emit (Func [$($arg)*] $ret))
-    };
-    (@emit [$first:tt $($rest:tt)*]) => {
-        $crate::typing::scheme!(@emit (Pair $first [$($rest)*]))
-    };
-    (@emit []) => {
-        [ $crate::typing::SchemeBytecode::Con($crate::typing::Constructor::Unit).encode() ]
-    };
-    (@emit $generic:ident) => {
-        [ $crate::typing::SchemeBytecode::Gen($generic).encode() ]
-    };
-    ( $( $generic:ident $(.$bound:ident)? )* : $($type:tt)* ) => {{
-        $crate::typing::scheme!(@generics 0; $($generic)*);
-        const BYTECODE: &[u8] = &$crate::concat::concat_slices!(
-            u8;
-            &[ 0 $(+ {const $generic: u8 = 1; $generic})* ],
-            $(
-                $(
-                    &[
-                        $crate::typing::SchemeBytecode::Gen($generic).encode(),
-                        $crate::typing::SchemeBytecode::$bound.encode()
-                    ],
-                )?
-            )*
-            &$crate::typing::scheme!(@emit $($type)*)
-        );
-        unsafe {
-            core::mem::transmute::<&[u8], &$crate::typing::Scheme>(BYTECODE)
-        }
-    }};
-}
-
-pub(crate) use scheme;
-
-#[repr(transparent)]
-pub struct Scheme([u8]);
-
-impl Scheme {
-
-    pub fn num_generics(&self) -> u8 {
-        self.0[0]
-    }
-
-    pub fn bytecode(&self) -> &[u8] {
-        &self.0[1..]
-    }
-
-}
+// use signed int here so that -1 can be used as a dummy (and checked via "<0")
+pub const PRI_IDX: Primitive = Primitive::I32;
+pub const IRT_IDX: ir::Type = PRI_IDX.to_ir();

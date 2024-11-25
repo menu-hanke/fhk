@@ -8,10 +8,9 @@ use enumset::{enum_set, EnumSet};
 use crate::bump::BumpRef;
 use crate::compile;
 use crate::intern::IRef;
-use crate::intrinsics::Intrinsic;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, LookupEntry, Obj, ObjRef, ObjectRef, CALLN, CALLX, CAT, DIM, EXPR, GET, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, pushmacro, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
 use crate::typing::Primitive;
 
@@ -92,7 +91,7 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
     let args: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
     if let Some(intrin) = Intrinsic::from_func(stem) {
         return match rest.is_empty() {
-            true => Some(pcx.objs.push_args::<CALLN>(CALLN::new(intrin as _, ObjRef::NIL), args)
+            true => Some(pcx.objs.push_args::<INTR>(INTR::new(intrin as _, ObjRef::NIL), args)
                 .cast()),
             false => None
         };
@@ -246,15 +245,14 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             pcx.data.bindings.truncate(base);
             Ok(value)
         },
-        tok @ (Token::Minus | Token::Not | Token::Ellipsis) => {
+        tok @ (Token::Minus | Token::Not) => {
             next(pcx)?;
             let value = parse_binop(pcx, UNARY_PRIORITY)?;
             let func = match tok {
                 Token::Minus     => Intrinsic::UNM,
-                Token::Not       => Intrinsic::NOT,
-                _ /* Ellipsis */ => Intrinsic::SPREAD
+                _ /* Not */      => Intrinsic::NOT,
             };
-            Ok(pcx.objs.push_args::<CALLN>(CALLN::new(func as _, ObjRef::NIL), &[value]).cast())
+            Ok(pcx.objs.push_args::<INTR>(INTR::new(func as _, ObjRef::NIL), &[value]).cast())
         },
         Token::Int | Token::Int64 | Token::Fp64 | Token::Literal => {
             let mut o = KINT::new(ObjRef::NIL, pcx.data.tdata as _);
@@ -287,10 +285,12 @@ fn parse_binop(pcx: &mut Pcx, limit: u8) -> compile::Result<ObjRef<EXPR>> {
             op = unsafe { core::mem::transmute(op as u8 - 2) };
             (lhs, rhs) = (rhs, lhs);
         }
-        lhs = pcx.objs.push_args::<CALLN>(
-            CALLN::new(Intrinsic::OR as u8 + (op as u8 - Token::Or as u8), ObjRef::NIL),
-            &[lhs, rhs]
-        ).cast();
+        lhs = pcx.objs.push(BINOP::new(
+                BinOp::OR as u8 + (op as u8 - Token::Or as u8),
+                ObjRef::NIL,
+                lhs,
+                rhs
+        )).cast();
     }
     Ok(lhs)
 }
