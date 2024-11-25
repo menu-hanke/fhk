@@ -293,7 +293,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
             ObjectRef::TPRI(_) => i,
             ObjectRef::TTEN(&TTEN { dim, .. }) => {
                 let mut values = func.code.push(Ins::NOP(Type::LSV));
-                for j in (0..dim).rev() {
+                for j in (0..dim+1).rev() {
                     values = func.code.push(Ins::CARG(values, i + j as isize));
                 }
                 values

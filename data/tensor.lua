@@ -62,7 +62,7 @@ end
 local function vec_totab(vec)
 	local t = table.new(vec.n, 0)
 	for i=0, vec.n-1 do
-		t[i] = vec.v[i]
+		t[i] = vec.e[i]
 	end
 	return t
 end
@@ -74,8 +74,8 @@ local function vec__tostring(vec)
 end
 
 local vec_mt = {
-	__index = function(self, i) return self.v[i] end,
-	__newindex = function(self, i, v) self.v[i] = v end,
+	__index = function(self, i) return self.e[i] end,
+	__newindex = function(self, i, e) self.e[i] = e end,
 	__len = function(self) return self.n end,
 	__ipairs = function(self) return array_inext, self, -1 end,
 	__tostring = vec__tostring
@@ -86,7 +86,7 @@ local function vector_ctype(e)
 	local ctid = tonumber(e)
 	local ct = VEC_CTYPES[ctid]
 	if ct then return ct end
-	ct = ffi.metatype(ffi.typeof("struct { $ *v; int32_t data; }", e), vec_mt)
+	ct = ffi.metatype(ffi.typeof("struct { $ *e; int32_t n; }", e), vec_mt)
 	VEC_CTYPES[ctid] = ct
 	return ct
 end
