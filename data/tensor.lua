@@ -63,7 +63,7 @@ end
 local function vec_totab(vec)
 	local t = table.new(vec.n, 0)
 	for i=0, vec.n-1 do
-		t[i] = vec.e[i]
+		t[i+1] = vec.e[i]
 	end
 	return t
 end
