@@ -337,7 +337,7 @@ fn deconstruct(pcx: &mut Pcx, value: ObjRef<EXPR>, num: usize) {
     }
 }
 
-fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
+fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::Result {
     let base = pcx.tmp.end();
     loop {
         let var = parse_vref(pcx)?;
@@ -363,8 +363,13 @@ fn parse_model_def(pcx: &mut Pcx) -> compile::Result {
         pcx.objs[vset].value = pcx.tmp[deco_base.add_size(i)]
     }
     let guard = match check(pcx, Token::Where)? {
-        true  => parse_expr(pcx)?,
-        false => ObjRef::NIL.cast()
+        true  => Some(parse_expr(pcx)?),
+        false => None
+    };
+    let guard = match (blockguard, guard) {
+        (Some(g), None) | (None, Some(g)) => g,
+        (Some(b), Some(g)) => pcx.objs.push(BINOP::new(BinOp::AND as _, ObjRef::NIL, b, g)).cast(),
+        (None, None) => ObjRef::NIL.cast()
     };
     // pcx.data.tab is guaranteed to be set here because we came here from parse_model
     pcx.objs.push_args::<MOD>(
@@ -396,6 +401,10 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     };
     pcx.data.tab = tab;
     debug_assert!(pcx.data.bindings.is_empty());
+    let blockguard = match check(pcx, Token::Where)? {
+        true => Some(parse_expr(pcx)?),
+        false => None
+    };
     if check(pcx, Token::LBracket)? {
         let mut axis = -1isize;
         while pcx.data.token != Token::RBracket {
@@ -417,11 +426,11 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     }
     if check(pcx, Token::LCurly)? {
         while pcx.data.token != Token::RCurly {
-            parse_model_def(pcx)?;
+            parse_model_def(pcx, blockguard)?;
         }
         next(pcx)?;
     } else {
-        parse_model_def(pcx)?;
+        parse_model_def(pcx, blockguard)?;
     }
     pcx.data.bindings.clear();
     Ok(())
