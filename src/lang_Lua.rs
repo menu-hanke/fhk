@@ -12,7 +12,7 @@ use crate::bump::{self, BumpRef, BumpVec};
 use crate::compile::{self, Ccx};
 use crate::data::{CALL_LUA, TENSOR_LUA};
 use crate::emit::{irt2cl, Ecx, Emit, InsValue};
-use crate::image::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance};
+use crate::image::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance, SwapInit};
 use crate::intern::IRef;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
@@ -28,7 +28,11 @@ use crate::support::SuppFunc;
 const LJ_LIBNAME: &'static [u8] = b"libluajit.so\0libluajit-5.1.so\0";
 
 // TODO: make this configurable?
+#[cfg(unix)]
 const CORO_STACK: usize = 1024 * 16;
+
+#[cfg(windows)]
+const CORO_STACK: usize = 1024 * 128;
 
 type lua_State = c_void;
 
@@ -578,7 +582,15 @@ unsafe fn init(lua: &Lua, stack: usize) {
     lib.lua_settop(L, 0);
     lib.lua_getfield(L, LUA_GLOBALSINDEX, c"__fhk_run".as_ptr());
     lib.lua_pushnumber(L, fhk_lua_swap_exit as usize as _);
-    fhk_swap_init(base, stack, run, &mut InitCtx { L, base } as *mut _ as *mut _);
+    let mut ctx = InitCtx { L, base };
+    fhk_swap_init(&SwapInit {
+        coro: base,
+        stack,
+        func: run,
+        ctx: &mut ctx as *mut _ as *mut _,
+        #[cfg(windows)]
+        bottom: stack - CORO_STACK
+    })
 }
 
 /* ---- Finalization -------------------------------------------------------- */

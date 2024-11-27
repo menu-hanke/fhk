@@ -166,16 +166,20 @@ fhk_swap_exit:
 
 .hidden fhk_swap_init
 .global fhk_swap_init
-// (coro[rdi], stack[rsi], func[rdx], ctx[rcx])
+// swap[rdi]
 fhk_swap_init:
-    sub rsi, 64
-    lea rax, [rip+1f]
-    mov [rsi+48], rax
-    mov [rdi], rsi
+    mov rax, [rdi+0x08]   // rax = sp
+    lea rsi, [rip+1f]     // rsi = label 1f
+    mov [rax-0x08], rsi   // return address = label 1f
+    mov rcx, rdi          // rcx = swap
+    mov rdi, [rdi]        // rdi = coro
+    sub rax, 56           // 6 gprs + return addr = 56 bytes
+    mov [rdi], rax        // coro.sp = stack
     jmp fhk_swap
 1:
-    mov rdi, rcx
-    jmp rdx
+    mov rdi, [rcx+0x18]   // rdi = swap.ctx
+    call [rcx+0x10]       // call swap.func
+    ud2                   // (must never return)
 
 .hidden fhk_swap_instance
 .global fhk_swap_instance
@@ -192,7 +196,13 @@ global_asm!("
 .global fhk_swap
 // (coro[rcx], ret_out[rdx]) -> ret_in[rax]
 fhk_swap:
-    sub rsp, 168 // 8 padding + 160 xmm regs
+    mov rax, gs:0x30
+    mov r8, [rax+0x08]
+    push r8
+    mov r8, [rax+0x10]
+    push r8
+    push rbx
+    sub rsp, 160
     vmovaps [rsp],     xmm6
     vmovaps [rsp+16],  xmm7
     vmovaps [rsp+32],  xmm8
@@ -203,7 +213,6 @@ fhk_swap:
     vmovaps [rsp+112], xmm13
     vmovaps [rsp+128], xmm14
     vmovaps [rsp+144], xmm15
-    push rbx
     push rbp
     push rdi
     push rsi
@@ -222,7 +231,6 @@ fhk_swap:
     pop rsi
     pop rdi
     pop rbp
-    pop rbx
     vmovaps xmm6,  [rsp]
     vmovaps xmm7,  [rsp+16]
     vmovaps xmm8,  [rsp+32]
@@ -233,13 +241,25 @@ fhk_swap:
     vmovaps xmm13, [rsp+112]
     vmovaps xmm14, [rsp+128]
     vmovaps xmm15, [rsp+144]
-    add rsp, 168
+    add rsp, 160
+    pop rbx
+    mov rcx, gs:0x30
+    pop rdx
+    mov [rcx+0x10], rdx
+    pop rdx
+    mov [rcx+0x08], rdx
     ret
 
 .global fhk_swap_exit
 // coro[rcx] -> ret[rax]
 fhk_swap_exit:
-    sub rsp, 168 // 8 padding + 160 xmm regs
+    mov rax, gs:0x30
+    mov rdx, [rax+0x08]
+    push rdx
+    mov rdx, [rax+0x10]
+    push rdx
+    push rbx
+    sub rsp, 160
     vmovaps [rsp],     xmm6
     vmovaps [rsp+16],  xmm7
     vmovaps [rsp+32],  xmm8
@@ -250,7 +270,6 @@ fhk_swap_exit:
     vmovaps [rsp+112], xmm13
     vmovaps [rsp+128], xmm14
     vmovaps [rsp+144], xmm15
-    push rbx
     push rbp
     push rdi
     push rsi
@@ -261,19 +280,30 @@ fhk_swap_exit:
     mov rax, [rcx]   // rax = coro.sp
     mov [rcx], rsp   // coro.sp = rsp
     mov r15, [rax]   // r15 = vmctx
+    mov rcx, gs:0x30 // fhk_vmexit restores registers, but we have to restore TIB
+    mov rdx, [rax+224]
+    mov [rcx+0x10], rdx
+    mov rdx, [rax+232]
+    mov [rcx+0x08], rdx
     jmp fhk_vmexit
 
 .global fhk_swap_init
-// (coro[rcx], stack[rdx], func[r8], ctx[r9])
+// swap[rcx]
 fhk_swap_init:
-    sub rdx, 240     // 64 (gprs) + 168 (xmm regs) + 8 (return address)
-    lea rax, [rip+1f]
-    mov [rdx+232], rax
-    mov [rcx], rdx
+    mov rdx, [rcx+0x08]   // rdx = stack high address
+    mov [rdx-0x10], rdx   // save stack top
+    mov rax, [rcx+0x20]   // rax = stack low address
+    mov [rdx-0x18], rax   // save stack bottom
+    lea rax, [rip+1f]     // rax = label 1f
+    mov [rdx-0x8], rax    // return address = label 1f
+    mov r9, rcx           // r9 = swap
+    mov rcx, [rcx]        // rcx = coro
+    sub rdx, 248          // 64 (gpr) + 160 (xmm) + 16 (tib) + 8 (return addr) = 248
+    mov [rcx], rdx        // coro.sp = stack
     jmp fhk_swap
 1:
-    mov rcx, r9
-    call r8          // this must never return
+    mov rcx, [r9+0x18]    // rcx = swap.ctx
+    call [r9+0x10]        // call swap.func (this must not return!)
     ud2
 
 .global fhk_swap_instance
@@ -284,6 +314,16 @@ fhk_swap_instance:
     ret
 ");
 
+#[repr(C)]
+pub struct SwapInit {
+    pub coro: usize,
+    pub stack: usize,
+    pub func: unsafe extern "C" fn(*mut ()) -> !,
+    pub ctx: *mut (),
+    #[cfg(windows)]
+    pub bottom: usize
+}
+
 extern "C" {
     // `stack` is a pointer to the address of the stack pointer.
     // this function stores regs on the current stacks, swaps stacks, and returns `ret` on the
@@ -293,12 +333,7 @@ extern "C" {
     // THIS MUST NOT BE CALLED ON THE SAME STACK THAT CALLED fhk_vmcall.
     pub fn fhk_swap_exit(coro: usize) -> i64;
     // initialize a coroutine.
-    pub fn fhk_swap_init(
-        coro: usize,
-        stack: usize,
-        func: unsafe extern "C" fn(*mut ()) -> !,
-        ctx: *mut ()
-    );
+    pub fn fhk_swap_init(SwapInit: &SwapInit);
     // get instance pointer from coroutine.
     // this is safe to call **only** when the main coroutine has been swapped out via fhk_swap().
     // this is an asm function to hide the int->ptr cast.
