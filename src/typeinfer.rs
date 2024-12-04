@@ -141,14 +141,45 @@ fn newpairtype(tvar: &mut IndexVec<TypeVar, Type>, left: Type, right: Type) -> T
     newcontype(tvar, Constructor::Pair, &[left, right])
 }
 
-fn newshapetype(sub: &mut IndexVec<TypeVar, Type>, dims: u8) -> Type {
+fn newpairlist(sub: &mut IndexVec<TypeVar, Type>, fields: &[Type]) -> Type {
     let mut ty = Type::UNIT;
-    for _ in 0..dims {
-        let base = sub.end();
-        sub.push(Type::pri(PRI_IDX)); // elem
-        newtypevar(sub); // dim
-        ty = newpairtype(sub, Type::con(Constructor::Tensor as _, base), ty);
+    for &f in fields.iter().rev() {
+        ty = newpairtype(sub, f, ty);
     }
+    ty
+}
+
+fn shapetype(tcx: &mut Tcx, idx: &[ObjRef<EXPR>]) -> Type {
+    let base = tcx.tmp.end();
+    let fields = tcx.tmp.align_for::<Type>();
+    let mut nils = 0;
+    for &i in idx {
+        let ety = if i.is_nil() {
+            nils += 1;
+            Type::UNIT
+        } else if nils > 0 {
+            // TODO: more generally, this should allow the dimension to have any nesting
+            // and only constrain the sum of dimensions.
+            // eg. consider
+            //   table A[global.N]
+            //   table B[:,A.N]
+            //   table C[:,:,B.N]
+            // here
+            //   A has 1 scalar axis
+            //   B has 1 scalar axis and 1 vector axis
+            //   C has 1 scalar axis (of size global.N) and 2 vector axes (of sizes A.N and B.N)
+            // ie. nested vector axes "spill" into the preceding `:`s
+            let dim = createdimtype(&mut tcx.data, nils);
+            nils = 0;
+            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Type::pri(PRI_IDX), dim])
+        } else {
+            Type::pri(PRI_IDX)
+        };
+        fields.push(ety);
+    }
+    debug_assert!(nils == 0);
+    let ty = newpairlist(&mut tcx.data.sub, &fields[base.cast_up()..]);
+    tcx.tmp.truncate(base);
     ty
 }
 
@@ -598,8 +629,10 @@ fn vartype(tcx: &mut Tcx, var: ObjRef<VAR>) -> TypeVar {
 }
 
 fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
-    let need = tcx.objs.dim(tcx.objs[var].tab);
+    let objs = Access::borrow(&tcx.objs);
+    let axes = &objs[objs[objs[var].tab].shape].fields;
     let mut have = idx.len();
+    let need = axes.len();
     if have < need {
         // not enough indices mentioned, insert current expression's index.
         // these are scalar indices, so they don't increase the dimension.
@@ -610,15 +643,26 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
         // too many indices mentioned.
         return Type::NEVER;
     }
-    let vty = Type::var(vartype(tcx, var));
-    if idx.is_empty() {
-        // no explicit indices mentioned, so we know the exact arity at this point.
-        if have < need {
-            let d = createdimtype(&mut tcx.data, (need-have) as _);
-            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[vty, d])
-        } else {
-            vty
+    let mut ty = Type::var(vartype(tcx, var));
+    // handle tail: every scalar axis increases the dimension by one, and every vector axis emits a
+    // nested tensor.
+    let mut dim = 0;
+    for i in (have..need).rev() {
+        dim += 1;
+        if i > 0 && axes[i-1].is_nil() {
+            // vector axis or end of tail
+            let d = createdimtype(&mut tcx.data, dim as _);
+            ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
+            dim = 0;
         }
+    }
+    if idx.is_empty() {
+        // no explicit indices mentioned, so we know the exact dimensions at this point.
+        if dim > 0 {
+            let d = createdimtype(&mut tcx.data, dim as _);
+            ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
+        }
+        ty
     } else {
         // explicit indices mentioned.
         // here the dimensionality depends on the dimension of the index expressions.
@@ -628,7 +672,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
         // * every explicit index `e_0, ..., e_k` gets a constraint:
         //     Index(v_{j+1}, v_j, e_j)
         let d = createdimtype(&mut tcx.data, need as _);
-        let mut v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[vty, d]);
+        let mut v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
         for &e in idx {
             let ety = exprtype(tcx, e);
             let (elem, dim) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
@@ -637,17 +681,17 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
             constraint(&mut tcx.data, Constraint::Index(vnext, v, dim));
             v = Type::var(vnext);
         }
-        // insert splats for missing indices
-        if have < need {
+        // increment dimension if we have implicit dimensions
+        if dim > 0 {
             let vdim = newtypevar(&mut tcx.data.sub);
-            let vten = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[vty, Type::var(vdim)]);
+            let vten = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, Type::var(vdim)]);
             unify(&mut tcx.data.sub, vten, v);
             let mut rdim = Type::con(Constructor::NEXT, vdim);
-            for _ in (have+1)..need {
+            for _ in 0..dim {
                 rdim = newcontype(&mut tcx.data.sub, Constructor::Next, &[rdim]);
             }
             let rdim = tcx.data.sub.push(rdim);
-            v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[vty, Type::var(rdim)]);
+            v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, Type::var(rdim)]);
         }
         v
     }
@@ -848,6 +892,7 @@ fn exprtype(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
 }
 
 fn visitall(tcx: &mut Tcx) {
+    tcx.data.ann.insert_unique_unchecked(ObjRef::NIL, Type::UNIT);
     let b1 = tcx.data.sub.push(Type::pri(Primitive::B1));
     tcx.data.ann.insert_unique_unchecked(ObjRef::TRUE.erase(), Type::var(b1));
     tcx.data.ann.insert_unique_unchecked(ObjRef::FALSE.erase(), Type::var(b1));
@@ -856,8 +901,7 @@ fn visitall(tcx: &mut Tcx) {
         match o {
             ObjectRef::TAB(&TAB { shape, .. }) => {
                 tcx.data.tab = ObjRef::GLOBAL;
-                let dims = tcx.objs[shape].fields.len();
-                let ty = newshapetype(&mut tcx.data.sub, dims as _);
+                let ty = shapetype(tcx, &objs[shape].fields);
                 let ety = exprtype(tcx, shape.cast());
                 unifyvar(&mut tcx.data.sub, ety, ty);
             },

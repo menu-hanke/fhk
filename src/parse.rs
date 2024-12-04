@@ -307,15 +307,17 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     if check(pcx, Token::LBracket)? {
         pcx.data.tab = ObjRef::GLOBAL;
         while pcx.data.token != Token::RBracket {
-            let value = parse_expr(pcx)?;
+            let value = match pcx.data.token {
+                Token::Colon => {
+                    next(pcx)?;
+                    ObjRef::NIL
+                },
+                _ => parse_expr(pcx)?.erase()
+            };
             pcx.tmp.push(value);
-            if pcx.data.token == Token::Comma {
-                next(pcx)?;
-            } else {
-                consume(pcx, Token::RBracket)?;
-                break;
-            }
+            if !check(pcx, Token::Comma)? { break }
         }
+        consume(pcx, Token::RBracket)?;
     }
     pcx.objs[tab].shape = pcx.objs.push_args::<TUPLE>(
         TUPLE::new(ObjRef::NIL),

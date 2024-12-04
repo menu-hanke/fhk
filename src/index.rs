@@ -219,7 +219,7 @@ impl<I: Index, T> IndexValueVec<I, T> {
         unsafe { &*self.0.get() }.is_empty()
     }
 
-    pub fn extend(&self, xs: impl Iterator<Item=T>) -> I {
+    pub fn extend(&self, xs: impl IntoIterator<Item=T>) -> I {
         let i = self.end();
         unsafe { &mut *self.0.get() }.raw.extend(xs);
         i

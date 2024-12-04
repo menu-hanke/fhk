@@ -71,12 +71,13 @@ impl ObjRef {
 
     // ORDER OBJ
     pub const NIL: ObjRef = zerocopy::transmute!(0);          // NIL
-    pub const B1: ObjRef<TPRI> = zerocopy::transmute!(1);     // TPRI.B1
-    pub const PTR: ObjRef<TPRI> = zerocopy::transmute!(2);    // TPRI.PTR
-    pub const FALSE: ObjRef<KINT> = zerocopy::transmute!(3);  // KINT B1 0
-    pub const TRUE: ObjRef<KINT> = zerocopy::transmute!(6);   // KINT B1 1
+    pub const TUP0: ObjRef<TTUP> = zerocopy::transmute!(2);   // TTUP []
+    pub const B1: ObjRef<TPRI> = zerocopy::transmute!(3);     // TPRI.B1
+    pub const PTR: ObjRef<TPRI> = zerocopy::transmute!(4);    // TPRI.PTR
+    pub const FALSE: ObjRef<KINT> = zerocopy::transmute!(5);  // KINT B1 0
+    pub const TRUE: ObjRef<KINT> = zerocopy::transmute!(8);   // KINT B1 1
                                                               // TUPLE NIL
-    pub const GLOBAL: ObjRef<TAB> = zerocopy::transmute!(11); // TAB GLOBAL []
+    pub const GLOBAL: ObjRef<TAB> = zerocopy::transmute!(13); // TAB GLOBAL []
 
 }
 
@@ -292,15 +293,6 @@ macro_rules! define_ops {
     };
 }
 
-// TAB terminology (following numpy):
-//   shape:     an n-tuple describing valid entries.
-//                * scalar `m` -> 0, ..., m-1 are valid
-//                * vector `x` -> 0, ..., x[i]-1 are valid, where `i` is the previous entry
-//   index:     any valid entry described by `shape` (n-tuple)
-//   size:      total number of valid indices
-//   axis:      an int in 0, ..., n-1 (scalar)
-//   dimension: number of axes (n, scalar)
-
 // note: all fields here must be 4 byte POD types.
 define_ops! {
     // named objects. name must be first. tab must be second for VAR and MOD.
@@ -314,7 +306,6 @@ define_ops! {
     RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
     VSET        { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
-    NIL         {};
     // types
     TVAR        {};
     TPRI.ty     {};
@@ -322,6 +313,7 @@ define_ops! {
     TTUP        {} elems: [ObjRef/*TY*/];
     // (TFUNC for functions + generic type annotations TPAR/TCON etc)
     // expressions. ann must be first.
+    NIL         { ann: ObjRef<TTUP> };
     KINT        { ann: ObjRef/*TY*/, k: i32 };
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
@@ -820,7 +812,8 @@ impl Default for Objects {
             lookup: Default::default()
         };
         // ORDER OBJ
-        let nil = objs.push(NIL::new());
+        let nil = objs.push(NIL::new(ObjRef::TUP0));
+        let tup0 = objs.push(TTUP::new());
         let b1 = objs.push(TPRI::new(Primitive::B1 as _));
         let ptr = objs.push(TPRI::new(Primitive::PTR as _));
         let false_ = objs.push(KINT::new(ObjRef::B1.erase(), 0));
@@ -828,6 +821,7 @@ impl Default for Objects {
         let empty = objs.push(TUPLE::new(ObjRef::NIL));
         let global = objs.push(TAB::new(Ccx::SEQ_GLOBAL, empty.cast()));
         debug_assert!(nil == ObjRef::NIL.cast());
+        debug_assert!(tup0 == ObjRef::TUP0.cast());
         debug_assert!(b1 == ObjRef::B1);
         debug_assert!(ptr == ObjRef::PTR);
         debug_assert!(false_ == ObjRef::FALSE);

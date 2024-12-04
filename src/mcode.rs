@@ -15,7 +15,7 @@ use crate::support::NativeFunc;
 //   s390x       4
 const FUNC_ALIGN: u32 = 32;
 
-index!(pub struct Label(u32) invalid(!0));
+index!(pub struct Label(u32) invalid(!0) debug("L{}"));
 
 pub type MCodeOffset = u32;
 

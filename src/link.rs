@@ -64,6 +64,12 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
         LINK "data is at {:#x}..{:#x} ({} bytes)",
         map.base() as usize + code.len(), map.base() as usize + code.len() + data.len(), data.len()
     );
+    if trace!(LINK) {
+        // TODO: move disassembly here too
+        for (label, &ofs) in mcode.labels.pairs() {
+            trace!(LINK "{:?} {:?}", unsafe { mem.add(ofs as _) }, label);
+        }
+    }
     Ok(map)
 }
 

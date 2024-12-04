@@ -128,7 +128,9 @@ ffi.cdef [[
 
 local function test_alloc(T, _, size, align)
 	print(string.format("[alloc] %d (align: %d)", size, align))
+	-- TODO: it would also be a good idea to put some guard pages here
 	local p = ffi.C.malloc(size)
+	ffi.fill(p, size, 0x29)
 	table.insert(T.allocs, p)
 	return p
 end

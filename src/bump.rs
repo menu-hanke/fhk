@@ -436,10 +436,21 @@ impl<W: Aligned> Bump<W> {
     }
 
     pub fn pop<T>(&mut self) -> Option<T>
-        where T: Get
+        where T: FromBytes
     {
-        // TODO: this also may need to re-align.
-        todo!()
+        if self.len < size_of::<T>() as u32 {
+            None
+        } else {
+            self.len -= size_of::<T>() as u32;
+            if T::ALIGN > W::ALIGN {
+                self.len &= !(T::ALIGN as u32 - 1);
+            }
+            let value = unsafe { self.ptr.as_ptr().add(self.len as _).cast::<T>().read() };
+            if T::ALIGN < W::ALIGN {
+                self.len &= !(W::ALIGN as u32 - 1);
+            }
+            Some(value)
+        }
     }
 
 }

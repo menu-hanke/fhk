@@ -129,7 +129,14 @@ local function makegetter(e, n)
 	buf:put(")\n")
 	local meta = metadata(e)
 	if meta then
-		error("TODO")
+		if n > 1 then
+			error("TODO")
+		end
+		buf:put("local r = self['fhk$e']()\nr.e = self.e[i1]\n")
+		for i=0, meta.n-1 do
+			buf:putf("r.n[%d] = self.n1[%d][i1]\n", i, i)
+		end
+		buf:put("return r\n")
 	else
 		if n > 1 then
 			error("TODO")
@@ -137,10 +144,12 @@ local function makegetter(e, n)
 		buf:put("return self.e[i1]\n")
 	end
 	buf:put("end")
+	print(buf)
 	return load(buf)()
 end
 
-local function maketotab(n)
+local function maketotab(e, n)
+	local meta = metadata(e)
 	local buf = buffer.new()
 	buf:put("return function(self)\nlocal tab0 = {}\n")
 	for i=0, n-1 do
@@ -151,7 +160,11 @@ local function maketotab(n)
 				if j > 0 then buf:put(",") end
 				buf:putf("i%d", i)
 			end
-			buf:put(")\n")
+			buf:put(")")
+			if meta then
+				buf:put(":totable()")
+			end
+			buf:put("\n")
 		else
 			buf:putf("local tab%d = {}\ntab%d[i%d] = tab%d\n", i+1, i, i, i+1)
 		end
@@ -182,10 +195,10 @@ local function newmetatype(e, n)
 	local shape = makeshape(n)
 	local mt = {
 		__index = {
-			["fhk$tensor"] = true,
-			get            = makegetter(e, n),
-			totable        = maketotab(n),
-			shape          = shape
+			["fhk$e"] = e,
+			get       = makegetter(e, n),
+			totable   = maketotab(e, n),
+			shape     = shape
 		},
 		__len      = shape,
 		__tostring = tensor__tostring,
@@ -208,14 +221,20 @@ local function tensor_ctype(e, n)
 	buf:put("struct {\n")
 	putflatrepr(e, buf, 1)
 	buf:putf("%s n[%d];\n}", IDX_CTYPE, n)
-	ct = typeof(tostring(buf), e)
+	print(buf)
+	local inner = e
+	while true do
+		local meta = metadata(inner)
+		if meta then inner = meta.e else break end
+	end
+	ct = typeof(tostring(buf), inner)
 	METADATA[tonumber(ct)] = {e=e, n=n}
 	CTYPES[ctk] = ct
 	return ffi.metatype(ct, newmetatype(e, n))
 end
 
 local function istensorx(x)
-	return x["fhk$tensor"]
+	return x["fhk$e"]
 end
 
 local function istensor(x)
