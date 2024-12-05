@@ -134,7 +134,7 @@ struct LuaCall {
 
 // execute a lua function call.
 // before begin_emit:
-//   FX LOVV (args: CARG LOP_VALUE|LOP_TAB|LOP_TSET) (func: KREF IRef<LuaFunc>)
+//   FX LOVV (args: CARG LOP_VALUE) (func: KREF IRef<LuaCall>)
 // after begin_emit:
 //   FX LOVX (args unchanged) (func: jump table index)
 const LOP_CALL: u8 = 0;
@@ -146,10 +146,7 @@ const LOP_RES: u8 = 1;
 // create a lua value from ir value(s).
 // scalar (TPRI) -> value is an ir value.
 // tensor (TTEN) -> value is a CARG list.
-// before begin_emit:
-//   LSV LOVV value (type: KREF TPRI|TTEN)
-// after begin_emit:
-//   LSV LOVX value (idx: original ins id)
+// LSV LOVV value (type: KREF TPRI|TTEN)
 const LOP_VALUE: u8 = 2;
 
 /* ---- Parsing ------------------------------------------------------------- */
