@@ -6,7 +6,7 @@ use zerocopy::Unalign;
 
 use crate::bump::BumpRef;
 use crate::lang::Lang;
-use crate::mem::SizeClass;
+use crate::mem::{CursorType, SizeClass};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
@@ -325,15 +325,53 @@ fn ins_load(ecx: &mut Ecx, id: InsId) {
     );
 }
 
+// TODO: use BOX in lang_C (but lang_Lua can't use it because the "frame" address is fixed)
+// (side note: a BOX equivalent for output parameters isn't useful since there's no CSE
+//  opportunity - just use ALLOC)
+// (side note 2: all calls should eventually use either BOX or their own LSV, not ALLOC,
+//  because ALLOC can't be CSE'd)
 fn ins_box(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let value = emit.code[id].decode_V();
-    let ty = emit.code[value].type_();
-    let frame = emit.fb.frame();
-    let ofs = frame.alloc(ty.size() as _, ty.size() as _);
-    let slot = frame.slot;
-    emit.fb.ins().stack_store(emit.values[value].value(), slot, ofs as i32);
-    emit.values[id] = InsValue { raw: ofs };
+    let frame = emit.fb.frame(&mut emit.frame);
+    let opcode = emit.code[value].opcode();
+    let ofs = match opcode {
+        Opcode::CARG => {
+            let mut args = value;
+            let ofs = frame.layout.align(8);
+            while emit.code[args].opcode() == Opcode::CARG {
+                let (next, value) = emit.code[args].decode_CARG();
+                let p = frame.layout.alloc_type(emit.code[value].type_());
+                emit.fb.ins().stack_store(emit.values[value].value(), frame.slot, p as i32);
+                args = next;
+            }
+            ofs
+        },
+        _ => {
+            let ofs = frame.layout.alloc_type(emit.code[value].type_());
+            emit.fb.ins().stack_store(emit.values[value].value(), frame.slot, ofs as i32);
+            ofs
+        }
+    };
+    emit.values[id] = InsValue { raw: ofs as _ };
+}
+
+fn ins_abox(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let (size, align) = emit.code[id].decode_ABOX();
+    let frame = emit.fb.frame(&mut emit.frame);
+    let ofs = frame.layout.alloc(size as _, align as _);
+    emit.values[id] = InsValue { raw: ofs as _ };
+}
+
+fn ins_bref(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let box_ = emit.code[id].decode_V();
+    debug_assert!((Opcode::BOX|Opcode::ABOX).contains(emit.code[box_].opcode()));
+    let slot = emit.frame.as_ref().unwrap().slot;
+    let ofs = emit.values[box_].raw;
+    let ptr = emit.fb.ins().stack_addr(irt2cl(Type::PTR), slot, ofs as i32);
+    emit.values[id] = InsValue::from_value(ptr);
 }
 
 fn ins_callb(ecx: &mut Ecx, id: InsId) {
@@ -401,8 +439,8 @@ fn ins_lop(ecx: &mut Ecx, id: InsId) -> compile::Result {
 pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
     use Opcode::*;
     let ins = ecx.data.code[id];
-    // hack: translate box here
-    if ins.type_() != Type::LSV || ins.opcode() == BOX {
+    // hack: translate boxes here
+    if ins.type_() != Type::LSV || (BOX|ABOX).contains(ins.opcode()) {
         match ins.opcode() {
             NOP => { /* NOP */ },
             JMP => ins_jmp(ecx, id),
@@ -428,6 +466,8 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             STORE => ins_store(ecx, id),
             LOAD => ins_load(ecx, id),
             BOX => ins_box(ecx, id),
+            ABOX => ins_abox(ecx, id),
+            BREF => ins_bref(ecx, id),
             CALL => todo!(),
             CALLB | CALLBI => ins_callb(ecx, id),
             CARG => { /* NOP */ },

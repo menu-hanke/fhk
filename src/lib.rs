@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+mod array;
 mod bitmap;
 mod bump;
 mod compile;
@@ -54,9 +55,9 @@ macro_rules! foreach_lang {
     ($mac:path $(,$($extra:tt)*)?) => {
         $mac! {
             $($($extra)*)?
-            #[cfg(feature="lang-C")] lang_C::C;
+            #[cfg(feature="lang-C")]   lang_C::C;
             #[cfg(feature="lang-Lua")] lang_Lua::Lua;
-//            #[cfg(feature="lang-R")] lang_R::R;
+            #[cfg(feature="lang-R")]   lang_R::R;
         }
     };
 }
@@ -82,6 +83,7 @@ const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
     b" [",
     #[cfg(feature="lang-C")]   b" C",
     #[cfg(feature="lang-Lua")] b" Lua",
+    #[cfg(feature="lang-R")]   b" R",
     b" ]",
     b"\0"
 );

@@ -1,46 +1,12 @@
 //! Runtime support functions.
 
-use alloc::vec::Vec;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, TrapCode};
-use cranelift_codegen::isa::CallConv;
+use cranelift_codegen::ir::{InstBuilder, TrapCode};
 use enumset::EnumSetType;
 
-use crate::emit::{block2cl, irt2cl, Ecx, NATIVE_CALLCONV};
+use crate::emit::{block2cl, signature, Ecx, Signature, NATIVE_CALLCONV};
 use crate::image::{fhk_vmexit, Instance};
 use crate::ir::Type;
 use crate::schedule::BlockId;
-
-struct Signature<T: ?Sized=[Type]> {
-    cc: CallConv,
-    ret: u8,
-    sig: T
-}
-
-macro_rules! signature {
-    ($cc:expr, $($arg:ident)* $(-> $($ret:ident)*)?) => {
-        Signature {
-            cc: $cc,
-            ret: 0 $( $(+ {let $ret = 1; $ret})* )?,
-            sig: [
-                $($($crate::ir::Type::$ret,)*)?
-                $($crate::ir::Type::$arg,)*
-            ]
-        }
-    };
-    ($cc:ident $($arg:ident)* $(-> $($ret:ident)*)?) => {
-        signature!(cranelift_codegen::isa::CallConv::$cc, $($arg)* $(-> $($ret)*)?)
-    };
-}
-
-fn ty2param(param: &mut Vec<AbiParam>, ty: &[Type]) {
-    param.extend(ty.iter().map(|&t| AbiParam::new(irt2cl(t))));
-}
-
-fn sig2cl(sig: &mut cranelift_codegen::ir::Signature, si: &Signature) {
-    sig.call_conv = si.cc;
-    ty2param(&mut sig.returns, &si.sig[..si.ret as usize]);
-    ty2param(&mut sig.params, &si.sig[si.ret as usize..]);
-}
 
 macro_rules! define_suppfuncs {
     ($(
@@ -90,7 +56,11 @@ macro_rules! define_nativefuncs {
     };
 }
 
-// note: all native functions must be defined before emitted functions.
+// TODO: consider language-specific suppfuncs (and nativefuncs), similar to ir::LangOp.
+// probably not needed currently since it's only used by R and only for one function,
+// but if eg. python needs it in the future it should probably go here rather than doing it
+// inside each lang.
+// add the suppfunc and nativefunc tables as constants in the Language trait?
 define_suppfuncs! {
     INIT  PTR I32 I32;
     ALLOC I64 I64 -> PTR;
@@ -117,8 +87,8 @@ impl SuppFunc {
         unsafe { core::mem::transmute(raw) }
     }
 
-    pub fn signature(self, sig: &mut cranelift_codegen::ir::Signature) {
-        sig2cl(sig, &SUPPFUNC_SIGNATURE[self as usize])
+    pub fn signature(self) -> &'static Signature {
+        SUPPFUNC_SIGNATURE[self as usize]
     }
 
 }
@@ -135,8 +105,8 @@ impl NativeFunc {
         NATIVEFUNC_PTR[self as usize]
     }
 
-    pub fn signature(self, sig: &mut cranelift_codegen::ir::Signature) {
-        sig2cl(sig, &NATIVEFUNC_SIGNATURE[self as usize])
+    pub fn signature(self) -> &'static Signature {
+        NATIVEFUNC_SIGNATURE[self as usize]
     }
 
 }

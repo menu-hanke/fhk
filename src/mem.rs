@@ -1,7 +1,10 @@
 //! Memory layout and representation.
 
+use core::cmp::max;
+
 use crate::bitmap::bitmap_array;
 use crate::index::{index, IndexArray};
+use crate::ir::Type;
 use crate::obj::{ObjRef, TAB};
 
 pub type Offset = u32;
@@ -135,24 +138,53 @@ impl SizeClass {
 
 }
 
-// utility for allocating memory slots
+// utility for allocating memory slots.
+// CursorA remembers alignment, Cursor doesn't.
 #[derive(Clone, Copy, Default)]
 pub struct Cursor { pub ptr: usize }
+#[derive(Clone, Copy)]
+pub struct CursorA { pub ptr: usize, pub align: usize }
 
-impl Cursor {
+pub trait CursorType {
 
-    pub fn align(&mut self, align: usize) -> usize {
-        if align > 0 {
-            debug_assert!(align.is_power_of_two());
-            self.ptr = (self.ptr + align - 1) & !(align - 1);
-        }
-        self.ptr
+    fn align_ptr(&mut self, align: usize) -> &mut usize;
+
+    fn align(&mut self, align: usize) -> usize {
+        debug_assert!(align.is_power_of_two());
+        *self.align_ptr(align)
     }
 
-    pub fn alloc(&mut self, size: usize, align: usize) -> usize {
-        let ptr = self.align(align);
-        self.ptr += size;
-        ptr
+    fn alloc(&mut self, size: usize, align: usize) -> usize {
+        let ptr = self.align_ptr(align);
+        let ret = *ptr;
+        *ptr += size;
+        ret
     }
 
+    fn alloc_type(&mut self, ty: Type) -> usize {
+        let size = ty.size();
+        self.alloc(size, size)
+    }
+
+}
+
+impl CursorType for Cursor {
+    fn align_ptr(&mut self, align: usize) -> &mut usize {
+        self.ptr = (self.ptr + align - 1) & !(align - 1);
+        &mut self.ptr
+    }
+}
+
+impl CursorType for CursorA {
+    fn align_ptr(&mut self, align: usize) -> &mut usize {
+        self.ptr = (self.ptr + align - 1) & !(align - 1);
+        self.align = max(self.align, align);
+        &mut self.ptr
+    }
+}
+
+impl Default for CursorA {
+    fn default() -> Self {
+        Self { ptr: 0 , align: 1 }
+    }
 }

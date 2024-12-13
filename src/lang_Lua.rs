@@ -17,7 +17,7 @@ use crate::intern::IRef;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
-use crate::lower::{decomposition, decomposition_size, reserve, CLcx};
+use crate::lower::{decompose, decomposition, decomposition_size, reserve, CLcx};
 use crate::mmap::{Mmap, Prot};
 use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP, TVAR};
 use crate::parse::parse_expr;
@@ -297,17 +297,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
     for (&i,&o) in zip(inputs, &callx.inputs).rev() {
         let ann = lcx.objs[o].ann;
         let ty = func.code.push(Ins::KREF(zerocopy::transmute!(ann)));
-        let value = match lcx.objs.get(ann) {
-            ObjectRef::TPRI(_) => i,
-            ObjectRef::TTEN(&TTEN { dim, .. }) => {
-                let mut values = func.code.push(Ins::NOP(Type::LSV));
-                for j in (0..dim+1).rev() {
-                    values = func.code.push(Ins::CARG(values, i + j as isize));
-                }
-                values
-            },
-            _ => unreachable!()
-        };
+        let value = decompose(func, &lcx.objs, ann, i);
         let value = func.code.push(Ins::LOVV(Type::LSV, value, ty, LangOp::Lua(LOP_VALUE)));
         args = func.code.push(Ins::CARG(args, value));
     }

@@ -41,6 +41,7 @@ pub struct BumpRef<T: ?Sized>(u32, PhantomData<T>);
 pub struct BumpRefOption<T: ?Sized> { pub raw: BumpRef<T> }
 
 // safety: must have T::ALIGN >= align_of_val(t)
+// (but inequality may be strict)
 pub unsafe trait Aligned {
     const ALIGN: usize;
 }
@@ -896,4 +897,23 @@ impl<T> Deref for BumpVec<T> {
     fn deref(&self) -> &BumpArray<T> {
         zerocopy::transmute_ref!(&self.raw.data)
     }
+}
+
+// note: you may *NOT* assume that the bytes here are actually aligned.
+// this is just a convenience wrapper to make the write functions align the written value.
+// you *may* assume that the written value is aligned to the higher alignment.
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(transparent)]
+pub struct AlignedBytes<const ALIGN: usize>([u8]);
+
+unsafe impl<const ALIGN: usize> Aligned for AlignedBytes<ALIGN> {
+    const ALIGN: usize = ALIGN;
+}
+
+impl<const ALIGN: usize> AlignedBytes<ALIGN> {
+
+    pub fn new(bytes: &[u8]) -> &Self {
+        unsafe { core::mem::transmute(bytes) }
+    }
+
 }

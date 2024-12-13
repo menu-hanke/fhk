@@ -471,8 +471,22 @@ pub fn reserve(func: &Func, num: usize) -> InsId {
     func.code.extend(repeat_n(Ins::NOP_FX, num))
 }
 
+pub fn decompose(func: &Func, objs: &Objects, ty: ObjRef, value: InsId) -> InsId {
+    let ds = decomposition_size(objs, ty);
+    match ds {
+        1 => value,
+        _ => {
+            let mut ret = func.code.push(Ins::NOP(Type::LSV));
+            for i in (0..ds).rev() {
+                ret = func.code.push(Ins::CARG(ret, value + i as isize));
+            }
+            ret
+        }
+    }
+}
+
 #[inline(always)]
-fn areserve<const K: usize>(func: &Func) -> [InsId; K] {
+pub fn areserve<const K: usize>(func: &Func) -> [InsId; K] {
     let r = reserve(func, K);
     let mut out = [InsId::INVALID.into(); K];
     for i in 0..K { out[i] = r+i as isize; }
@@ -2528,6 +2542,7 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                 }
             },
             Obj::QUERY => {
+                // TODO: make query take the dest as parameter and return only fxes
                 let &QUERY { tab, ref value , .. } = &lcx.objs[obj.cast::<QUERY>()];
                 lcx.data.tab = objs[&tab.erase()].cast();
                 let mut query = Query::new(obj.cast());

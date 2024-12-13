@@ -9,7 +9,7 @@ use hashbrown::hash_map::Entry;
 use crate::bump::Bump;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
-use crate::mem::Cursor;
+use crate::mem::{Cursor, CursorType};
 
 index!(struct FinalizerId(u16));
 
@@ -27,6 +27,7 @@ pub struct FinalizerBuilder {
     cmd: Vec<FinalizerId>
 }
 
+// TODO: sort finalized objects by finalizer, so that finalizerid isn't needed here.
 pub struct Finalizers {
     mem: Bump<u8>,
     finalizers: Box<IndexSlice<FinalizerId, Finalizer>>,

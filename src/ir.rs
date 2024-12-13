@@ -187,14 +187,15 @@ macro_rules! decode_at {
 
 macro_rules! decode_fn {
     ($vis:vis fn -> $($rest:tt)*) => { /* workaround for nested repetition in define_opcodes */ };
-    ($vis:vis fn $name:ident -> $($field:ident=$mode:ident)*) => {
+    ($vis:vis fn $name:ident $($check:ident)? -> $($field:ident=$mode:ident)*) => {
         #[allow(unused_parens)]
         $vis fn $name(self) -> ( $(mode_type::$mode),* ) {
+            $( debug_assert!(self.opcode() == Opcode::$check); )?
             ( $(decode_at!(self, $field, $mode)),* )
         }
     };
-    ($vis:vis fn $name:ident -> $($a:ident $($b:ident $($c:ident)?)?)?) => {
-        decode_fn!($vis fn $name -> $(a=$a $(b=$b $(c=$c)?)?)?);
+    ($vis:vis fn $name:ident $($check:ident)? -> $($a:ident $($b:ident $($c:ident)?)?)?) => {
+        decode_fn!($vis fn $name $($check)? -> $(a=$a $(b=$b $(c=$c)?)?)?);
     };
 }
 
@@ -256,7 +257,7 @@ macro_rules! define_opcodes {
                     ( $(Type::$type;)? type_; )
                     $($mode)*
                 );
-                decode_fn!(pub fn $($decoder)? -> $($mode)*);
+                decode_fn!(pub fn $($decoder $name)? -> $($mode)*);
             )*
         }
 
@@ -315,10 +316,13 @@ define_opcodes! {
     ALLOC.PTR V V;                     // size align
     STORE.FX  V V;                     // ptr value
     LOAD      V;                       // ptr
-    BOX.LSV   V;                       // value (c=offset after layout)
+
+    BOX.LSV   V;
+    ABOX.LSV  X X,   decode_ABOX;      // size align
+    BREF.PTR  V;
 
     CALL.FX   V F,   decode_CALL;      // args func
-    CALLB.FX  V V F, decode_CALLB;     // idx fx bundle  (NOT inlineable)
+    CALLB.FX  V V F;                   // idx fx bundle  (NOT inlineable)
     CALLBI.FX V V F;                   // idx fx bundle  (inlineable)
     CARG.LSV  V V,   decode_CARG;      // arg next
     RES       V P,   decode_RES;       // call phi
@@ -541,6 +545,7 @@ impl Ins {
 
     decode_fn!(pub fn decode_V -> V);
     decode_fn!(pub fn decode_VV -> V V);
+    decode_fn!(pub fn decode_CALLB -> V V F); // CALLB and CALLBI
 
 }
 

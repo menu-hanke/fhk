@@ -1,5 +1,6 @@
 //! Dynamic library loading.
 
+use core::ffi::{c_void, CStr};
 use core::ops::Deref;
 use core::ptr::NonNull;
 
@@ -14,8 +15,9 @@ pub struct LibBox(NonNull<Lib>);
 
 impl Drop for LibBox {
     fn drop(&mut self) {
-        // TODO: target
-        todo!()
+        unsafe {
+            target::close(self);
+        }
     }
 }
 
@@ -26,109 +28,98 @@ impl Deref for LibBox {
     }
 }
 
-// macro_rules! dynlib {
-//     (
-//         $vis:vis struct $libname:ident {
-//             $(fn $name:ident($($pname:ident : $pty:ty),*) $(-> $rty:ty)?;)*
-//             $(sym $sname:ident: $sty:ty;)*
-//         }
-//     ) => {
-// 
-//         $vis struct $libname {
-//             lib: crate::dl::Lib,
-//             $( $name: unsafe extern "C" fn($($pty,)*) $(-> $rty)?, )*
-//             $( $sname: core::ptr::NonNull<$sty>, )*
-//         }
-// 
-//         impl $libname {
-// 
-//             pub fn init(lib: crate::dl::Lib) -> Option<Self> {
-//                 $(
-//                     let $name = unsafe {
-//                         core::mem::transmute(
-//                             lib.sym(concat!(stringify!($name), "\0").as_bytes())?.as_ptr()
-//                         )
-//                     };
-//                 )*
-//                 $(
-//                     let $sname = lib.sym(concat!(stringify!($sname), "\0").as_bytes())?.cast();
-//                 )*
-//                 Some(Self { lib, $($name,)* $($sname,)* })
-//             }
-// 
-//             #[allow(dead_code)]
-//             pub fn open(name: &[u8]) -> Option<Self> {
-//                 Self::init(crate::dl::Lib::open(name)?)
-//             }
-// 
-//             #[allow(dead_code)]
-//             pub fn open_first(name: &[u8]) -> Option<Self> {
-//                 Self::init(crate::dl::Lib::open_first(name)?)
-//             }
-// 
-//             $(
-//                 #[allow(dead_code)]
-//                 pub unsafe fn $name(&self, $($pname : $pty),*) $(-> $rty)? {
-//                     let fp: extern "C" fn($($pty),*) $(-> $rty)? = core::mem::transmute(self.$name);
-//                     fp($($pname),*)
-//                 }
-//             )*
-// 
-//         }
-// 
-//     };
-// }
-// 
-// pub(crate) use dynlib;
-
-#[cfg(unix)]
-#[allow(dead_code)]
-mod target {
-
-    use core::ffi::c_void;
-    use core::ptr::NonNull;
-
-    use alloc::borrow::Cow;
-    use alloc::vec::Vec;
-
-    pub struct Lib(NonNull<c_void>);
-
-    fn cstr(s: &[u8]) -> Cow<'_, [u8]> {
-        match s.last() {
-            Some(&0) => Cow::Borrowed(s),
-            _ => Cow::Owned({
-                let mut bytes = Vec::with_capacity(s.len()+1);
-                bytes.extend_from_slice(s);
-                bytes.push(0);
-                bytes
-            })
+pub fn open(mut name: &[u8]) -> Option<LibBox> {
+    while let Some(end) = name.iter().position(|&c| c == 0) {
+        let lib = unsafe { target::open(name.as_ptr().cast()) };
+        if lib.is_some() {
+            return lib;
         }
+        name = &name[end+1..];
     }
+    None
+}
 
-    impl Lib {
+impl Lib {
 
-        pub fn open(name: &[u8]) -> Option<Self> {
-            let ptr = unsafe { libc::dlopen(cstr(name).as_ptr().cast(), libc::RTLD_LAZY) };
-            Some(Self(NonNull::new(ptr as _)?))
-        }
-
-        pub fn sym(&self, name: &[u8]) -> *const c_void {
-            unsafe { libc::dlsym(self.0.as_ptr(), cstr(name).as_ptr().cast()) }
-        }
-
-    }
-
-    impl Drop for Lib {
-        fn drop(&mut self) {
-            unsafe {
-                libc::dlclose(self.0.as_ptr());
-            }
-        }
+    pub fn sym(&self, name: &CStr) -> *mut c_void {
+        unsafe { target::sym(self, name.as_ptr()) }
     }
 
 }
 
-#[cfg(windows)]
+macro_rules! lib {
+    (
+        $vis:vis struct $libname:ident {
+            $(fn $name:ident($($pname:ident : $pty:ty),*) $(-> $rty:ty)?;)*
+            $(extern $sname:ident: $sty:ty;)*
+        }
+    ) => {
+
+        $vis struct $libname {
+            lib: $crate::dl::LibBox,
+            $( $name: unsafe extern "C" fn($($pty,)*) $(-> $rty)?, )*
+            $( $sname: *mut $sty, )*
+        }
+
+        impl $libname {
+
+            pub fn new(lib: $crate::dl::LibBox) -> Option<Self> {
+                $(
+                    let $name = lib.sym({
+                        let name = concat!(stringify!($name), "\0");
+                        unsafe { core::ffi::CStr::from_ptr(name.as_ptr().cast()) }
+                    });
+                    if $name.is_null() { return None }
+                    let $name = unsafe { core::mem::transmute($name) };
+                )*
+                $(
+                    let $sname = lib.sym({
+                        let name = concat!(stringify!($sname), "\0");
+                        unsafe { core::ffi::CStr::from_ptr(name.as_ptr().cast()) }
+                    }) as _;
+                )*
+                Some(Self { lib, $($name,)* $($sname,)* })
+            }
+
+            $(
+                #[allow(dead_code)]
+                pub unsafe fn $name(&self, $($pname : $pty),*) $(-> $rty)? {
+                    (self.$name)($($pname),*)
+                }
+            )*
+
+        }
+
+    };
+}
+
+pub(crate) use lib;
+
+#[cfg(unix)]
 mod target {
-    /* TODO */
+
+    use core::ffi::{c_char, c_void};
+    use core::ptr::NonNull;
+
+    use super::{Lib, LibBox};
+
+    pub unsafe fn open(name: *const c_char) -> Option<LibBox> {
+        Some(LibBox(NonNull::new(libc::dlopen(name, libc::RTLD_LAZY).cast())?))
+    }
+
+    pub unsafe fn sym(lib: &Lib, name: *const c_char) -> *mut c_void {
+        // i'm not sure if const ref -> mut pointer is technically haram, but lib is zero-sized and
+        // never dereferenced in rust code so it's probably fine (?).
+        // if this is a problem, then ig the zero-sized type inside it can be wrapped in an
+        // unsafecell.
+        // but since unsafecell semantics work on byte ranges (i think?) it is not necessary (i
+        // think?).
+        libc::dlsym(lib as *const Lib as *mut Lib as *mut c_void, name) as *mut c_void
+    }
+
+    pub unsafe fn close(lib: &Lib) {
+        // see comment in sym()
+        libc::dlclose(lib as *const Lib as *mut Lib as *mut c_void);
+    }
+
 }

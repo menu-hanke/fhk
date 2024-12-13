@@ -1,11 +1,10 @@
 //! IR -> Machine code pipeline.
 
-use core::cmp::max;
 use core::mem::take;
 
 use alloc::vec::Vec;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{AbiParam, AliasRegion, ExtFuncData, ExternalName, FuncRef, GlobalValue, GlobalValueData, InstBuilder, InstInserterBase, MemFlags, Signature, StackSlot, StackSlotData, StackSlotKind, UserExternalName, Value};
+use cranelift_codegen::ir::{AbiParam, AliasRegion, ExtFuncData, ExternalName, FuncRef, GlobalValue, GlobalValueData, InstBuilder, InstInserterBase, MemFlags, StackSlot, StackSlotData, StackSlotKind, UserExternalName, Value};
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::Configurable;
 use cranelift_codegen::{FinalizedMachReloc, FinalizedRelocTarget};
@@ -21,7 +20,7 @@ use crate::index::{self, IndexVec, InvalidValue};
 use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
-use crate::mem::{Cursor, Offset, SizeClass, Slot};
+use crate::mem::{CursorA, SizeClass, Slot};
 use crate::schedule::{compute_schedule, BlockId, Gcm};
 use crate::support::{emitsupport, NativeFunc, SuppFunc};
 use crate::trace::trace;
@@ -30,15 +29,13 @@ use crate::typestate::{Absent, R, RW};
 
 pub struct Frame {
     pub slot: StackSlot,
-    size: Cursor,
-    align: Offset
+    pub layout: CursorA
 }
 
 pub struct FuncBuilder {
     pub ctx: cranelift_codegen::Context,
     pub block: cranelift_codegen::ir::Block,
     pub supp: EnumSet<SuppFunc>, // stored here for borrowing reasons
-    frame: Option<Frame>
 }
 
 // this is roughly the equivalent of
@@ -57,6 +54,7 @@ pub struct Emit {
     pub isa: OwnedTargetIsa,
     pub lang: LangState,
     pub fb: FuncBuilder,
+    pub frame: Option<Frame>, // stored here for borrowing reasons
     pub gcm: Gcm,
     pub code: IndexVec<InsId, Ins>,
     pub values: IndexVec<InsId, InsValue>,
@@ -89,6 +87,44 @@ pub const NATIVE_CALLCONV: CallConv = {
         CallConv::SystemV
     }
 };
+
+pub struct Signature<T: ?Sized=[Type]> {
+    pub cc: CallConv,
+    pub ret: u8,
+    pub sig: T
+}
+
+macro_rules! signature {
+    ($cc:expr, $($arg:ident)* $(-> $($ret:ident)*)?) => {
+        $crate::emit::Signature {
+            cc: $cc,
+            ret: 0 $( $(+ {let $ret = 1; $ret})* )?,
+            sig: [
+                $($($crate::ir::Type::$ret,)*)?
+                $($crate::ir::Type::$arg,)*
+            ]
+        }
+    };
+    ($cc:ident $($arg:ident)* $(-> $($ret:ident)*)?) => {
+        signature!(cranelift_codegen::isa::CallConv::$cc, $($arg)* $(-> $($ret)*)?)
+    };
+}
+
+pub(crate) use signature;
+
+fn ty2param(param: &mut Vec<AbiParam>, ty: &[Type]) {
+    param.extend(ty.iter().map(|&t| AbiParam::new(irt2cl(t))));
+}
+
+impl Signature {
+
+    pub fn to_cranelift(&self, sig: &mut cranelift_codegen::ir::Signature) {
+        sig.call_conv = self.cc;
+        ty2param(&mut sig.returns, &self.sig[..self.ret as usize]);
+        ty2param(&mut sig.params, &self.sig[self.ret as usize..]);
+    }
+
+}
 
 impl InsValue {
 
@@ -201,34 +237,31 @@ impl FuncBuilder {
         }
     }
 
-    pub fn frame(&mut self) -> &mut Frame {
-        self.frame.get_or_insert_with(|| Frame {
-            slot: self.ctx.func.create_sized_stack_slot(
-                       StackSlotData::new(StackSlotKind::ExplicitSlot, 0, 0)
-                   ),
-                   size: Default::default(),
-                   align: 1
-        })
-    }
-
     fn clear(&mut self) {
         self.ctx.clear();
-        self.frame = None;
     }
 
 }
 
-impl Frame {
+pub fn func_frame<'frame>(
+    ctx: &mut cranelift_codegen::Context,
+    frame: &'frame mut Option<Frame>
+) -> &'frame mut Frame {
+    frame.get_or_insert_with(|| Frame {
+        slot: ctx.func.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 0, 0)),
+        layout: Default::default()
+    })
+}
 
-    pub fn alloc(&mut self, size: Offset, align: Offset) -> Offset {
-        let ofs = self.size.alloc(size as _, align as _);
-        self.align = max(self.align, align);
-        ofs as _
+impl FuncBuilder {
+
+    pub fn frame<'frame>(&mut self, frame: &'frame mut Option<Frame>) -> &'frame mut Frame {
+        func_frame(&mut self.ctx, frame)
     }
 
 }
 
-fn makesig(signature: &mut Signature, func: &Func) {
+fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
     match func.kind {
         FuncKind::User() => todo!(),
         FuncKind::Query(_) => {
@@ -271,7 +304,7 @@ impl FuncBuilder {
 
     fn importfuncref(
         &mut self,
-        sig: Signature,
+        sig: cranelift_codegen::ir::Signature,
         name: UserExternalName,
         colocated: bool
     ) -> FuncRef {
@@ -285,7 +318,7 @@ impl FuncBuilder {
     }
 
     pub fn importfunc(&mut self, ir: &IR, fid: FuncId) -> FuncRef {
-        let mut sig = Signature::new(CallConv::Fast);
+        let mut sig = cranelift_codegen::ir::Signature::new(CallConv::Fast);
         makesig(&mut sig, &ir.funcs[fid]);
         let name = UserExternalName::new(Sym::Label as _,
             {let fid: u16 = zerocopy::transmute!(fid); fid as _});
@@ -294,15 +327,15 @@ impl FuncBuilder {
 
     pub fn importsupp(&mut self, ir: &IR, supp: SuppFunc) -> FuncRef {
         self.supp |= supp;
-        let mut sig = Signature::new(CallConv::Fast);
-        supp.signature(&mut sig);
+        let mut sig = cranelift_codegen::ir::Signature::new(CallConv::Fast);
+        supp.signature().to_cranelift(&mut sig);
         let name = UserExternalName::new(Sym::Label as _, ir.funcs.raw.len() as u32 + supp as u32);
         self.importfuncref(sig, name, true)
     }
 
     pub fn importnative(&mut self, func: NativeFunc) -> FuncRef {
-        let mut sig = Signature::new(NATIVE_CALLCONV);
-        func.signature(&mut sig);
+        let mut sig = cranelift_codegen::ir::Signature::new(NATIVE_CALLCONV);
+        func.signature().to_cranelift(&mut sig);
         self.importfuncref(sig, UserExternalName::new(Sym::Native as _, func as _), false)
     }
 
@@ -485,10 +518,10 @@ fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
 }
 
 fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
-    if let Some(frame) = &emit.fb.frame {
+    if let Some(frame) = &emit.frame {
         let slot = &mut emit.fb.ctx.func.sized_stack_slots[frame.slot];
-        slot.size = frame.size.ptr as _;
-        slot.align_shift = frame.align.ilog2() as _;
+        slot.size = frame.layout.ptr as _;
+        slot.align_shift = frame.layout.align.ilog2() as _;
     }
     if trace!(CLIF) {
         trace!("{}", emit.fb.ctx.func.display());
@@ -519,6 +552,7 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
     // TODO: sink RIGHT HERE
     emit.fb.clear();
     emit.bump.clear();
+    emit.frame = None;
     let clf = &mut emit.fb.ctx.func;
     makesig(&mut clf.signature, func);
     for (id, phis) in emit.blockparams.pairs() {
@@ -562,7 +596,7 @@ fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
         _ => {
             let emit = &mut *ecx.data;
             emit.fb.clear();
-            supp.signature(&mut emit.fb.ctx.func.signature);
+            supp.signature().to_cranelift(&mut emit.fb.ctx.func.signature);
             let entry = emit.fb.newblock();
             // supp code uses this to get function args:
             debug_assert!(entry == block2cl(BlockId::START));
@@ -622,8 +656,8 @@ impl Phase for Emit {
                 ctx: cranelift_codegen::Context::new(),
                 block: cranelift_codegen::ir::Block::reserved_value(),
                 supp: Default::default(),
-                frame: None
             },
+            frame: None,
             gcm: Default::default(),
             code: Default::default(),
             values: Default::default(),

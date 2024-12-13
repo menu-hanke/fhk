@@ -62,6 +62,10 @@ impl Primitive {
         (U8|U16|U32|U64).contains(self)
     }
 
+    pub fn size(self) -> usize {
+        self.to_ir().size()
+    }
+
 }
 
 #[derive(EnumSetType)]
@@ -101,3 +105,6 @@ impl Constructor {
 // use signed int here so that -1 can be used as a dummy (and checked via "<0")
 pub const PRI_IDX: Primitive = Primitive::I32;
 pub const IRT_IDX: ir::Type = PRI_IDX.to_ir();
+
+// for rust code dealing with indices coming from compiled code (note the sign difference)
+pub type Idx = u32;
