@@ -810,17 +810,17 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
             Some(newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Type::var(elem), dim]))
         },
         ObjectRef::GET(&GET { value, mut idx, .. }) => {
-            let mut vty = Type::var(exprtype(tcx, value));
+            let mut vty = exprtype(tcx, value);
             loop {
                 let e = newtypevar(&mut tcx.data.sub);
                 let next = newtypevar(&mut tcx.data.sub);
                 let repr = newpairtype(&mut tcx.data.sub, Type::var(e), Type::var(next));
-                unify(&mut tcx.data.sub, vty, repr);
+                unifyvar(&mut tcx.data.sub, vty, repr);
                 match idx {
                     0 => break Some(Type::var(e)),
                     _ => {
                         idx -= 1;
-                        vty = repr;
+                        vty = next;
                     }
                 }
             }
@@ -943,6 +943,23 @@ fn canondim(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
     ty
 }
 
+fn canonpair(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
+    use TypeRepr::*;
+    let mut ty = sub[tv];
+    ty = match ty.unpack() {
+        Var(i) if i == tv => Type::UNIT,
+        Var(i) => canonpair(sub, i),
+        Con(Constructor::PAIR, base) => {
+            canonpair(sub, base+1);
+            return ty;
+        },
+        Con(Constructor::UNIT, _) => ty,
+        _ => unreachable!()
+    };
+    sub[tv] = ty;
+    ty
+}
+
 // * eliminate type variables
 // * multi pri => widest type
 // * tensor<t, 0> => t
@@ -966,6 +983,10 @@ fn canonty(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
             } else {
                 return ty;
             }
+        },
+        Con(Constructor::PAIR, base) => {
+            canonpair(sub, base+1);
+            return ty;
         },
         _ => return ty
     };
