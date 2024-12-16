@@ -150,6 +150,7 @@ r_api! {
     rt fn Rf_allocVector(sexp_t: SEXPTYPE, n: R_xlen_t) -> SEXP;
     rt fn Rf_allocList(n: c_int) -> SEXP;
     rt fn Rf_setAttrib(vec: SEXP, name: SEXP, val: SEXP) -> SEXP;
+    rt fn Rf_getAttrib(vec: SEXP, name: SEXP) -> SEXP;
     rt fn Rf_length(x: SEXP) -> R_len_t;
     rt fn CDR(x: SEXP) -> SEXP;
     rt fn SETCAR(x: SEXP, y: SEXP) -> SEXP;
@@ -548,9 +549,15 @@ unsafe fn exportarray(vmctx: &mut Instance, lib: &RuntimeLibR, value: SEXP, mut 
     let size = (lib.Rf_length)(value) as usize;
     match array.borrow_mut().shape_mut() {
         [s] => *s = size as _,
-        _ => {
-            // TODO: check R_DimSymbol
-            todo!("exportarray dim>1");
+        shape => {
+            let dims = (lib.Rf_getAttrib)(value, lib.R_DimSymbol);
+            if (lib.Rf_length)(dims) != shape.len() as _ {
+                todo!("error reporting (R returned bad array shape)")
+            }
+            let data = (lib.DATAPTR)(dims) as *const u32;
+            for (i,s) in shape.iter_mut().enumerate() {
+                *s = *data.add(i);
+            }
         }
     }
     let src = (lib.DATAPTR)(value);
