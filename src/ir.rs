@@ -355,6 +355,11 @@ impl Opcode {
         (JMP|GOTO|IF|RET|TRET|UB|ABORT).contains(self)
     }
 
+    pub fn is_lang(self) -> bool {
+        use Opcode::*;
+        (LO|LOV|LOVV|LOVX|LOX|LOXX).contains(self)
+    }
+
     pub fn num_v(self) -> usize {
         Self::INPUTS_V[self as usize] as _
     }

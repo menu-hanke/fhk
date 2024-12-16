@@ -6,7 +6,8 @@ use enumset::EnumSetType;
 use logos::{Logos, Skip};
 
 use crate::compile;
-use crate::parser::{syntaxerr, Pcx, SyntaxError};
+use crate::err::ErrorMessage;
+use crate::parser::{syntaxerr, Pcx};
 
 #[derive(Debug)]
 pub struct SourceLocation {
@@ -231,7 +232,7 @@ pub fn next(pcx: &mut Pcx) -> compile::Result<Token> {
     let parser = &mut *pcx.data;
     let mut token = match parser.lex.next() {
         Some(Ok(token)) => token,
-        Some(_)         => return syntaxerr(pcx, SyntaxError::InvalidToken),
+        Some(_)         => return syntaxerr(pcx, ErrorMessage::InvalidToken),
         None            => return Ok(Token::Eof)
     };
     match token {

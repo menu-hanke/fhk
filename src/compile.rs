@@ -30,25 +30,23 @@ pub trait Phase: Sized {
     fn run(_: &mut Ccx<Self>) -> Result { Ok(()) }
 }
 
-impl Phase for Absent {
-    fn new(_: &mut Ccx<Absent>) -> Result<Self> { Ok(Self) }
-}
-
-pub unsafe trait PhaseMarker: Phase {}
-
 macro_rules! define_phases {
     ($( $name:ident $data:ty; )*) => {
         typestate_union! {
             pub union PhaseData:_PhaseData {
-                $( $name: $data ),*
+                $($name: $data),*
             }
         }
         $( unsafe impl PhaseMarker for $data {} )*
     };
 }
 
+pub unsafe trait PhaseMarker: Phase {}
+
 define_phases! {
-    ABSENT      Absent;
+    // special "pseudo"-phases
+    ABSENT      Absent;       // no phase data, can create a new one
+    // actual phases
     PARSE       Parser;
     TYPE        TypeInfer;
     LOWER       Lower;
@@ -58,8 +56,11 @@ define_phases! {
     LINK        Link;
 }
 
+impl Phase for Absent { fn new(_: &mut Ccx<Absent>) -> Result<Self> { Ok(Self) } }
+impl Phase for () { fn new(_: &mut Ccx<Absent>) -> Result<Self> { unreachable!() } }
+
 #[repr(C)] // need repr(C) for transmuting references.
-pub struct Ccx<P=Absent, O=RW, I=RW> {
+pub struct Ccx<P=(), O=RW, I=RW> {
     // current phase data
     pub data: PhaseData<P>,
     // object graph
@@ -96,7 +97,7 @@ pub struct CompilePhase<'a, P, T: PhaseMarker> {
     pub data: ManuallyDrop<T>
 }
 
-impl Ccx {
+impl Ccx<Absent> {
 
     pub const SEQ_GLOBAL: IRef<[u8]> = IRef::small_from_end_size(11, 5);
 
@@ -166,6 +167,50 @@ impl<P,I> Ccx<P, RW, I> {
 
 }
 
+pub trait CompileError<P=()> {
+    #[cold]
+    fn write(self, ccx: &mut Ccx<P, R, R>);
+}
+
+// shorthand so that you don't have to write ccx.erase().error(...) for generic errors.
+impl<T,P> CompileError<P> for T where T: CompileError<()>, P: PhaseMarker {
+    fn write(self, ccx: &mut Ccx<P, R, R>) {
+        self.write(ccx.erase())
+    }
+}
+
+impl<P,G,I> Ccx<P,G,I> {
+
+    pub fn erase(&mut self) -> &mut Ccx<(), G, I> {
+        // safety: caller cannot (safely) overwrite current phase data:
+        //   * `()` doesn't implement PhaseMarker so they can't call begin()
+        //   * there is no way to safely obtain an instance of PhaseData<()>, so they can't set
+        //     it directly
+        unsafe { transmute(self) }
+    }
+
+    #[inline(never)]
+    #[cold]
+    fn do_error<E>(&mut self, e: E)
+        where E: CompileError<P>
+    {
+        self.host.buf.clear();
+        // safety: this is basically the same as calling erase+freeze_ir+freeze_graph but without
+        // the necessary type acrobatics
+        e.write(unsafe { transmute(self) });
+    }
+
+    // this is split to avoid monomorphization for each T
+    #[inline(always)]
+    pub fn error<T,E>(&mut self, e: E) -> Result<T>
+        where E: CompileError<P>
+    {
+        self.do_error(e);
+        Err(())
+    }
+
+}
+
 impl<'a, P, T: PhaseMarker> CompilePhase<'a, P, T> {
 
     pub fn leak(self) -> &'a mut Ccx<P, RW, RW> {
@@ -190,17 +235,16 @@ impl<'a, P, T: PhaseMarker> Drop for CompilePhase<'a, P, T> {
     }
 }
 
-fn run<P: PhaseMarker>(ccx: &mut Ccx) -> Result {
+fn run<P: PhaseMarker>(ccx: &mut Ccx<Absent>) -> Result {
     P::run(ccx.begin::<P>()?.ccx)
 }
 
-impl Ccx {
+impl Ccx<Absent> {
 
     pub fn compile(&mut self) -> Result {
         run::<TypeInfer>(self)?;
         run::<Lower>(self)?;
         run::<Optimize>(self)?;
-        // run::<RemoveFx>(self)?;
         run::<ComputeLayout>(self)?;
         run::<Emit>(self)?;
         run::<Link>(self)?;

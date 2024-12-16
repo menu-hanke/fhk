@@ -104,6 +104,14 @@ local function test_result(T, results)
 	check({query.query(inst):unpack()}, true_)
 end
 
+local function pcallfail(message, f, ...)
+	local ok, err = pcall(f, ...)
+	assert(not ok, "expected fail but succeeded")
+	if not err:match(message) then
+		error(string.format("bad error message: %s", err))
+	end
+end
+
 local function test_fail(T, expr, message)
 	local query = T.G:newquery("global")
 	if type(expr) == "table" then
@@ -114,11 +122,11 @@ local function test_fail(T, expr, message)
 		query:add(expr)
 	end
 	local inst = test_newinstance(T)
-	local ok, err = pcall(query.query, inst)
-	assert(not ok, "query was supposed to fail but didn't")
-	if not err:match(message) then
-		error(string.format("bad error message: %s", err))
-	end
+	pcallfail(message, query.query, inst)
+end
+
+local function test_compilefail(T, message)
+	pcallfail(message, test_compile, T)
 end
 
 ffi.cdef [[
@@ -147,6 +155,7 @@ local function testnew()
 	env.result = bind(env, test_result)
 	env.fail = bind(env, test_fail)
 	env.compile = bind(env, test_compile)
+	env.compilefail = bind(env, test_compilefail)
 	env.newinstance = bind(env, test_newinstance)
 	env.alloc = ffi.cast("void *(*)(void *,size_t,size_t)", bind(env, test_alloc))
 	return env

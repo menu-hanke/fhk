@@ -627,20 +627,13 @@ fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
 impl Phase for Emit {
 
     fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self> {
-        let lang = LangState::new(
-            ccx,
-            ccx.ir.funcs.raw.iter()
+        let langs = ccx.ir.funcs.raw.iter()
             .flat_map(|f| f.code.pairs())
-            .filter_map(|(_,i)|
-                if (Opcode::LOV|Opcode::LOVV|Opcode::LOVX|Opcode::LOX|Opcode::LOXX)
-                .contains(i.opcode())
-                {
-                    Some(Lang::from_u8(i.decode_L().lang))
-                } else {
-                    None
-                }
-            ).collect()
-        )?;
+            .filter_map(|(_,i)| match i.opcode().is_lang() {
+                true => Some(Lang::from_u8(i.decode_L().lang)),
+                false => None
+            }).collect();
+        let lang = LangState::new(ccx.erase(), langs)?;
         let mut flag_builder = cranelift_codegen::settings::builder();
         flag_builder.set("enable_pinned_reg", "true").unwrap();
         flag_builder.set("opt_level", "speed").unwrap();

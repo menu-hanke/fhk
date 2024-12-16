@@ -14,6 +14,7 @@ mod dataflow;
 mod dl;
 mod dump;
 mod emit;
+mod err;
 mod finalize;
 mod hash;
 mod image;

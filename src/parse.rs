@@ -7,11 +7,12 @@ use enumset::{enum_set, EnumSet};
 
 use crate::bump::BumpRef;
 use crate::compile;
+use crate::err::ErrorMessage;
 use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::lex::Token;
 use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, defmacro, langerr, next, parse_name, parse_name_pattern, pushmacro, redeferr, require, save, syntaxerr, tokenerr, Binding, Namespace, ParenCounter, Pcx, SyntaxError};
+use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, Binding, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
 const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
@@ -29,7 +30,7 @@ fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(IRef<[u8]>, IRef<[u8]>)> {
 fn implicittab(pcx: &mut Pcx) -> compile::Result<ObjRef<TAB>> {
     let tab = pcx.data.tab;
     if tab.is_nil() {
-        return syntaxerr(pcx, SyntaxError::BadImplicitTab);
+        return syntaxerr(pcx, ErrorMessage::BadImplicitTab);
     }
     Ok(tab)
 }
@@ -150,7 +151,7 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
 fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
     require(pcx, Token::Ident)?;
     let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
-        else { return langerr(pcx) };
+        else { return pcx.error(LangError) };
     next(pcx)?; // skip name
     lang.parse(pcx, n)
 }
@@ -238,7 +239,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
                         ).cast();
                     }
                 },
-                _ => return tokenerr(pcx, Token::Eq | Token::Comma)
+                _ => return pcx.error(TokenError { want: Token::Eq | Token::Comma })
             }
             consume(pcx, Token::In)?;
             let value = parse_expr(pcx)?;
@@ -268,7 +269,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
         Token::Call => { next(pcx)?; Ok(parse_callx(pcx, 1)?.cast()) },
         Token::True => { next(pcx)?; Ok(ObjRef::TRUE.cast()) },
         Token::False => { next(pcx)?; Ok(ObjRef::FALSE.cast()) },
-        _ => syntaxerr(pcx, SyntaxError::ExpectedValue)
+        _ => return syntaxerr(pcx, ErrorMessage::ExpectedValue)
     }
 }
 
@@ -300,7 +301,11 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     let name = parse_name(pcx)?;
     let tab = pcx.objs.tab(name).get_or_create();
     if !pcx.objs[tab].shape.is_nil() {
-        return redeferr(pcx, Namespace::Table, name);
+        return pcx.error(DefinitionError {
+            ns: Namespace::Table,
+            body: name,
+            what: DefinitionErrorType::Redefinition
+        });
     }
     pcx.objs[tab].mark = 0;
     let base = pcx.tmp.end();
@@ -352,7 +357,7 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
         match pcx.data.token {
             Token::Comma => { next(pcx)?; if true { todo!("handle multiple outputs"); } continue; },
             Token::Eq    => { next(pcx)?; break },
-            _            => return tokenerr(pcx, Token::Comma | Token::Eq)
+            _            => return pcx.error(TokenError { want: Token::Comma | Token::Eq })
         }
     }
     let deco_base = pcx.tmp.align_for::<ObjRef<EXPR>>().end();
@@ -394,7 +399,7 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
                 next(pcx)?;
                 pcx.data.this.cast()
             },
-            _ => return tokenerr(pcx, Token::Ident)
+            _ => return pcx.error(TokenError { want: Token::Ident.into() })
         },
         _ => {
             let name = parse_name(pcx)?;
@@ -452,9 +457,9 @@ fn parse_macro_body_rec(
     while !(stop.contains(pcx.data.token) && parens.balanced()) {
         parens.token(pcx.data.token);
         match pcx.data.token {
-            Token::CapName if template => return syntaxerr(pcx, SyntaxError::CapNameInTemplate),
+            Token::CapName if template => return syntaxerr(pcx, ErrorMessage::CapNameInTemplate),
             Token::CapPos | Token::Dollar if !template
-                => return syntaxerr(pcx, SyntaxError::CapPosInBody),
+                => return syntaxerr(pcx, ErrorMessage::CapPosInBody),
             Token::Dollar => {
                 pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                 nextcap += 1;
@@ -466,7 +471,7 @@ fn parse_macro_body_rec(
                 let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
                 let idx = match pcx.data.marg.iter().position(|a| *a == name) {
                     Some(i) => i,
-                    None => return syntaxerr(pcx, SyntaxError::UndefCap)
+                    None => return syntaxerr(pcx, ErrorMessage::UndefCap),
                 };
                 pcx.tmp.push([Token::OpInsert as u8, idx as u8]);
                 nextcap = max(nextcap, idx as u8+1);
@@ -499,7 +504,7 @@ fn parse_macro_body_rec(
                                 cursor += 1;
                             },
                             Some(&(mut c)) if c.is_ascii_digit() => {
-                                if !template { return syntaxerr(pcx, SyntaxError::CapPosInBody) }
+                                if !template { return syntaxerr(pcx, ErrorMessage::CapPosInBody) }
                                 let mut idx = 0;
                                 loop {
                                     idx = 10*idx + c-b'0';
@@ -512,7 +517,7 @@ fn parse_macro_body_rec(
                                 nextcap = max(nextcap, idx+1);
                             },
                             Some(&(mut c)) if c.is_ascii_alphanumeric() || c == b'_' => {
-                                if template { return syntaxerr(pcx, SyntaxError::CapNameInTemplate) }
+                                if template { return syntaxerr(pcx, ErrorMessage::CapNameInTemplate) }
                                 let start = cursor;
                                 loop {
                                     cursor += 1;
@@ -522,16 +527,16 @@ fn parse_macro_body_rec(
                                 }
                                 let cap = match pcx.intern.find(&data[start..cursor]) {
                                     Some(r) => r,
-                                    None => return syntaxerr(pcx, SyntaxError::UndefCap)
+                                    None => return syntaxerr(pcx, ErrorMessage::UndefCap)
                                 }.cast();
                                 let idx = match pcx.data.marg.iter().position(|a| *a == cap) {
                                     Some(i) => i,
-                                    None => return syntaxerr(pcx, SyntaxError::UndefCap)
+                                    None => return syntaxerr(pcx, ErrorMessage::UndefCap)
                                 };
                                 pcx.tmp.push([Token::OpInsert as u8, idx as _]);
                             },
                             _ => {
-                                if !template { return syntaxerr(pcx, SyntaxError::CapPosInBody) }
+                                if !template { return syntaxerr(pcx, ErrorMessage::CapPosInBody) }
                                 pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                                 nextcap += 1;
                             }
@@ -637,7 +642,7 @@ fn parse_toplevel(pcx: &mut Pcx) -> compile::Result {
                     _            => parse_snippet(pcx)
                 }?
             },
-            _ => return tokenerr(pcx, TOPLEVEL_KEYWORDS)
+            _ => return pcx.error(TokenError { want: TOPLEVEL_KEYWORDS })
         }
         pcx.data.bindings.clear();
     }

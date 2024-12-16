@@ -84,17 +84,14 @@ lua_api! {
     fn luaL_openlibs(L: *mut lua_State);
     fn luaL_loadbuffer(L: *mut lua_State, buff: *const u8, sz: usize, name: *const c_char) -> c_int;
     fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int);
-    fn lua_pcall(L: *mut lua_State, nargs: c_int, nresults: c_int, errfunc: c_int) -> c_int;
     fn lua_gettop(L: *mut lua_State) -> c_int;
     fn lua_settop(L: *mut lua_State, idx: c_int);
     fn lua_type(L: *mut lua_State, idx: c_int) -> c_int;
     fn lua_pushnumber(L: *mut lua_State, n: f64);
     fn lua_pushlstring(L: *mut lua_State, s: *const u8, n: isize);
-    fn lua_pushnil(L: *mut lua_State);
     fn lua_pushvalue(L: *mut lua_State, idx: c_int);
     fn lua_tointeger(L: *mut lua_State, idx: c_int) -> isize;
     fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
-    fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int;
     fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int);
     fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char);
     fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: c_int);
@@ -445,12 +442,13 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
     lib.lua_pushnumber(L, fhk_swap as usize as _);
     lib.lua_call(L, 2, 2);
     if lib.lua_type(L, -2) == LUA_TNIL {
-        // TODO: return error message
-        todo!()
+        let msg = lib.lua_tolstring(L, -1, core::ptr::null_mut());
+        ccx.error(CStr::from_ptr(msg))
+    } else {
+        let mem = lib.lua_tointeger(L, -2);
+        lib.lua_settop(L, -3);
+        Ok(mem as _)
     }
-    let mem = lib.lua_tointeger(L, -2);
-    lib.lua_settop(L, -3);
-    Ok(mem as _)
 }
 
 fn emitcall(ecx: &mut Ecx, id: InsId) -> InsValue {

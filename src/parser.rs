@@ -10,13 +10,14 @@ use hashbrown::hash_map::Entry;
 use logos::Logos;
 
 use crate::bump::Bump;
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, CompileError, Phase};
+use crate::err::ErrorMessage;
 use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
 use crate::intern::{Intern, IRef};
 use crate::lex::{self, Token};
 use crate::obj::{ObjRef, EXPR, TAB};
-use crate::typestate::{typestate_union, Absent};
+use crate::typestate::{typestate_union, Absent, R};
 
 index!(pub struct ScopeId(u32) invalid(!0));
 index!(struct MacroId(u32) invalid(!0));
@@ -80,33 +81,10 @@ pub struct Parser<L=Absent> {
     snippet: Vec<u8>,
 }
 
-pub type Pcx<'a> = Ccx<Parser<logos::Lexer<'a, Token>>>;
+pub type PcxData<'a> = Parser<logos::Lexer<'a, Token>>;
+pub type Pcx<'a> = Ccx<PcxData<'a>>;
 
-#[derive(Clone, Copy)]
-pub enum SyntaxError {
-    InvalidToken,
-    ExpectedValue,
-    CapNameInTemplate,
-    CapPosInBody,
-    UndefCap,
-    BadImplicitTab
-}
-
-impl SyntaxError {
-
-    fn str(self) -> &'static str {
-        use SyntaxError::*;
-        match self {
-            InvalidToken       => "invalid token",
-            ExpectedValue      => "expected value",
-            CapNameInTemplate  => "named capture not allowed in templates",
-            CapPosInBody       => "positional capture not allowed in macro body",
-            UndefCap           => "undefined capture",
-            BadImplicitTab     => "implicit table not allowed here"
-        }
-    }
-
-}
+/* ---- Stringify ----------------------------------------------------------- */
 
 #[derive(Clone, Copy)]
 pub enum SequenceType {
@@ -187,6 +165,8 @@ pub fn stringify(buf: &mut Bump, intern: &Intern, body: &[u8], sty: SequenceType
     }
 }
 
+/* ---- Error messages ------------------------------------------------------ */
+
 fn nsname(ns: Namespace) -> &'static str {
     use Namespace::*;
     match ns {
@@ -198,7 +178,7 @@ fn nsname(ns: Namespace) -> &'static str {
     }
 }
 
-fn traceback(pcx: &mut Pcx) {
+fn traceback(pcx: &mut Ccx<PcxData, R, R>) {
     use Namespace::*;
     for frame in pcx.data.stack.iter().rev() {
         pcx.host.buf.write(nsname(frame.ns));
@@ -247,72 +227,81 @@ fn traceback(pcx: &mut Pcx) {
     write!(pcx.host.buf, "on line {} col {}", loc.line, loc.col).unwrap();
 }
 
-#[cold]
-fn syntaxerr_(pcx: &mut Pcx, error: SyntaxError) {
-    pcx.host.buf.clear();
-    write!(pcx.host.buf, "syntax error: {}\n", error.str()).unwrap();
-    traceback(pcx);
+#[derive(Clone, Copy)]
+pub struct SyntaxError {
+    pub message: ErrorMessage
 }
 
-pub fn syntaxerr<T>(pcx: &mut Pcx, error: SyntaxError) -> compile::Result<T> {
-    syntaxerr_(pcx, error);
-    Err(())
-}
-
-#[cold]
-fn tokenerr_(pcx: &mut Pcx, want: EnumSet<Token>) {
-    pcx.host.buf.clear();
-    write!(pcx.host.buf, "unexpected token: `{}` (expected ", pcx.data.token.str()).unwrap();
-    let mut comma = "";
-    for tok in want {
-        write!(pcx.host.buf, "{}`{}`", comma, tok.str()).unwrap();
-        comma = ", ";
+impl<'a> CompileError<PcxData<'a>> for SyntaxError {
+    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        write!(pcx.host.buf, "syntax error: {}\n", self.message.str()).unwrap();
+        traceback(pcx);
     }
-    pcx.host.buf.write(b")\n");
-    traceback(pcx)
 }
 
-pub fn tokenerr<T>(pcx: &mut Pcx, want: impl Into<EnumSet<Token>>) -> compile::Result<T> {
-    tokenerr_(pcx, want.into());
-    Err(())
+pub fn syntaxerr<T>(pcx: &mut Pcx, message: ErrorMessage) -> compile::Result<T> {
+    pcx.error(SyntaxError { message })
 }
 
-#[cold]
-fn xdeferr_(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>, what: &str) {
-    pcx.host.buf.clear();
-    pcx.host.buf.write(what);
-    pcx.host.buf.write(nsname(ns));
-    stringify(
-        &mut pcx.host.buf,
-        &pcx.intern,
-        pcx.intern.get_slice(body.cast()),
-        SequenceType::Body
-    );
-    pcx.host.buf.push(b'\n');
-    traceback(pcx)
+#[derive(Clone, Copy)]
+pub struct TokenError {
+    pub want: EnumSet<Token>
 }
 
-pub fn undeferr<T>(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>) -> compile::Result<T> {
-    xdeferr_(pcx, ns, body, "undefined ");
-    Err(())
+impl<'a> CompileError<PcxData<'a>> for TokenError {
+    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        write!(pcx.host.buf, "unexpected token: `{}` (expected ", pcx.data.token.str()).unwrap();
+        let mut comma = "";
+        for tok in self.want {
+            write!(pcx.host.buf, "{}`{}`", comma, tok.str()).unwrap();
+            comma = ", ";
+        }
+        pcx.host.buf.write(b")\n");
+        traceback(pcx)
+    }
 }
 
-pub fn redeferr<T>(pcx: &mut Pcx, ns: Namespace, body: IRef<[u8]>) -> compile::Result<T> {
-    xdeferr_(pcx, ns, body, "redefinition of ");
-    Err(())
+#[derive(Clone, Copy)]
+pub enum DefinitionErrorType {
+    Undefined,
+    Redefinition
 }
 
-#[cold]
-fn langerr_(pcx: &mut Pcx) {
-    pcx.host.buf.clear();
-    pcx.host.buf.write(b"unsupported language: ");
-    pcx.host.buf.write(pcx.intern.get_slice::<u8>(zerocopy::transmute!(pcx.data.tdata)));
+pub struct DefinitionError {
+    pub ns: Namespace,
+    pub body: IRef<[u8]>,
+    pub what: DefinitionErrorType
 }
 
-pub fn langerr<T>(pcx: &mut Pcx) -> compile::Result<T> {
-    langerr_(pcx);
-    Err(())
+impl<'a> CompileError<PcxData<'a>> for DefinitionError {
+    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        pcx.host.buf.write(match self.what {
+            DefinitionErrorType::Undefined => "undefined ",
+            DefinitionErrorType::Redefinition => "redefinition of"
+        });
+        pcx.host.buf.write(nsname(self.ns));
+        stringify(
+            &mut pcx.host.buf,
+            &pcx.intern,
+            pcx.intern.get_slice(self.body.cast()),
+            SequenceType::Body
+        );
+        pcx.host.buf.push(b'\n');
+        traceback(pcx)
+    }
 }
+
+#[derive(Clone, Copy)]
+pub struct LangError;
+
+impl<'a> CompileError<PcxData<'a>> for LangError {
+    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        pcx.host.buf.write(b"unsupported language: ");
+        pcx.host.buf.write(pcx.intern.get_slice::<u8>(zerocopy::transmute!(pcx.data.tdata)));
+    }
+}
+
+/* ---- Macros -------------------------------------------------------------- */
 
 fn splitstem(mut name: &[u8]) -> IRef<[u8]> {
     if name[0] == Token::Scope as _ {
@@ -548,6 +537,8 @@ pub fn pushtemplate(pcx: &mut Pcx, template: IRef<[u8]>, cap: &[IRef<[u8]>]) -> 
     next(pcx)
 }
 
+/* ---- Parsing ------------------------------------------------------------- */
+
 fn parse_name_seq(pcx: &mut Pcx, sty: SequenceType) -> compile::Result<IRef<[u8]>> {
     let base = pcx.tmp.end();
     save(pcx);
@@ -682,7 +673,11 @@ pub fn next(pcx: &mut Pcx) -> compile::Result {
                     frame.lookahead_data = data;
                     next(pcx)
                 },
-                None => undeferr(pcx, Namespace::Snippet, name)
+                None => pcx.error(DefinitionError {
+                    ns: Namespace::Snippet,
+                    body: name,
+                    what: DefinitionErrorType::Undefined
+                })
             }
         },
         token => {
@@ -705,7 +700,7 @@ pub fn require(pcx: &mut Pcx, token: Token) -> compile::Result<u32> {
     if pcx.data.token == token {
         Ok(pcx.data.tdata)
     } else {
-        tokenerr(pcx, token)
+        pcx.error(TokenError { want: token.into() })
     }
 }
 
@@ -765,6 +760,8 @@ pub fn parse<'a,F,R>(ccx: &'a mut Ccx<Parser>, input: &'a [u8], func: F) -> comp
     unsafe { core::ptr::drop_in_place(&mut pcx.data.lex) }
     result
 }
+
+/* -------------------------------------------------------------------------- */
 
 impl Phase for Parser {
 
