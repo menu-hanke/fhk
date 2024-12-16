@@ -149,6 +149,7 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
 }
 
 fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    consume(pcx, Token::Call)?;
     require(pcx, Token::Ident)?;
     let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
         else { return pcx.error(LangError) };
@@ -231,7 +232,6 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
                         n += 1;
                     }
                     consume(pcx, Token::Eq)?;
-                    consume(pcx, Token::Call)?;
                     let call = parse_callx(pcx, n)?;
                     for i in 0..n {
                         pcx.data.bindings[base+i].value = pcx.objs.push(
@@ -266,7 +266,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             next(pcx)?;
             Ok(pcx.objs.push(o).cast())
         }
-        Token::Call => { next(pcx)?; Ok(parse_callx(pcx, 1)?.cast()) },
+        Token::Call => Ok(parse_callx(pcx, 1)?.cast()),
         Token::True => { next(pcx)?; Ok(ObjRef::TRUE.cast()) },
         Token::False => { next(pcx)?; Ok(ObjRef::FALSE.cast()) },
         _ => return syntaxerr(pcx, ErrorMessage::ExpectedValue)
@@ -332,20 +332,9 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     Ok(())
 }
 
-fn deconstruct(pcx: &mut Pcx, value: ObjRef<EXPR>, num: usize) {
-    match num {
-        0 => {},
-        1 => {
-            pcx.tmp.push(value);
-        },
-        _ => for i in 0..num as u8 {
-            pcx.tmp.push(pcx.objs.push(GET::new(i, ObjRef::NIL, value)));
-        }
-    }
-}
-
 fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::Result {
     let base = pcx.tmp.end();
+    let mut n = 1;
     loop {
         let var = parse_vref(pcx)?;
         pcx.objs[var].mark = 0;
@@ -355,19 +344,21 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
         }
         pcx.tmp.push(pcx.objs.push(VSET::new(var, ObjRef::NIL.cast())));
         match pcx.data.token {
-            Token::Comma => { next(pcx)?; if true { todo!("handle multiple outputs"); } continue; },
+            Token::Comma => { n += 1; next(pcx)?; continue; },
             Token::Eq    => { next(pcx)?; break },
             _            => return pcx.error(TokenError { want: Token::Comma | Token::Eq })
         }
     }
-    let deco_base = pcx.tmp.align_for::<ObjRef<EXPR>>().end();
     let vset_base = base.cast_up::<ObjRef<VSET>>();
-    let num = deco_base.size_index() - vset_base.size_index();
-    let value = parse_expr(pcx)?;
-    deconstruct(pcx, value, num);
-    for i in (0..num as isize).rev() {
-        let vset = pcx.tmp[vset_base.add_size(i)];
-        pcx.objs[vset].value = pcx.tmp[deco_base.add_size(i)]
+    if n == 1 {
+        let value = parse_expr(pcx)?;
+        pcx.objs[pcx.tmp[vset_base]].value = value;
+    } else {
+        let call = parse_callx(pcx, n)?;
+        for (i, &vset) in pcx.tmp[vset_base..].iter().enumerate() {
+            let value = pcx.objs.push(GET::new(i as _, ObjRef::NIL, call.cast()));
+            pcx.objs[vset].value = value.cast();
+        }
     }
     let guard = match check(pcx, Token::Where)? {
         true  => Some(parse_expr(pcx)?),
@@ -381,7 +372,7 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
     // pcx.data.tab is guaranteed to be set here because we came here from parse_model
     pcx.objs.push_args::<MOD>(
         MOD::new(IRef::EMPTY, pcx.data.tab, guard),
-        cast_args(&pcx.tmp[vset_base..deco_base.cast::<ObjRef<VSET>>()])
+        cast_args(&pcx.tmp[vset_base..])
     );
     pcx.tmp.truncate(base);
     Ok(())
