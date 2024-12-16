@@ -1565,7 +1565,7 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
                     explicitdim -= d as usize;
                     let (j,s) = match explicitdim {
                         0 /* outermost explicit dimension */ => {
-                            let s = computeshape(lcx, ctr, i);
+                            let s = emitshape(lcx, ctr, i);
                             let j = emititer(lcx, &mut reduce.loop_, i);
                             if let Some((start, out)) = innerloop {
                                 lcx.data.func.code.set(reduce.loop_.body, start);
