@@ -144,7 +144,6 @@ local function makegetter(e, n)
 		buf:put("return self.e[i1]\n")
 	end
 	buf:put("end")
-	print(buf)
 	return load(buf)()
 end
 
@@ -221,7 +220,6 @@ local function tensor_ctype(e, n)
 	buf:put("struct {\n")
 	putflatrepr(e, buf, 1)
 	buf:putf("%s n[%d];\n}", IDX_CTYPE, n)
-	print(buf)
 	local inner = e
 	while true do
 		local meta = metadata(inner)
