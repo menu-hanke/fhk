@@ -237,14 +237,14 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
     let mut args = func.code.push(Ins::NOP(Type::LSV));
     let [call] = areserve(func);
     let callx = &lcx.objs[obj];
-    let out = reserve(func, decomposition_size(&lcx.objs, callx.ann));
+    let ds = decomposition_size(&lcx.objs, callx.ann);
+    let mut out = reserve(func, ds) + ds as isize;
     let outann = match lcx.objs.get(callx.ann) {
         ObjectRef::TTUP(TTUP { elems, .. }) => elems,
         _ => &[callx.ann],
     };
-    let mut curout = out;
     let base = lcx.tmp.end();
-    for &a in outann {
+    for &a in outann.iter().rev() {
         let [abox] = areserve(func);
         let ty = func.code.push(Ins::KREF(zerocopy::transmute!(a)));
         let output = func.code.push(Ins::LOVV(Type::LSV, abox, ty, LangOp::R(LOP_OUTPUT)));
@@ -252,7 +252,10 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
         let ptr = func.code.push(Ins::BREF(abox));
         let ptr = func.code.push(Ins::MOVF(Type::PTR, ptr, call));
         let mut cursor = CursorA::default();
-        for &ty in &*decomposition(&lcx.objs, a, &mut lcx.tmp) {
+        let deco = decomposition(&lcx.objs, a, &mut lcx.tmp);
+        out -= deco.len() as isize;
+        let mut curout = out;
+        for &ty in &*deco {
             let ofs = cursor.alloc_type(ty);
             let ofs = func.code.push(Ins::KINT(Type::I64, ofs as _));
             let ptr = func.code.push(Ins::ADDP(ptr, ofs));
