@@ -11,6 +11,8 @@ use crate::typestate::R;
 pub enum ErrorMessage {
     InvalidToken,
     ExpectedValue,
+    ExpectedPrimitive,
+    ExpectedType,
     CapNameInTemplate,
     CapPosInBody,
     UndefCap,
@@ -24,6 +26,8 @@ impl ErrorMessage {
         match self {
             InvalidToken       => "invalid token",
             ExpectedValue      => "expected value",
+            ExpectedPrimitive  => "expected scalar type name",
+            ExpectedType       => "expected type",
             CapNameInTemplate  => "named capture not allowed in templates",
             CapPosInBody       => "positional capture not allowed in macro body",
             UndefCap           => "undefined capture",

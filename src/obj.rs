@@ -639,12 +639,14 @@ impl Objects {
     }
 
     pub fn annotate(&mut self, idx: ObjRef<EXPR>, ann: ObjRef) {
-        if self[idx].ann.is_nil() {
-            self[idx].ann = ann;
-        } else {
-            // TODO: unify annotations. either do it right here, or leave a hint for type
-            // inference.
-            todo!()
+        if !ann.is_nil() {
+            if self[idx].ann.is_nil() {
+                self[idx].ann = ann;
+            } else {
+                // TODO: unify annotations. either do it right here, or leave a hint for type
+                // inference.
+                todo!()
+            }
         }
     }
 

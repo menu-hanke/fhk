@@ -97,6 +97,8 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
             false => None
         };
     }
+    // TODO: just make this special syntax, eg. a load keyword or something, since it always
+    // requires a type annotation and this is a mess.
     if stem == b"load" {
         let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
         let ty: [u8; 4] = tail[3..7].try_into().unwrap();
@@ -157,6 +159,43 @@ fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
     lang.parse(pcx, n)
 }
 
+// TODO: this can't parse nested arrays etc. (should those even be exposed to the user?)
+fn parse_typeann(pcx: &mut Pcx) -> compile::Result<ObjRef/*TY*/> {
+    let mut ty = match check(pcx, Token::Ident)? {
+        true => {
+            let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+            match Primitive::from_name(pcx.intern.get_slice(name)) {
+                Some(pri) => pcx.objs.push(TPRI::new(pri as _)).erase(),
+                None => return syntaxerr(pcx, ErrorMessage::ExpectedPrimitive)
+            }
+        },
+        false => ObjRef::NIL
+    };
+    if check(pcx, Token::LBracket)? {
+        let mut dim = 0;
+        while pcx.data.token != Token::RBracket {
+            consume(pcx, Token::Colon)?;
+            dim += 1;
+            if !check(pcx, Token::Comma)? { break }
+        }
+        consume(pcx, Token::RBracket)?;
+        // shorthand: [] is the same as [:]
+        dim = max(dim, 1);
+        ty = pcx.objs.push(TTEN::new(dim as _, ty)).erase();
+    }
+    if ty.is_nil() {
+        return syntaxerr(pcx, ErrorMessage::ExpectedType);
+    }
+    Ok(ty)
+}
+
+fn parse_maybeann(pcx: &mut Pcx) -> compile::Result<ObjRef/*TY*/> {
+    Ok(match check(pcx, Token::Colon)? {
+        true  => parse_typeann(pcx)?,
+        false => ObjRef::NIL
+    })
+}
+
 // ORDER BINOP
 const PRIORITY: &'static [(u8, u8)] = &[
     (1,1), // or
@@ -215,35 +254,46 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
         },
         Token::Let => {
             next(pcx)?;
-            let base = pcx.data.bindings.len();
+            let bindbase = pcx.data.bindings.len();
             let name = parse_name(pcx)?;
+            let ann = parse_maybeann(pcx)?;
             match pcx.data.token {
                 Token::Eq => {
                     next(pcx)?;
                     let value = parse_expr(pcx)?;
+                    pcx.objs.annotate(value, ann);
                     pcx.data.bindings.push(Binding { name, value });
                 },
                 Token::Comma => {
-                    pcx.data.bindings.push(Binding { name, value: ObjRef::NIL.cast() });
-                    let mut n = 1;
+                    #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+                    #[repr(C)]
+                    struct PendingBinding { name: IRef<[u8]>, ann: ObjRef }
+                    let base = pcx.tmp.end();
+                    pcx.tmp.push(PendingBinding { name, ann });
                     while check(pcx, Token::Comma)? {
                         let name = parse_name(pcx)?;
-                        pcx.data.bindings.push(Binding { name, value: ObjRef::NIL.cast() });
-                        n += 1;
+                        let ann = parse_maybeann(pcx)?;
+                        pcx.tmp.push(PendingBinding { name, ann });
                     }
                     consume(pcx, Token::Eq)?;
+                    let n = pcx.tmp[base.cast_up::<PendingBinding>()..].len();
                     let call = parse_callx(pcx, n)?;
-                    for i in 0..n {
-                        pcx.data.bindings[base+i].value = pcx.objs.push(
-                            GET::new(i as _, ObjRef::NIL, call.cast())
-                        ).cast();
-                    }
+                    pcx.data.bindings.extend(
+                        pcx.tmp[base.cast_up::<PendingBinding>()..]
+                        .iter()
+                        .enumerate()
+                        .map(|(i,&PendingBinding { name, ann })| Binding {
+                            name,
+                            value: pcx.objs.push(GET::new(i as _, ann, call.cast())).cast()
+                        })
+                    );
+                    pcx.tmp.truncate(base);
                 },
                 _ => return pcx.error(TokenError { want: Token::Eq | Token::Comma })
             }
             consume(pcx, Token::In)?;
             let value = parse_expr(pcx)?;
-            pcx.data.bindings.truncate(base);
+            pcx.data.bindings.truncate(bindbase);
             Ok(value)
         },
         tok @ (Token::Minus | Token::Not) => {
@@ -333,8 +383,10 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
 }
 
 fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::Result {
+    #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+    #[repr(C)]
+    struct PendingVset { var: ObjRef<VAR>, value: ObjRef<EXPR>, ann: ObjRef }
     let base = pcx.tmp.end();
-    let mut n = 1;
     loop {
         let var = parse_vref(pcx)?;
         pcx.objs[var].mark = 0;
@@ -342,23 +394,29 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
             if true { todo!(); } // TODO: parse subset
             consume(pcx, Token::RBracket)?;
         }
-        pcx.tmp.push(pcx.objs.push(VSET::new(var, ObjRef::NIL.cast())));
+        let ann = parse_maybeann(pcx)?;
+        pcx.tmp.push(PendingVset { var, ann, value: ObjRef::NIL.cast() });
         match pcx.data.token {
-            Token::Comma => { n += 1; next(pcx)?; continue; },
+            Token::Comma => { next(pcx)?; continue; },
             Token::Eq    => { next(pcx)?; break },
             _            => return pcx.error(TokenError { want: Token::Comma | Token::Eq })
         }
     }
-    let vset_base = base.cast_up::<ObjRef<VSET>>();
+    let pending_base = base.cast_up::<PendingVset>();
+    let n = pcx.tmp[pending_base..].len();
     if n == 1 {
-        let value = parse_expr(pcx)?;
-        pcx.objs[pcx.tmp[vset_base]].value = value;
+        pcx.tmp[pending_base].value = parse_expr(pcx)?;
     } else {
         let call = parse_callx(pcx, n)?;
-        for (i, &vset) in pcx.tmp[vset_base..].iter().enumerate() {
-            let value = pcx.objs.push(GET::new(i as _, ObjRef::NIL, call.cast()));
-            pcx.objs[vset].value = value.cast();
+        for (i, p) in pcx.tmp[pending_base..].iter_mut().enumerate() {
+            p.value = pcx.objs.push(GET::new(i as _, ObjRef::NIL, call.cast())).cast();
         }
+    }
+    let vset_base = pcx.tmp.end().cast::<ObjRef<VSET>>();
+    for i in 0..n {
+        let PendingVset { var, value, ann } = pcx.tmp[pending_base.add_size(i as _)];
+        pcx.objs.annotate(value, ann);
+        pcx.tmp.push(pcx.objs.push(VSET::new(var, value)));
     }
     let guard = match check(pcx, Token::Where)? {
         true  => Some(parse_expr(pcx)?),

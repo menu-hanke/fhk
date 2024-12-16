@@ -496,7 +496,10 @@ fn createtype(tcx: &mut Tcx, idx: ObjRef) -> Type {
         ObjectRef::TVAR(_) => Type::var(newtypevar(&mut tcx.data.sub)),
         ObjectRef::TPRI(&TPRI { ty, .. }) => Type::pri(EnumSet::from_u16_truncated(1 << ty)),
         ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
-            let e = createtype(tcx, elem);
+            let e = match elem.is_nil() {
+                true  => Type::var(newtypevar(&mut tcx.data.sub)),
+                false => createtype(tcx, elem)
+            };
             let d = createdimtype(&mut tcx.data, dim);
             newcontype(&mut tcx.data.sub, Constructor::Tensor, &[e, d])
         },
