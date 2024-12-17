@@ -541,7 +541,10 @@ fn parse_macro_body_rec(
                         // INVARIANT: here cursor points at '$'
                         if cursor > base {
                             pcx.tmp.push(Token::Literal as u8);
-                            pcx.tmp.push(pcx.intern.intern_range(base..cursor));
+                            // write it this way so that it doesn't add padding for alignment.
+                            let lit: [u8; 4] = zerocopy::transmute!(
+                                pcx.intern.intern_range(base..cursor));
+                            pcx.tmp.push(lit);
                             data = pcx.intern.bump().as_slice();
                         }
                         if cursor >= end { break; }
@@ -593,6 +596,7 @@ fn parse_macro_body_rec(
                         base = cursor;
                         while cursor < end && data[cursor] != b'$' { cursor += 1 }
                     }
+                    pcx.tmp.push(Token::OpLiteralBoundary as u8);
                 } else {
                     save(pcx);
                 }

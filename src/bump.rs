@@ -395,10 +395,18 @@ impl<W: Aligned> Bump<W> {
         BumpRef(ptr/T::ALIGN as u32, PhantomData)
     }
 
-    pub fn write_range<T>(&mut self, _range: Range<BumpRef<T>>) -> BumpRef<T>
+    pub fn write_range<T>(&mut self, range: Range<BumpRef<T>>) -> BumpRef<T>
         where T: FromBytes + IntoBytes
     {
-        todo!()
+        let Range { start, end } = range;
+        let len = end.size_index() - start.size_index();
+        let (ptr, data) = self.reserve_dst::<[T]>(len);
+        let data = data as *mut [T] as *mut T;
+        unsafe {
+            let src = self.ptr.as_ptr().cast::<T>().add(start.size_index());
+            core::ptr::copy_nonoverlapping(src, data, len);
+        }
+        ptr.cast()
     }
 
     pub fn extend<I>(&mut self, iter: I) -> BumpRef<I::Item>

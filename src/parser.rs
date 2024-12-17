@@ -622,12 +622,23 @@ fn expandnext(pcx: &mut Pcx) -> Option<Token> {
     }
 }
 
+// TODO 1: this should share code with stringify
+// TODO 2: this is the only user of intern.intern_consume_from(). this should be changed to use
+//         pcx.tmp as workspace so that intern_consume_from (and related writer functions) can be
+//         removed
 fn expandstring(pcx: &mut Pcx) {
     let start = pcx.intern.bump().end();
+    let mut space = false;
     loop {
         // this should never return none, because the recorder should never record
         // incomplete strings
-        match expandnext(pcx).unwrap() {
+        let token = expandnext(pcx).unwrap();
+        let tsp = SPACE_BETWEEN & (1 << token as u64) != 0;
+        if space && tsp {
+            pcx.intern.write(&b' ');
+        }
+        space = tsp;
+        match token {
             Token::OpLiteralBoundary => break,
             Token::Ident | Token::Literal => pcx.intern.write_ref(
                 zerocopy::transmute!(pcx.data.tdata)),

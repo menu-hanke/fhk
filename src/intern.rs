@@ -152,6 +152,10 @@ unsafe fn bytesmatch(data: *const u8, r: RawRef, bytes: &[u8]) -> bool {
     }
 }
 
+unsafe fn refmatch(bump: &[u8], r: RawRef, bytes: &[u8], align: u32) -> bool {
+    r.end() & (align - 1) == 0 && bytesmatch(bump.as_ptr(), r, bytes)
+}
+
 unsafe fn refdata<'a>(data: *const u8, r: RawRef) -> &'a [u8] {
     let raw_size = r.raw_size() as usize;
     let end = r.end() as usize;
@@ -175,7 +179,7 @@ unsafe fn entry<'tab, 'short>(
         fxhash(bytes),
         // note: this tests that the *end* is aligned, which works as long as size is a multiple
         // of alignment.
-        |&r| r.end() & (align - 1) == 0 && bytesmatch(bump.as_ptr(), r, bytes),
+        |&r| refmatch(bump, r, bytes, align),
         |&r| fxhash(refdata(bump.as_ptr(), r))
     )
 }
@@ -232,10 +236,7 @@ impl Intern {
         where T: ?Sized + Aligned + bump::IntoBytes
     {
         let bytes = unsafe {
-            core::slice::from_raw_parts(
-                value as *const T as *const u8,
-                size_of_val(value)
-            )
+            core::slice::from_raw_parts(value as *const T as *const u8, size_of_val(value))
         };
         IRef(internbytes(self, bytes, T::ALIGN as _), PhantomData)
     }
@@ -247,14 +248,28 @@ impl Intern {
         self.intern_consume_from(base).cast()
     }
 
-    pub fn intern_range(&mut self, _range: Range<usize>) -> IRef<[u8]> {
-        todo!()
+    pub fn find<T>(&self, value: &T) -> Option<IRef<T>>
+        where T: ?Sized + Aligned + bump::IntoBytes
+    {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(value as *const T as *const u8, size_of_val(value))
+        };
+        self.tab.find(
+            fxhash(bytes),
+            |&r| unsafe { refmatch(self.bump.as_slice(), r, bytes, T::ALIGN as _) }
+        ).map(|&r| IRef(r, PhantomData))
     }
 
-    pub fn find<T>(&self, _value: &T) -> Option<IRef<T>>
-        where T: ?Sized + bump::IntoBytes
-    {
-        todo!()
+    pub fn intern_range(&mut self, range: Range<usize>) -> IRef<[u8]> {
+        let Range { start, end } = range;
+        let bytes = self.bump.as_slice();
+        IRef(match unsafe { entry(&mut self.tab, bytes, &bytes[start..end], 1) } {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                self.bump.write_range::<u8>(BumpRef::from_offset(start)..BumpRef::from_offset(end));
+                *e.insert(newref(&mut self.bump, end-start)).get()
+            }
+        }, PhantomData)
     }
 
     pub fn get_range(&self, r: IRef<[u8]>) -> Range<usize> {
