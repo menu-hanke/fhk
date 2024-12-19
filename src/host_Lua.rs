@@ -1,7 +1,6 @@
 //! Lua host support.
 
 use core::ffi::{c_char, c_int, c_void};
-use core::pin::Pin;
 use core::u64;
 
 use alloc::boxed::Box;
@@ -230,18 +229,12 @@ unsafe extern "C" fn fhk_newinstance(
     udata: *mut c_void,
     prev: *const fhk_Instance,
     reset: u64
-) -> Pin<&mut fhk_Instance> {
-    let mem = alloc(udata, image.size as _, align_of::<Instance>());
-    if !prev.is_null() {
-        // should this go in image.rs as well?
-        core::ptr::copy_nonoverlapping(prev as *const u8, mem, image.size as _);
-    }
+) -> *mut fhk_Instance {
     // TODO: only reset if this query depends on the reset mask (save mask for queries too)
     // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
-    image.reset(mem, reset);
-    let mem = mem as *mut Instance;
-    (*mem).host = HostInst { alloc, udata, err: core::ptr::null() };
-    Pin::new_unchecked(&mut *mem)
+    let inst = image.newinstance(prev, reset, |size, align| alloc(udata, size, align));
+    (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
+    inst
 }
 
 macro_rules! define_api {

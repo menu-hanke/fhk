@@ -1,10 +1,12 @@
 //! Runtime support functions.
 
+use core::mem::replace;
+
 use cranelift_codegen::ir::{InstBuilder, TrapCode};
 use enumset::EnumSetType;
 
 use crate::emit::{block2cl, signature, Ecx, Signature, NATIVE_CALLCONV};
-use crate::image::{fhk_vmexit, Instance};
+use crate::image::{fhk_vmexit, DupHeader, Instance};
 use crate::ir::Type;
 use crate::schedule::BlockId;
 
@@ -123,11 +125,11 @@ extern "C" {
 /* ---- Init ---------------------------------------------------------------- */
 
 /*
- * +--------+------+------+
- * |  31..5 | 4..1 |   0  |
- * +========+======+======+
- * | offset | size | zero |
- * +--------+------+------+
+ * +--------+------+-----+------+
+ * |  31..6 | 5..2 |  1  |   0  |
+ * +========+======+=====+======+
+ * | offset | size | dup | zero |
+ * +--------+------+-----+------+
  */
 #[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
@@ -135,20 +137,25 @@ pub struct DynSlot(u32);
 
 impl DynSlot {
 
-    pub fn new(ofs: u32, type_: Type) -> Self {
+    pub fn new(ofs: u32, type_: Type, dup: bool) -> Self {
         Self(
-            (ofs << 5)
-            | ((type_.size() as u32) << 1)
+            (ofs << 6)
+            | ((type_.size() as u32) << 2)
+            | ((dup as u32) << 1)
             | ((type_ == Type::B1) as u32)
         )
     }
 
     fn offset(self) -> u32 {
-        self.0 >> 5
+        self.0 >> 6
     }
 
     fn size(self) -> u32 {
-        (self.0 >> 1) & 0xf
+        (self.0 >> 2) & 0xf
+    }
+
+    fn dup(self) -> bool {
+        (self.0 & 2) != 0
     }
 
     fn zero(self) -> bool {
@@ -157,12 +164,7 @@ impl DynSlot {
 
 }
 
-unsafe extern "C" fn rt_init(
-    vmctx: &mut Instance,
-    slots: *const DynSlot,
-    num: u32,
-    size: u32
-) {
+unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u32, size: u32) {
     let raw = vmctx as *mut _ as *mut u8;
     let slots = core::slice::from_raw_parts(slots, num as _);
     for &slot in slots {
@@ -172,7 +174,18 @@ unsafe extern "C" fn rt_init(
         if colo && !(*pptr).is_null() { continue; }
         let elemsize = slot.size();
         let slotsize = size*elemsize;
-        let ptr = vmctx.host.alloc(slotsize as _, elemsize as _);
+        let ptr = match slot.dup() {
+            true => {
+                debug_assert!(size_of::<DupHeader>() == 8);
+                let ptr = vmctx.host.alloc((slotsize + 8) as _, 8) as *mut DupHeader;
+                *ptr = DupHeader {
+                    size: slotsize + 8,
+                    next: replace(&mut vmctx.dup, slot.offset())
+                };
+                ptr.add(1) as _
+            },
+            false => vmctx.host.alloc(slotsize as _, elemsize as _)
+        };
         if slot.zero() { core::ptr::write_bytes(ptr, 0, slotsize as _); }
         *pptr = ptr;
     }

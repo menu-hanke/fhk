@@ -24,8 +24,80 @@ pub struct Image {
 #[repr(align(8))]
 pub struct Instance {
     pub host: HostInst,
+    pub dup: Offset, // allocations to duplicate when continuing from this state
     sp: *mut u8, // stack pointer just before entering query
     _pin: PhantomPinned
+}
+
+// header for duplicated dynamic slots
+//   +-----------+--------------+
+//   | DupHeader | ... data ... |
+//   +-----------+--------------+
+// order of fields doesn't matter, but size must be 8.
+#[repr(C)]
+pub struct DupHeader {
+    pub size: Offset, // alloc size, including header
+    pub next: Offset, // slot of next dup data
+}
+
+/* ---- Instance creation --------------------------------------------------- */
+
+impl Image {
+
+    pub unsafe fn newinstance<UnsafeAlloc>(
+        &self,
+        prev: *const Instance,
+        reset: u64,
+        mut alloc: UnsafeAlloc
+    ) -> *mut Instance
+        where UnsafeAlloc: FnMut(usize, usize) -> *mut u8
+    {
+        let inst = alloc(self.size as _, align_of::<Instance>()) as *mut Instance;
+        (*inst).dup = 0;
+        if !prev.is_null() {
+            core::ptr::copy_nonoverlapping(prev as *const u8, inst as *mut u8, self.size as _);
+        }
+        // reset new instance
+        // special case 0 and -1 to avoid shift by 64.
+        match reset {
+            0 => {},
+            u64::MAX => core::ptr::write_bytes(inst as *mut u8, 0, self.size as _),
+            mut mask => {
+                let mut idx = 0;
+                while mask != 0 {
+                    let num0 = mask.trailing_zeros() as usize;
+                    mask >>= num0;
+                    let num1 = mask.trailing_ones() as usize;
+                    mask >>= num1;
+                    let start = *self.breakpoints.raw.get_unchecked(idx+num0) as usize;
+                    let end = *self.breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
+                    idx += num0+num1;
+                    core::ptr::write_bytes((inst as *mut u8).add(start), 0, end-start);
+                }
+            }
+        }
+        // copy dup list
+        if !prev.is_null() {
+            let mut dup = (*prev).dup;
+            while dup != 0 {
+                let newptr = (inst as *mut u8).add(dup as usize) as *mut *mut DupHeader;
+                let new = *newptr;
+                if new.is_null() {
+                    dup = (*(*((prev as *const u8).add(dup as usize) as *const *const DupHeader))
+                        .sub(1)).next;
+                } else {
+                    let DupHeader { size, next } = *new.sub(1);
+                    debug_assert!(size_of::<DupHeader>() == 8);
+                    let copy = alloc(size as _, 8);
+                    *newptr = copy as *mut DupHeader;
+                    core::ptr::copy_nonoverlapping(new.sub(1) as *const u8, copy, size as _);
+                    dup = next;
+                }
+            }
+        }
+        inst
+    }
+
 }
 
 /* ---- Call and exit ------------------------------------------------------- */
@@ -92,31 +164,6 @@ cfg_if! {
     } else {
         pub use fhk_vmcall as fhk_vmcall_native;
     }
-}
-
-impl Image {
-
-    pub unsafe fn reset(&self, mem: *mut u8, reset: u64) {
-        // special case 0 and -1 to avoid shift by 64.
-        match reset {
-            0 => {},
-            u64::MAX => core::ptr::write_bytes(mem, 0, self.size as _),
-            mut mask => {
-                let mut idx = 0;
-                while mask != 0 {
-                    let num0 = mask.trailing_zeros() as usize;
-                    mask >>= num0;
-                    let num1 = mask.trailing_ones() as usize;
-                    mask >>= num1;
-                    let start = *self.breakpoints.raw.get_unchecked(idx+num0) as usize;
-                    let end = *self.breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
-                    idx += num0+num1;
-                    core::ptr::write_bytes(mem.add(start), 0, end-start);
-                }
-            }
-        }
-    }
-
 }
 
 /* ---- Stack swapping ------------------------------------------------------ */

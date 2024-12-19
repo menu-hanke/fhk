@@ -49,7 +49,7 @@ local function prettyprint(x)
 			buf:put(v)
 		end
 	end
-	buf:put("]")
+	buf:put(" ]")
 	return tostring(buf)
 end
 

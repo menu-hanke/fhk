@@ -15,11 +15,18 @@ use crate::typestate::{Absent, R, RW};
 
 index!(struct SlotId(u32));
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SlotType {
+    Data,
+    Bitmap,
+    BitmapDup
+}
+
 struct SlotDef {
     reset: ResetSet,
     scl: SizeClass,
     size: u8, // also alignment, pointer size for dynamic slots
-    bitmap: bool,
+    sty: SlotType,
     value: Slot
 }
 
@@ -30,7 +37,11 @@ pub struct ComputeLayout {
 
 type Ctx<'a> = Ccx<ComputeLayout, RW, R<'a>>;
 
-fn newslot(reset: ResetSet, scl: SizeClass, type_: Type) -> SlotDef {
+fn isbitmap(sty: SlotType) -> bool {
+    sty != SlotType::Data
+}
+
+fn newslot(reset: ResetSet, scl: SizeClass, type_: Type, dup: bool) -> SlotDef {
     debug_assert!(type_.size() > 0);
     SlotDef {
         reset,
@@ -39,7 +50,11 @@ fn newslot(reset: ResetSet, scl: SizeClass, type_: Type) -> SlotDef {
             true => Type::PTR.size(),
             false => type_.size()
         } as _,
-        bitmap: type_ == Type::B1,
+        sty: match (type_, dup) {
+            (Type::B1, false) => SlotType::Bitmap,
+            (Type::B1, true)  => SlotType::BitmapDup,
+            _                 => SlotType::Data
+        },
         value: Default::default()
     }
 }
@@ -49,13 +64,15 @@ fn collect(ctx: &mut Ccx<ComputeLayout>) {
     for func in &ctx.ir.funcs.raw {
         match &func.kind {
             &FuncKind::Bundle(Bundle { reset, scl, .. }) => {
-                ctx.data.slots.push(newslot(reset, scl, Type::B1));
+                let mut hasptr = false;
                 for phi in index::iter_range(func.returns()) {
                     let ty = func.phis.at(phi).type_;
                     if ty != Type::FX {
-                        ctx.data.slots.push(newslot(reset, scl, ty));
+                        ctx.data.slots.push(newslot(reset, scl, ty, false));
+                        hasptr |= ty == Type::PTR;
                     }
                 }
+                ctx.data.slots.push(newslot(reset, scl, Type::B1, hasptr && scl.is_dynamic()));
             },
             _ => {}
         }
@@ -73,27 +90,24 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
     for (fid, func) in ctx.ir.funcs.pairs_mut() {
         match &mut func.kind {
             FuncKind::Bundle(Bundle { scl, slots, dynslots, check, .. }) => {
-                let bitmap = slotdefs[slot].value;
-                *check = bitmap;
-                *slots = insert.end();
-                trace!(MEM "{:?} bitmap {:#04x}:{}", fid, bitmap.byte(), bitmap.bit());
                 if scl.is_dynamic() {
                     // alloc dynamic slot data for BINIT
-                    let base = slot;
                     *dynslots = ctx.mcode.data.bump().end().cast_up();
-                    ctx.mcode.data.write(&DynSlot::new(bitmap.byte(), Type::B1));
+                    let mut ds = slot;
                     for phi in index::iter_span(func.ret) {
                         let ty = func.phis.at(phi).type_;
                         if ty != Type::FX {
-                            slot += 1;
-                            let phislot = slotdefs[slot].value;
-                            ctx.mcode.data.write(&DynSlot::new(phislot.byte(), ty));
+                            let phislot = slotdefs[ds].value;
+                            ctx.mcode.data.write(&DynSlot::new(phislot.byte(), ty, false));
+                            ds += 1;
                         }
                     }
-                    slot = base;
+                    let SlotDef { value, sty, .. } = slotdefs[ds];
+                    ctx.mcode.data.write(&DynSlot::new(value.byte(), Type::B1,
+                        sty == SlotType::BitmapDup));
                 }
-                slot += 1;
                 // alloc vmctx slots (fx slots don't matter, they will never be read/written)
+                *slots = insert.end();
                 for phi in index::iter_span(func.ret) {
                     insert.push(match func.phis.at(phi).type_ {
                         Type::FX => Default::default(),
@@ -105,6 +119,10 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                         }
                     });
                 }
+                let bitmap = slotdefs[slot].value;
+                *check = bitmap;
+                trace!(MEM "{:?} bitmap {:#04x}:{}", fid, bitmap.byte(), bitmap.bit());
+                slot += 1;
             },
             _ => {}
         }
@@ -118,7 +136,7 @@ fn sort(ctx: &Ctx) -> Box<[SlotId]> {
         let reset: u64 = zerocopy::transmute!(slot.reset);
         let num: u32 = zerocopy::transmute!(slot.scl);
         // NOT reset here to put slots that are never reset last
-        (!reset, num, !slot.size)
+        (!reset, num, !slot.size, slot.sty)
     });
     order
 }
@@ -128,9 +146,10 @@ fn partition(ctx: &mut Ctx, order: &[SlotId]) -> IndexVec<BreakpointId, (ResetSe
     let mut cursor = (size_of::<Instance>() as Offset, 0); // (byte, bit) of next slot
     let mut rs = ResetSet::default();
     let mut sc = SizeClass::INVALID;
+    let mut bt = SlotType::Data;
     for (i, &id) in order.iter().enumerate() {
-        let SlotDef { reset, scl, size, bitmap, .. } = ctx.data.slots[id];
-        if cursor.1 != 0 && (rs, sc, bitmap) != (reset, scl, true) {
+        let SlotDef { reset, scl, size, sty, .. } = ctx.data.slots[id];
+        if cursor.1 != 0 && (rs, sc, sty) != (reset, scl, bt) {
             // reset, size class, or type changed mid-bitfield: close bitfield
             cursor = (cursor.0 + ctx.data.slots[order[i-1]].size as Offset, 0);
             sc = scl;
@@ -144,11 +163,13 @@ fn partition(ctx: &mut Ctx, order: &[SlotId]) -> IndexVec<BreakpointId, (ResetSe
         // while we are allocation bitfields
         cursor.0 = (cursor.0 + size as Offset - 1) & !(size as Offset - 1);
         ctx.data.slots[id].value = Slot::new(cursor.0, cursor.1);
-        if bitmap {
+        if isbitmap(sty) {
             cursor.1 = (cursor.1 + 1) & 7;
+            bt = sty;
         }
         if cursor.1 == 0 {
             cursor.0 += size as Offset;
+            bt = SlotType::Data;
         }
     }
     if cursor.1 != 0 {
