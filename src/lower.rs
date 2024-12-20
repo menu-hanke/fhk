@@ -2588,6 +2588,11 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
     }
 }
 
+fn resetvm(mat: &mut BitMatrix<FuncId, ResetId>, value: FuncId, id: ResetId) {
+    mat[value].set(id);
+    mat[value+2].set(id); // reset arm (var) or availability (model)
+}
+
 // construct and solve the dataflow equations:
 //   for each function F, let R(F) denote its reset set.
 //   for each explicit reset r and func F:
@@ -2604,14 +2609,20 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
             let id: ResetId = zerocopy::transmute!(id);
             for &obj in objs {
                 let ptr = ccx.data.objs[&obj];
-                let base = match ccx.objs[obj].op {
+                match ccx.objs[obj].op {
                     Obj::VAR => {
-                        // var: reset the variable
-                        ccx.data.bump[ptr.cast::<Var>()].base
+                        let var = &ccx.data.bump[ptr.cast::<Var>()];
+                        resetvm(&mut mat, var.base, id);
+                        for &vset in &var.value {
+                            let vset = &ccx.data.bump[vset];
+                            if vset.vst != VSet::SIMPLE {
+                                resetvm(&mut mat, ccx.data.bump[vset.model].base, id);
+                            }
+                        }
                     },
                     _ /* MOD */ => {
                         let model = &ccx.data.bump[ccx.data.objs[&obj].cast::<Mod>()];
-                        match model.mt {
+                        let base = match model.mt {
                             Mod::SIMPLE => {
                                 // simple model: reset the variable
                                 ccx.data.bump[model.value[0].var].base
@@ -2620,11 +2631,10 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
                                 // complex model: reset the model
                                 model.base
                             }
-                        }
+                        };
+                        resetvm(&mut mat, base, id);
                     }
-                };
-                mat[base].set(id); // reset value
-                mat[base+2].set(id); // reset arm (var) or avail (complex mod)
+                }
             }
         }
     }
