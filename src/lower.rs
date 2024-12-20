@@ -2415,8 +2415,9 @@ fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
     let mut ctr = InsId::START;
     let bump = Access::borrow(&lcx.data.bump);
     let model = &bump[model];
+    let ret = lcx.data.func.code.push(Ins::RET());
     let kfal = lcx.data.func.code.push(Ins::KINT(Type::B1, 0));
-    let jfal = lcx.data.func.code.push(Ins::JMP(kfal, ctr, 0.into()));
+    let jfal = lcx.data.func.code.push(Ins::JMP(kfal, ret, 0.into()));
     if !model.guard.is_nil() {
         emitcheck(lcx, &mut ctr, model.guard.erase(), jfal);
         let cond = emitvalue(lcx, &mut ctr, model.guard);
@@ -2425,7 +2426,6 @@ fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
     for setter in &model.value {
         emitcheck(lcx, &mut ctr, setter.obj.erase(), jfal);
     }
-    let ret = lcx.data.func.code.push(Ins::RET());
     let ktru = lcx.data.func.code.push(Ins::KINT(Type::B1, 1));
     lcx.data.func.code.set(ctr, Ins::JMP(ktru, ret, 0.into()));
 }
