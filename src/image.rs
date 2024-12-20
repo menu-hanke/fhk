@@ -36,7 +36,7 @@ pub struct Instance {
 // order of fields doesn't matter, but size must be 8.
 #[repr(C)]
 pub struct DupHeader {
-    pub size: Offset, // alloc size, including header
+    pub size: Offset, // alloc size, not including header
     pub next: Offset, // slot of next dup data
 }
 
@@ -44,9 +44,9 @@ pub struct DupHeader {
 
 impl Image {
 
-    pub unsafe fn newinstance<UnsafeAlloc>(
+    pub unsafe fn instantiate<UnsafeAlloc>(
         &self,
-        prev: *const Instance,
+        template: *const Instance,
         reset: u64,
         mut alloc: UnsafeAlloc
     ) -> *mut Instance
@@ -54,8 +54,8 @@ impl Image {
     {
         let inst = alloc(self.size as _, align_of::<Instance>()) as *mut Instance;
         (*inst).dup = 0;
-        if !prev.is_null() {
-            core::ptr::copy_nonoverlapping(prev as *const u8, inst as *mut u8, self.size as _);
+        if !template.is_null() {
+            core::ptr::copy_nonoverlapping(template as *const u8, inst as *mut u8, self.size as _);
         }
         // reset new instance
         // special case 0 and -1 to avoid shift by 64.
@@ -77,20 +77,28 @@ impl Image {
             }
         }
         // copy dup list
-        if !prev.is_null() {
-            let mut dup = (*prev).dup;
+        if !template.is_null() {
+            let mut dup = (*template).dup;
             while dup != 0 {
                 let newptr = (inst as *mut u8).add(dup as usize) as *mut *mut DupHeader;
                 let new = *newptr;
                 if new.is_null() {
-                    dup = (*(*((prev as *const u8).add(dup as usize) as *const *const DupHeader))
+                    dup = (*(*((template as *const u8).add(dup as usize) as *const *const DupHeader))
                         .sub(1)).next;
                 } else {
                     let DupHeader { size, next } = *new.sub(1);
                     debug_assert!(size_of::<DupHeader>() == 8);
-                    let copy = alloc(size as _, 8);
-                    *newptr = copy as *mut DupHeader;
-                    core::ptr::copy_nonoverlapping(new.sub(1) as *const u8, copy, size as _);
+                    let copy = alloc((size+8) as _, 8) as *mut DupHeader;
+                    *copy = DupHeader {
+                        size,
+                        next: core::ptr::replace(&raw mut (*inst).dup, dup)
+                    };
+                    *newptr = copy.add(1);
+                    core::ptr::copy_nonoverlapping(
+                        new.sub(1) as *const u8,
+                        copy.add(1) as *mut u8,
+                        size as _
+                    );
                     dup = next;
                 }
             }

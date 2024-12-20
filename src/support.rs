@@ -179,7 +179,7 @@ unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u
                 debug_assert!(size_of::<DupHeader>() == 8);
                 let ptr = vmctx.host.alloc((slotsize + 8) as _, 8) as *mut DupHeader;
                 *ptr = DupHeader {
-                    size: slotsize + 8,
+                    size: slotsize,
                     next: replace(&mut vmctx.dup, slot.offset())
                 };
                 ptr.add(1) as _

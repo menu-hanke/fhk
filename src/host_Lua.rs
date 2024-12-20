@@ -232,7 +232,7 @@ unsafe extern "C" fn fhk_newinstance(
 ) -> *mut fhk_Instance {
     // TODO: only reset if this query depends on the reset mask (save mask for queries too)
     // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
-    let inst = image.newinstance(prev, reset, |size, align| alloc(udata, size, align));
+    let inst = image.instantiate(prev, reset, |size, align| alloc(udata, size, align));
     (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
     inst
 }
