@@ -8,6 +8,7 @@ use enumset::EnumSetType;
 use crate::emit::{block2cl, signature, Ecx, Signature, NATIVE_CALLCONV};
 use crate::image::{fhk_vmexit, DupHeader, Instance};
 use crate::ir::Type;
+use crate::mem::Offset;
 use crate::schedule::BlockId;
 
 macro_rules! define_suppfuncs {
@@ -125,11 +126,13 @@ extern "C" {
 /* ---- Init ---------------------------------------------------------------- */
 
 /*
- * +--------+------+-----+------+
- * |  31..6 | 5..2 |  1  |   0  |
- * +========+======+=====+======+
- * | offset | size | dup | zero |
- * +--------+------+-----+------+
+ *         +--------+---+-----+------+
+ *         |  31..5 | 4 |  3  | 2..0 |
+ *         +========+===+=====+======+
+ * data    | offset | 0 |    size    |
+ *         +--------+---+-----+------+
+ * bitmap  | offset | 1 | dup |  bit |
+ *         +--------+---+-----+------+
  */
 #[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
@@ -137,57 +140,78 @@ pub struct DynSlot(u32);
 
 impl DynSlot {
 
-    pub fn new(ofs: u32, type_: Type, dup: bool) -> Self {
-        Self(
-            (ofs << 6)
-            | ((type_.size() as u32) << 2)
-            | ((dup as u32) << 1)
-            | ((type_ == Type::B1) as u32)
-        )
+    pub fn new_data(ofs: Offset, size: u32) -> Self {
+        debug_assert!((ofs as usize) & (Type::PTR.size() - 1) == 0);
+        Self((ofs << 5) | size)
     }
 
-    fn offset(self) -> u32 {
-        self.0 >> 6
+    pub fn new_bitmap(ofs: Offset, dup: bool, bit: u32) -> Self {
+        debug_assert!((ofs as usize) & (Type::PTR.size() - 1) == 0);
+        Self((ofs << 5) | (1 << 4) | ((dup as u32) << 3) | bit)
+    }
+
+    fn offset(self) -> Offset {
+        self.0 >> 5
+    }
+
+    fn is_bitmap(self) -> bool {
+        self.0 & (1 << 4) != 0
     }
 
     fn size(self) -> u32 {
-        (self.0 >> 2) & 0xf
+        debug_assert!(!self.is_bitmap());
+        self.0 & 0xf
     }
 
-    fn dup(self) -> bool {
-        (self.0 & 2) != 0
+    fn bit(self) -> u32 {
+        debug_assert!(self.is_bitmap());
+        self.0 & 0x7
     }
 
-    fn zero(self) -> bool {
-        (self.0 & 1) != 0
+    fn is_dup(self) -> bool {
+        debug_assert!(self.is_bitmap());
+        self.0 & (1 << 3) != 0
     }
 
 }
 
 unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u32, size: u32) {
-    let raw = vmctx as *mut _ as *mut u8;
     let slots = core::slice::from_raw_parts(slots, num as _);
     for &slot in slots {
-        // TODO: store colocated bit in dynslot
-        let colo = slot.zero();
-        let pptr = raw.add(slot.offset() as _) as *mut *mut u8;
-        if colo && !(*pptr).is_null() { continue; }
-        let elemsize = slot.size();
-        let slotsize = size*elemsize;
-        let ptr = match slot.dup() {
+        let ofs = slot.offset();
+        let ptr = (vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8;
+        let data = match slot.is_bitmap() {
             true => {
-                debug_assert!(size_of::<DupHeader>() == 8);
-                let ptr = vmctx.host.alloc((slotsize + 8) as _, 8) as *mut DupHeader;
-                *ptr = DupHeader {
-                    size: slotsize,
-                    next: replace(&mut vmctx.dup, slot.offset())
+                if !(*ptr).is_null() {
+                    let words = core::slice::from_raw_parts_mut(*ptr as *mut u64, ((size+7)>>3) as _);
+                    let mask = 0x0101010101010101 * 0xfeu8.rotate_left(slot.bit()) as u64;
+                    for word in words { *word &= mask; }
+                    continue
+                }
+                let data = match slot.is_dup() {
+                    true => {
+                        debug_assert!(size_of::<DupHeader>() == 8);
+                        let data = vmctx.host.alloc((size+8) as _, 8) as *mut DupHeader;
+                        *data = DupHeader {
+                            size,
+                            next: replace(&mut vmctx.dup, slot.offset())
+                        };
+                        data.add(1) as _
+                    },
+                    false => vmctx.host.alloc(size as _, 8)
                 };
-                ptr.add(1) as _
+                core::ptr::write_bytes(data, 0, size as _);
+                data
             },
-            false => vmctx.host.alloc(slotsize as _, elemsize as _)
+            false => {
+                let ss = slot.size();
+                vmctx.host.alloc((ss*size) as _, ss as _)
+            }
         };
-        if slot.zero() { core::ptr::write_bytes(ptr, 0, slotsize as _); }
-        *pptr = ptr;
+        // *don't* use `ptr` here, it's UB because we access the vmctx reference in between.
+        *((vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8) = data;
+        let mut _x = 123;
+        *(&mut _x) = 1234;
     }
 }
 

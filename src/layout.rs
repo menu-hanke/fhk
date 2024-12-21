@@ -97,14 +97,18 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                     for phi in index::iter_span(func.ret) {
                         let ty = func.phis.at(phi).type_;
                         if ty != Type::FX {
-                            let phislot = slotdefs[ds].value;
-                            ctx.mcode.data.write(&DynSlot::new(phislot.byte(), ty, false));
+                            let SlotDef { value, sty, .. } = slotdefs[ds];
+                            let dslot = match sty {
+                                SlotType::Data => DynSlot::new_data(value.byte(), ty.size() as _),
+                                _ => DynSlot::new_bitmap(value.byte(), false, value.bit())
+                            };
+                            ctx.mcode.data.write(&dslot);
                             ds += 1;
                         }
                     }
                     let SlotDef { value, sty, .. } = slotdefs[ds];
-                    ctx.mcode.data.write(&DynSlot::new(value.byte(), Type::B1,
-                        sty == SlotType::BitmapDup));
+                    ctx.mcode.data.write(
+                        &DynSlot::new_bitmap(value.byte(), sty == SlotType::BitmapDup, value.bit()));
                 }
                 // alloc vmctx slots (fx slots don't matter, they will never be read/written)
                 *slots = insert.end();
@@ -160,7 +164,7 @@ fn partition(ctx: &mut Ctx, order: &[SlotId]) -> IndexVec<BreakpointId, (ResetSe
             rs = reset;
         }
         // if type_ != B1, we have bit=0, otherwise align=1, so this can never change the byte
-        // while we are allocation bitfields
+        // while we are allocating bitfields
         cursor.0 = (cursor.0 + size as Offset - 1) & !(size as Offset - 1);
         ctx.data.slots[id].value = Slot::new(cursor.0, cursor.1);
         if isbitmap(sty) {
