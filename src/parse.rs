@@ -626,11 +626,23 @@ fn checkopenparen(pcx: &mut Pcx) -> compile::Result<Option<Token>> {
     Ok(Some(close))
 }
 
+fn parse_pattern(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+    match pcx.data.token {
+        Token::CapName => {
+            let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+            pcx.data.marg.push(name);
+            next(pcx)?;
+            Ok(pcx.intern.intern(&[Token::OpInsert as u8]))
+        },
+        _ => parse_name_pattern(pcx)
+    }
+}
+
 fn parse_macro_var(pcx: &mut Pcx) -> compile::Result {
     next(pcx)?; // skip `var`
     pcx.data.undef_base = 0;
     pcx.data.marg.clear();
-    let table_pattern = parse_name_pattern(pcx)?;
+    let table_pattern = parse_pattern(pcx)?;
     let name_pattern = parse_name_pattern(pcx)?;
     let base = pcx.tmp.end();
     if let Some(stop) = checkopenparen(pcx)? {
