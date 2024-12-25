@@ -305,7 +305,7 @@ define_ops! {
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
     RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
-    VSET        { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
+    VSET.flat   { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     // types
     TVAR        {};
     TPRI.ty     {};
@@ -320,7 +320,7 @@ define_ops! {
     KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
     DIM.axis    { ann: ObjRef/*TY*/ };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
-    VGET        { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
+    VGET.flat   { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     BINOP.binop { ann: ObjRef/*TY*/, left: ObjRef<EXPR>, right: ObjRef<EXPR> };

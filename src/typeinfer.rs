@@ -631,7 +631,7 @@ fn vartype(tcx: &mut Tcx, var: ObjRef<VAR>) -> TypeVar {
     tv
 }
 
-fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
+fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], flat: bool) -> Type {
     let objs = Access::borrow(&tcx.objs);
     let axes = &objs[objs[objs[var].tab].shape].fields;
     let mut have = idx.len();
@@ -647,16 +647,24 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>]) -> Type {
         return Type::NEVER;
     }
     let mut ty = Type::var(vartype(tcx, var));
-    // handle tail: every scalar axis increases the dimension by one, and every vector axis emits a
-    // nested tensor.
+    // handle tail:
+    // * empty tail     ->  zero dimensions
+    // * flat tail      ->  one dimension
+    // * implicit tail  ->  one dimension per scalar axis, one nest per vector axis
     let mut dim = 0;
-    for i in (have..need).rev() {
-        dim += 1;
-        if i > 0 && axes[i-1].is_nil() {
-            // vector axis or end of tail
-            let d = createdimtype(&mut tcx.data, dim as _);
-            ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
-            dim = 0;
+    if have < need {
+        if flat {
+            dim = 1;
+        } else {
+            for i in (have..need).rev() {
+                dim += 1;
+                if i > 0 && axes[i-1].is_nil() {
+                    // vector axis or end of tail
+                    let d = createdimtype(&mut tcx.data, dim as _);
+                    ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
+                    dim = 0;
+                }
+            }
         }
     }
     if idx.is_empty() {
@@ -775,7 +783,8 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
             }
             Some(ty)
         },
-        ObjectRef::VGET(&VGET { var, ref idx, .. }) => Some(visitvref(tcx, var, idx)),
+        ObjectRef::VGET(&VGET { flat, var, ref idx, .. })
+            => Some(visitvref(tcx, var, idx, flat != 0)),
         ObjectRef::CAT(CAT { elems, .. } ) => {
             let e = newtypevar(&mut tcx.data.sub);
             let d = newtypevar(&mut tcx.data.sub);
@@ -915,8 +924,8 @@ fn visitall(tcx: &mut Tcx) {
                     unifyvar(&mut tcx.data.sub, ety, Type::pri(Primitive::B1));
                 }
                 for &vset in value.iter() {
-                    let &VSET { var, value, ref idx, .. } = &objs[vset];
-                    let vty = visitvref(tcx, var, idx);
+                    let &VSET { flat, var, value, ref idx, .. } = &objs[vset];
+                    let vty = visitvref(tcx, var, idx, flat != 0);
                     let ety = exprtype(tcx, value);
                     unifyvar(&mut tcx.data.sub, ety, vty);
                 }

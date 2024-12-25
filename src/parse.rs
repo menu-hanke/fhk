@@ -136,17 +136,23 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
     Ok(if pcx.data.token == Token::LBracket {
         next(pcx)?;
         let base = pcx.tmp.end();
+        let mut flat = false;
         while pcx.data.token != Token::RBracket {
+            if check(pcx, Token::DotDot)? {
+                flat = true;
+                break
+            }
             let idx = parse_expr(pcx)?;
             pcx.tmp.push(idx);
             if !check(pcx, Token::Comma)? { break }
         }
         consume(pcx, Token::RBracket)?;
-        let vget = pcx.objs.push_args(VGET::new(ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
+        let vget = pcx.objs.push_args(
+            VGET::new(flat as _, ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
         pcx.tmp.truncate(base);
         vget
     } else {
-        pcx.objs.push(VGET::new(ObjRef::NIL, var)).cast()
+        pcx.objs.push(VGET::new(0, ObjRef::NIL, var)).cast()
     })
 }
 
@@ -416,7 +422,7 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
     for i in 0..n {
         let PendingVset { var, value, ann } = pcx.tmp[pending_base.add_size(i as _)];
         pcx.objs.annotate(value, ann);
-        pcx.tmp.push(pcx.objs.push(VSET::new(var, value)));
+        pcx.tmp.push(pcx.objs.push(VSET::new(0, var, value)));
     }
     let guard = match check(pcx, Token::Where)? {
         true  => Some(parse_expr(pcx)?),

@@ -929,15 +929,14 @@ fn emitshapelen(func: &Func, base: InsId, dim: usize) -> InsId {
     len
 }
 
-fn emitsplatloop(
+fn emitsplatbounds(
     lcx: &mut Lcx,
-    loop_: &mut LoopState,
     tab: &Tab,
     flat: InsId,
     call: InsId,
     mut axis: usize,
     endaxis: usize,
-) -> InsId {
+) -> (InsId, InsId) {
     let one = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
     let mut start = flat;
     let mut end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, one));
@@ -946,6 +945,19 @@ fn emitsplatloop(
         end = idxftran(lcx, tab, call, axis, end);
         axis += 1;
     }
+    (start, end)
+}
+
+fn emitsplatloop(
+    lcx: &mut Lcx,
+    loop_: &mut LoopState,
+    tab: &Tab,
+    flat: InsId,
+    call: InsId,
+    axis: usize,
+    endaxis: usize,
+) -> InsId {
+    let (start, end) = emitsplatbounds(lcx, tab, flat, call, axis, endaxis);
     emitrangeloop(&lcx.data.func, loop_, IRT_IDX, start, end)
 }
 
@@ -1423,77 +1435,114 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
     let var = vardata(&lcx.data.objs, vget.var);
     let source = &bump[lcx.data.tab];
     let target = &bump[bump[var].tab];
+    let sdim = source.axes.len();
+    let tdim = target.axes.len();
     let call = emittabcall(&lcx.data.func, target.func);
-    // compute tail from inside out
-    let base = lcx.tmp.end();
-    let mut ann = vget.ann;
-    // how many explicit dimensions?
-    let mut explicitdim = vget.idx.iter().filter_map(|&i| match objs[objs[i].ann].op {
+    let flattail = vget.flat != 0;
+    let ann = vget.ann;
+    let cty = &objs[ann.cast::<TTEN>()];
+    let dim = cty.dim as usize;
+    let explicitdim = vget.idx.iter().filter_map(|&i| match objs[objs[i].ann].op {
         Obj::TTEN => Some(objs[objs[i].ann.cast::<TTEN>()].dim as usize),
         _ => None
     }).sum();
-    if explicitdim > 0 {
-        // if the implicit tail starts with scalar axes, they are merged into the explicit outer loop
-        ann = objs[ann.cast::<TTEN>()].elem;
-    }
-    // unpack nesting
-    let nest = lcx.tmp.align_for::<ObjRef>();
-    let vann = objs[vget.var].ann;
-    while ann != vann {
-        debug_assert!(objs[ann].op == Obj::TTEN);
-        nest.push(ann);
-        ann = objs[ann.cast::<TTEN>()].elem;
-    }
-    // load variable
     let inline = isdisjointidx(&bump[lcx.data.tab], target, &vget.idx);
+    // (placeholder for) flat index corresponding to `value`.
+    // each inner loop refers to this when loading value, and the outer loops set it.
     let [mut flat] = areserve(&lcx.data.func);
+    // current value.
+    // start from the innermost value (callb) and propagates up towards the outermost loop.
     let mut value = emitvarload(lcx, var, flat, inline);
-    // emit loop nest, starting from the inside
-    let mut axis = target.axes.len();
+    // current inner loop:
+    // * start (instruction): the instruction to execute to jump to this loop;
+    // * out (label): where this loop jumps when it's done.
     let mut innerloop: Option<(/*start:*/Ins, /*out:*/InsId)> = None;
-    while lcx.tmp.end().cast::<ObjRef>() > base.cast_up() {
-        let ann: ObjRef<TTEN> = lcx.tmp.pop().unwrap();
-        let cty = &objs[ann];
-        let dim = cty.dim as usize;
-        axis -= dim;
-        let [thisflat] = areserve(&lcx.data.func);
-        let shape = reserve(&lcx.data.func, dim);
-        let mut start = thisflat;
-        for i in 0..dim {
-            let s = shape + i as isize;
-            match &target.axes[axis+i] {
-                &Axis { rank: Axis::SCALAR, ret, .. } => {
-                    lcx.data.func.code.set(s, Ins::RES(IRT_IDX, call, ret));
-                    start = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, s));
-                },
-                &Axis { /* VECTOR */ ret, .. } => {
-                    debug_assert!(i == 0);
-                    let idxsize = lcx.data.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
-                    let f = lcx.data.func.code.push(Ins::RES(Type::PTR, call, ret));
-                    let ofs = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, idxsize));
-                    let fstart = lcx.data.func.code.push(Ins::ADDP(f, ofs));
-                    let fstart1 = lcx.data.func.code.push(Ins::ADDP(fstart, idxsize));
-                    start = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart));
-                    let end = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart1));
-                    lcx.data.func.code.set(s, Ins::SUB(IRT_IDX, end, start));
+    // current axis. start from innermost, decrement towards outermost.
+    let mut axis = tdim;
+    // 1. implicit tail loop nest
+    {
+        let mut xann = ann;
+        // if there are explicit dimensions, then the handle all dimensions of the outermost
+        // type in the innermost explicit outer loop.
+        if explicitdim > 0 {
+            xann = objs[ann.cast::<TTEN>()].elem;
+        }
+        let vann = objs[vget.var].ann;
+        if xann != vann {
+            if flattail {
+                // all explicit dimensions are scalars, otherwise this would have been merged
+                // with the innermost explicit loop.
+                debug_assert!(explicitdim == 0);
+                debug_assert!(dim == 1);
+                let [thisflat] = areserve(&lcx.data.func);
+                axis = min(sdim, tdim-vget.idx.len());
+                let (start, end) = emitsplatbounds(lcx, target, thisflat, call,
+                    axis+vget.idx.len(), tdim);
+                let len = lcx.data.func.code.push(Ins::SUB(IRT_IDX, end, start));
+                let mut col = newcollect(lcx, cty, len);
+                let j = emitrangeloop(&lcx.data.func, &mut col.reduce.loop_, IRT_IDX, start, end);
+                lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, j));
+                let (out, result, start) = closecollect(lcx, col, value, None.into());
+                innerloop = Some((start, out));
+                flat = thisflat;
+                value = result;
+            } else {
+                // need inner loop nest.
+                let base = lcx.tmp.end();
+                // unpack nesting
+                let nest = lcx.tmp.align_for::<ObjRef>();
+                while xann != vann {
+                    debug_assert!(objs[xann].op == Obj::TTEN);
+                    nest.push(xann);
+                    xann = objs[xann.cast::<TTEN>()].elem;
                 }
+                while lcx.tmp.end().cast::<ObjRef>() > base.cast_up() {
+                    let tty: &TTEN = &objs[lcx.tmp.pop().unwrap()];
+                    let dim = tty.dim as usize;
+                    axis -= dim;
+                    let [thisflat] = areserve(&lcx.data.func);
+                    let shape = reserve(&lcx.data.func, dim);
+                    let mut start = thisflat;
+                    for i in 0..dim {
+                        let s = shape + i as isize;
+                        match &target.axes[axis+i] {
+                            &Axis { rank: Axis::SCALAR, ret, .. } => {
+                                lcx.data.func.code.set(s, Ins::RES(IRT_IDX, call, ret));
+                                start = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, s));
+                            },
+                            &Axis { /* VECTOR */ ret, .. } => {
+                                debug_assert!(i == 0);
+                                let idxsize = lcx.data.func.code.push(
+                                    Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
+                                let f = lcx.data.func.code.push(Ins::RES(Type::PTR, call, ret));
+                                let ofs = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, idxsize));
+                                let fstart = lcx.data.func.code.push(Ins::ADDP(f, ofs));
+                                let fstart1 = lcx.data.func.code.push(Ins::ADDP(fstart, idxsize));
+                                start = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart));
+                                let end = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart1));
+                                lcx.data.func.code.set(s, Ins::SUB(IRT_IDX, end, start));
+                            }
+                        }
+                    }
+                    let len = emitshapelen(&lcx.data.func, shape, dim);
+                    let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, len));
+                    let mut col = newcollect(lcx, tty, shape);
+                    let j = emitrangeloop(&lcx.data.func, &mut col.reduce.loop_, IRT_IDX, start, end);
+                    lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, j));
+                    if let Some((start, out)) = innerloop {
+                        lcx.data.func.code.set(col.reduce.loop_.body, start);
+                        col.reduce.loop_.body = out;
+                    }
+                    let (out, result, start) = closecollect(lcx, col, value, None.into());
+                    innerloop = Some((start, out));
+                    flat = thisflat;
+                    value = result;
+                }
+                lcx.tmp.truncate(base);
             }
         }
-        let len = emitshapelen(&lcx.data.func, shape, dim);
-        let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, len));
-        let mut col = newcollect(lcx, cty, shape);
-        let j = emitrangeloop(&lcx.data.func, &mut col.reduce.loop_, IRT_IDX, start, end);
-        lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, j));
-        if let Some((start, out)) = innerloop {
-            lcx.data.func.code.set(col.reduce.loop_.body, start);
-            col.reduce.loop_.body = out;
-        }
-        let (out, result, start) = closecollect(lcx, col, value, None.into());
-        innerloop = Some((start, out));
-        flat = thisflat;
-        value = result;
     }
-    lcx.tmp.truncate(base);
+    // 2. explicit indices
     if explicitdim > 0 {
         fn xnewreduce(func: &Func, ds: usize, inner_inits: Option<InsId>) -> (Reduce, InsId) {
             let l_phis = func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
@@ -1510,9 +1559,6 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
             }
             (reduce, inits)
         }
-        let ann: ObjRef<TTEN> = vget.ann.cast();
-        let cty = &objs[ann];
-        let dim = cty.dim as usize;
         let shape = reserve(&lcx.data.func, dim);
         let (ds, ptrs, esizes) = alloctensordata(lcx, cty, shape);
         // emit inner loop
@@ -1530,18 +1576,31 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
         // have tail?
         if explicitdim < dim {
             let [thisflat] = areserve(&lcx.data.func);
-            let mut start = thisflat;
             let taildim = dim - explicitdim;
-            axis -= taildim;
             shapeend -= taildim as isize;
-            for i in 0..taildim {
-                debug_assert!(target.axes[axis+i].rank == Axis::SCALAR);
-                lcx.data.func.code.set(shapeend + i as isize,
-                    Ins::RES(IRT_IDX, call, target.axes[axis+i].ret));
-                start = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, shapeend + i as isize));
-            }
-            let len = emitshapelen(&lcx.data.func, shapeend, taildim);
-            let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, len));
+            let (start, end) = match flattail {
+                true => {
+                    // flat tail is one-dimensional
+                    debug_assert!(taildim == 1);
+                    axis = min(sdim, tdim-vget.idx.len()) + vget.idx.len();
+                    let (start, end) = emitsplatbounds(lcx, target, thisflat, call, axis, tdim);
+                    lcx.data.func.code.set(shapeend, Ins::SUB(IRT_IDX, end, start));
+                    (start, end)
+                },
+                false => {
+                    let mut start = thisflat;
+                    axis -= taildim;
+                    for i in 0..taildim {
+                        debug_assert!(target.axes[axis+i].rank == Axis::SCALAR);
+                        lcx.data.func.code.set(shapeend + i as isize,
+                            Ins::RES(IRT_IDX, call, target.axes[axis+i].ret));
+                        start = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, shapeend + i as isize));
+                    }
+                    let len = emitshapelen(&lcx.data.func, shapeend, taildim);
+                    let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, len));
+                    (start, end)
+                }
+            };
             let j = emitrangeloop(&lcx.data.func, &mut reduce.loop_, IRT_IDX, start, end);
             lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, j));
             if let Some((start, out)) = innerloop {
@@ -1554,6 +1613,7 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
             (reduce, inits) = xnewreduce(&lcx.data.func, ds, Some(inits));
         }
         // handle explicit dimensions
+        let mut edim = explicitdim;
         for &i in vget.idx.iter().rev() {
             axis -= 1;
             let [thisflat] = areserve(&lcx.data.func);
@@ -1562,8 +1622,8 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
                 true => emitvalue(lcx, ctr, i),
                 false => {
                     let d = typedim(objs, i.erase());
-                    explicitdim -= d as usize;
-                    let (j,s) = match explicitdim {
+                    edim -= d as usize;
+                    let (j,s) = match edim {
                         0 /* outermost explicit dimension */ => {
                             let s = emitshape(lcx, ctr, i);
                             let j = emititer(lcx, &mut reduce.loop_, i);
@@ -1623,17 +1683,16 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
             flat = thisflat;
         }
     }
-    // and now we have nothing but the prefix left
-    let sdim = source.axes.len();
-    let tdim = target.axes.len();
-    let axis_prefix = min(sdim, tdim-vget.idx.len());
-    debug_assert!(axis == axis_prefix);
-    let prefix = idxtransfer(lcx, source, target, sdim, axis, INS_FLATIDX);
-    lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
-    // close pending loop
-    let (start, out) = innerloop.unwrap();
-    swapctr(&lcx.data.func, ctr, start, out);
-    value
+    // 3. prefix
+    {
+        debug_assert!(axis == min(sdim, tdim-vget.idx.len()));
+        let prefix = idxtransfer(lcx, source, target, sdim, axis, INS_FLATIDX);
+        lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
+        // close pending loop
+        let (start, out) = innerloop.unwrap();
+        swapctr(&lcx.data.func, ctr, start, out);
+        value
+    }
 }
 
 // if ALL of the following are true...
