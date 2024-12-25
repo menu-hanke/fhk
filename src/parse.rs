@@ -1,6 +1,7 @@
 //! Source -> Graph.
 
 use core::cmp::max;
+use core::mem::replace;
 use core::ops::Range;
 
 use enumset::{enum_set, EnumSet};
@@ -132,11 +133,10 @@ fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> 
     Ok(expr)
 }
 
-fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> {
-    Ok(if pcx.data.token == Token::LBracket {
-        next(pcx)?;
-        let base = pcx.tmp.end();
-        let mut flat = false;
+// pushes indices on pcx.tmp, returns flat
+fn parse_vrefidx(pcx: &mut Pcx) -> compile::Result<bool> {
+    let mut flat = false;
+    if check(pcx, Token::LBracket)? {
         while pcx.data.token != Token::RBracket {
             if check(pcx, Token::DotDot)? {
                 flat = true;
@@ -147,13 +147,16 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
             if !check(pcx, Token::Comma)? { break }
         }
         consume(pcx, Token::RBracket)?;
-        let vget = pcx.objs.push_args(
-            VGET::new(flat as _, ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
-        pcx.tmp.truncate(base);
-        vget
-    } else {
-        pcx.objs.push(VGET::new(0, ObjRef::NIL, var)).cast()
-    })
+    }
+    Ok(flat)
+}
+
+fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> {
+    let base = pcx.tmp.end();
+    let flat = parse_vrefidx(pcx)?;
+    let vget = pcx.objs.push_args(VGET::new(flat as _, ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
+    pcx.tmp.truncate(base);
+    Ok(vget)
 }
 
 fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
@@ -389,40 +392,37 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
 }
 
 fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::Result {
-    #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-    #[repr(C)]
-    struct PendingVset { var: ObjRef<VAR>, value: ObjRef<EXPR>, ann: ObjRef }
     let base = pcx.tmp.end();
+    // note: vset.value = annotation
     loop {
         let var = parse_vref(pcx)?;
         pcx.objs[var].mark = 0;
-        if check(pcx, Token::LBracket)? {
-            if true { todo!(); } // TODO: parse subset
-            consume(pcx, Token::RBracket)?;
-        }
+        let base2 = pcx.tmp.end();
+        let flat = parse_vrefidx(pcx)?;
         let ann = parse_maybeann(pcx)?;
-        pcx.tmp.push(PendingVset { var, ann, value: ObjRef::NIL.cast() });
+        let vset = pcx.objs.push_args::<VSET>(VSET::new(flat as _, var, ann.cast()),
+            &pcx.tmp[base2.cast_up()..]);
+        pcx.tmp.truncate(base2);
+        pcx.tmp.push(vset);
         match pcx.data.token {
             Token::Comma => { next(pcx)?; continue; },
             Token::Eq    => { next(pcx)?; break },
             _            => return pcx.error(TokenError { want: Token::Comma | Token::Eq })
         }
     }
-    let pending_base = base.cast_up::<PendingVset>();
-    let n = pcx.tmp[pending_base..].len();
+    let vset_base = base.cast_up::<ObjRef<VSET>>();
+    let n = pcx.tmp[vset_base..].len();
     if n == 1 {
-        pcx.tmp[pending_base].value = parse_expr(pcx)?;
+        let value = parse_expr(pcx)?;
+        let ann = replace(&mut pcx.objs[pcx.tmp[vset_base]].value, value).erase();
+        pcx.objs.annotate(value, ann);
     } else {
         let call = parse_callx(pcx, n)?;
-        for (i, p) in pcx.tmp[pending_base..].iter_mut().enumerate() {
-            p.value = pcx.objs.push(GET::new(i as _, ObjRef::NIL, call.cast())).cast();
+        for (i, &p) in pcx.tmp[vset_base..].iter().enumerate() {
+            let value = pcx.objs.push(GET::new(i as _, ObjRef::NIL, call.cast())).cast();
+            let ann = replace(&mut pcx.objs[p].value, value).erase();
+            pcx.objs.annotate(value, ann);
         }
-    }
-    let vset_base = pcx.tmp.end().cast::<ObjRef<VSET>>();
-    for i in 0..n {
-        let PendingVset { var, value, ann } = pcx.tmp[pending_base.add_size(i as _)];
-        pcx.objs.annotate(value, ann);
-        pcx.tmp.push(pcx.objs.push(VSET::new(0, var, value)));
     }
     let guard = match check(pcx, Token::Where)? {
         true  => Some(parse_expr(pcx)?),

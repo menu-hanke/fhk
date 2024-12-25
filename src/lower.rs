@@ -365,6 +365,30 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         let vst = if mt == Mod::SIMPLE {
             VSet::SIMPLE
         } else if isprefixidx(&ctx.objs, obj.tab, ctx.objs[vset.var].tab, &vset.idx) {
+            if vset.flat == 0 && ctx.objs[ctx.objs[obj.tab].shape].fields.len()
+                + (typedim(&ctx.objs, vset.value.erase()) as usize)
+                < ctx.objs[ctx.objs[ctx.objs[vset.var].tab].shape].fields.len()
+            {
+                // TODO: decide what to do here. the VSET value is a nested array, but the PREFIX
+                // optimization assumes a flat array. there are a few possible ways to implement
+                // this case:
+                // (1) flatten the nested array on assignment in VSET
+                //   + one-time cost
+                //   + access is simple
+                //   - one-time cost is still a cost
+                //   - unnecessary allocs (but should be eliminatable)
+                // (2) access the nested array in var load
+                //   + no extra cost for VSET
+                //   + no extra allocs
+                //   - access needs to chase pointers every time
+                // (3) move this to COMPLEX
+                //   + no extra code because this case needs to be handled in complex anyway
+                //   - maybe more pessimized (but doesn't really matter since it's a rare case)
+                // probably the best solution is (3) and then inside COMPLEX implement a nested
+                // vset value using the technique (1), ie. create a lookup table for the explicit
+                // part and flatten the implicit part.
+                todo!()
+            }
             VSet::PREFIX
         } else {
             VSet::COMPLEX
@@ -1699,6 +1723,7 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
 //   (1) the VGET variable has exactly one model,
 //   (2) VGET and VSET tables match,
 //   (3) VGET and VSET indices match,
+//   (4) VGET and VSET flatness matches,
 // then emit a direct load from the model
 fn emitfwdvget(lcx: &mut Lcx, vget: &VGET) -> IndexOption<InsId> {
     let lower = &mut *lcx.data;
@@ -1706,6 +1731,7 @@ fn emitfwdvget(lcx: &mut Lcx, vget: &VGET) -> IndexOption<InsId> {
     let var = &bump[vardata(&lower.objs, vget.var)];
     let [vset] = var.value else { return None.into() };
     let vset = &bump[vset];
+    if lcx.objs[vset.obj].flat != vget.flat { return None.into() };
     let model = &bump[vset.model];
     // TODO: this check can be relaxed, just need to translate index.
     if !sametab(&lcx.objs, &bump[lower.tab], &bump[model.tab]) { return None.into() }
@@ -2407,7 +2433,7 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
                     for (j, &ty) in lcx.data.tmp_vty.iter().enumerate() {
                         let res = lcx.data.func.code.push(
                             Ins::RES(Type::PTR, call, vset.ret + j as isize));
-                        let ptr = emitarrayptr(&lcx.data.func, res + j as isize, ofs, ty);
+                        let ptr = emitarrayptr(&lcx.data.func, res, ofs, ty);
                         lcx.data.func.code.set(base + j as isize, Ins::LOAD(ty, ptr));
                     }
                     base
