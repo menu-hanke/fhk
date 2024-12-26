@@ -358,7 +358,7 @@ fn ins_box(ecx: &mut Ecx, id: InsId) {
 
 fn ins_abox(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
-    let (size, align) = emit.code[id].decode_ABOX();
+    let (_, size, align) = emit.code[id].decode_ABOX();
     let frame = emit.fb.frame(&mut emit.frame);
     let ofs = frame.layout.alloc(size as _, align as _);
     emit.values[id] = InsValue { raw: ofs as _ };

@@ -130,9 +130,9 @@ fn earlyvisit(
         return early
     }
     let cins = code.at(id);
-    let block = match cins.opcode() {
-        Opcode::PHI => ins[zerocopy::transmute!(cins.a())].early,
-        _ => {
+    let block = match cins.opcode().is_pinned() {
+        true => ins[cins.controls()[0]].early,
+        false => {
             let mut b = BlockId::START;
             for &input in dfg.inputs(id) {
                 let ib = earlyvisit(ins, blocks, dfg, code, input);
@@ -157,6 +157,7 @@ fn latevisit(
     blocks: &IndexSlice<BlockId, Block>,
     dfg: &Dataflow<InsId>,
     mat: &ControlMatrix,
+    code: &Code,
     work: &mut Vec<u16>, // <BlockId>
     id: InsId
 ) -> Range<InsIdP> {
@@ -165,19 +166,25 @@ fn latevisit(
         return pos .. pos + n as isize
     }
     let base = work.len();
+    let pinned = code.at(id).opcode().is_pinned();
+    if pinned {
+        work.push(zerocopy::transmute!(ins[id].early));
+    }
     for &user in dfg.uses(id) {
-        let upos = latevisit(ins, place, blocks, dfg, mat, work, user);
-        'uloop: for u in index::iter_range(upos) {
-            let ublock = place[u];
-            for b in &mut work[base..] {
-                let up = lca(blocks, ublock, zerocopy::transmute!(*b));
-                if mat[blocks[up].ctr].test(id) {
-                    // note: if i had a fancy rematerialization algorith, it would go right here.
-                    *b = zerocopy::transmute!(up);
-                    continue 'uloop;
+        let upos = latevisit(ins, place, blocks, dfg, mat, code, work, user);
+        if !pinned {
+            'uloop: for u in index::iter_range(upos) {
+                let ublock = place[u];
+                for b in &mut work[base..] {
+                    let up = lca(blocks, ublock, zerocopy::transmute!(*b));
+                    if mat[blocks[up].ctr].test(id) {
+                        // note: if i had a fancy rematerialization algorith, it would go right here.
+                        *b = zerocopy::transmute!(up);
+                        continue 'uloop;
+                    }
                 }
+                work.push(zerocopy::transmute!(ublock));
             }
-            work.push(zerocopy::transmute!(ublock));
         }
     }
     // TODO: lift up loop invariants here
@@ -192,27 +199,17 @@ fn latevisit(
 
 fn lateschedule(gcm: &mut Gcm, code: &Code) {
     for id in index::iter_span(gcm.dfg.end()) {
-        if code.at(id).opcode() == Opcode::PHI {
-            gcm.work_u16.push(zerocopy::transmute!(id));
-        } else {
-            latevisit(
-                &mut gcm.ins,
-                &mut gcm.place,
-                &gcm.blocks,
-                &gcm.dfg,
-                &gcm.cmat,
-                &mut gcm.work_u16,
-                id
-            );
-        }
+        latevisit(
+            &mut gcm.ins,
+            &mut gcm.place,
+            &gcm.blocks,
+            &gcm.dfg,
+            &gcm.cmat,
+            code,
+            &mut gcm.work_u16,
+            id
+        );
     }
-    for &phi in &gcm.work_u16 {
-        let phi: InsId = zerocopy::transmute!(phi);
-        let ins = &mut gcm.ins[phi];
-        debug_assert!(ins.pos == InsIdP::INVALID.into());
-        ins.pos = gcm.place.push(ins.early);
-    }
-    gcm.work_u16.clear();
 }
 
 fn dominates(blocks: &IndexSlice<BlockId, Block>, a: BlockId, mut b: BlockId) -> bool {

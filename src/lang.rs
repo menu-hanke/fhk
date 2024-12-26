@@ -17,7 +17,7 @@ use crate::parser::Pcx;
 
 pub trait Language: Sized {
     fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>>;
-    fn lower(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId;
+    fn lower(lcx: &mut CLcx, ctr: InsId, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId;
     fn begin_emit(ccx: &mut Ccx) -> compile::Result<Self>;
     fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<InsValue>;
     #[allow(unused_variables)]
@@ -107,11 +107,12 @@ impl Lang {
     pub fn lower(
         self,
         lcx: &mut CLcx,
+        ctr: InsId,
         obj: ObjRef<CALLX>,
         func: &Func,
         inputs: &[InsId]
     ) -> InsId {
-        dispatch!(self, Lang => Lang::lower(lcx, obj, func, inputs))
+        dispatch!(self, Lang => Lang::lower(lcx, ctr, obj, func, inputs))
     }
 
     pub fn emit(self, ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<InsValue> {

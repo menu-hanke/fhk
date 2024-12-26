@@ -591,7 +591,13 @@ fn lower_value(lower: &LowerState, tmp: &BumpPtr, func: &Func, value: Value) -> 
     }
 }
 
-fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+fn lower_call(
+    lcx: &mut CLcx,
+    ctr: InsId,
+    obj: ObjRef<CALLX>,
+    func: &Func,
+    inputs: &[InsId]
+) -> InsId {
     let callx = &lcx.objs[obj];
     let call: BumpRef<Call> = zerocopy::transmute!(callx.func);
     let call = &lcx.perm[call];
@@ -600,7 +606,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
         size => {
             let size = func.code.push(Ins::KINT(Type::I64, size as _));
             let align = func.code.push(Ins::KINT(Type::I64, call.align as _));
-            func.code.push(Ins::ALLOC(size, align))
+            func.code.push(Ins::ALLOC(size, align, ctr))
         }
     };
     let callins = func.code.push(Ins::NOP_FX);
@@ -668,7 +674,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
                     }
                     // this can overalign and that's ok
                     let align = func.code.push(Ins::KINT(Type::I64, 8));
-                    let alloc = func.code.push(Ins::ALLOC(len, align));
+                    let alloc = func.code.push(Ins::ALLOC(len, align, ctr));
                     *op = alloc;
                     func.code.set(cursor, Ins::MOVF(Type::PTR, alloc, callins));
                     cursor += 1;
@@ -792,9 +798,15 @@ impl Language for C {
         Ok(obj)
     }
 
-    fn lower(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+    fn lower(
+        lcx: &mut CLcx,
+        ctr: InsId,
+        obj: ObjRef<CALLX>,
+        func: &Func,
+        inputs: &[InsId]
+    ) -> InsId {
         let base = lcx.tmp.end();
-        let res = lower_call(lcx, obj, func, inputs);
+        let res = lower_call(lcx, ctr, obj, func, inputs);
         lcx.tmp.truncate(base);
         res
     }

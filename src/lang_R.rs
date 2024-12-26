@@ -233,7 +233,13 @@ fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALLX>> {
 
 /* ---- Lowering ------------------------------------------------------------ */
 
-fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+fn lower_call(
+    lcx: &mut CLcx,
+    ctr: InsId,
+    obj: ObjRef<CALLX>,
+    func: &Func,
+    inputs: &[InsId]
+) -> InsId {
     let mut args = func.code.push(Ins::NOP(Type::LSV));
     let [call] = areserve(func);
     let callx = &lcx.objs[obj];
@@ -263,7 +269,7 @@ fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId])
             curout += 1;
         }
         lcx.tmp.truncate(base);
-        func.code.set(abox, Ins::ABOX(cursor.ptr as _, cursor.align as _));
+        func.code.set(abox, Ins::ABOX(ctr, cursor.ptr as _, cursor.align as _));
     }
     for (&i,&o) in zip(inputs, &callx.inputs).rev() {
         let ann = lcx.objs[o].ann;
@@ -706,8 +712,14 @@ impl Language for R {
         parse_call(pcx)
     }
 
-    fn lower(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
-        lower_call(lcx, obj, func, inputs)
+    fn lower(
+        lcx: &mut CLcx,
+        ctr: InsId,
+        obj: ObjRef<CALLX>,
+        func: &Func,
+        inputs: &[InsId]
+    ) -> InsId {
+        lower_call(lcx, ctr, obj, func, inputs)
     }
 
     fn begin_emit(ccx: &mut Ccx) -> compile::Result<Self> {

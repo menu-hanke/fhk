@@ -313,12 +313,12 @@ define_opcodes! {
     ULT.B1    V V;
     ULE.B1    V V;
 
-    ALLOC.PTR V V;                     // size align
+    ALLOC.PTR V V C;                   // size align control
     STORE.FX  V V;                     // ptr value
     LOAD      V;                       // ptr
 
     BOX.LSV   V;
-    ABOX.LSV  X X,   decode_ABOX;      // size align
+    ABOX.LSV  C X X, decode_ABOX;      // control size align
     BREF.PTR  V;
 
     CALL.FX   V F,   decode_CALL;      // args func
@@ -358,6 +358,11 @@ impl Opcode {
     pub fn is_lang(self) -> bool {
         use Opcode::*;
         (LO|LOV|LOVV|LOVX|LOX|LOXX).contains(self)
+    }
+
+    pub fn is_pinned(self) -> bool {
+        use Opcode::*;
+        (PHI|ALLOC|ABOX).contains(self)
     }
 
     pub fn num_v(self) -> usize {
@@ -588,7 +593,6 @@ pub struct Func {
     pub arg: PhiId, // one past last argument
     pub phis: IndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
-    // TODO: box size
 }
 
 #[derive(Default)]

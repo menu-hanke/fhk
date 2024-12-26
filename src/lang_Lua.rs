@@ -622,7 +622,13 @@ impl Language for Lua {
         Ok(obj)
     }
 
-    fn lower(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+    fn lower(
+        lcx: &mut CLcx,
+        _ctr: InsId,
+        obj: ObjRef<CALLX>,
+        func: &Func,
+        inputs: &[InsId]
+    ) -> InsId {
         lower_call(lcx, obj, func, inputs)
     }
 

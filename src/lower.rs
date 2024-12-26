@@ -1224,7 +1224,7 @@ fn emitcallx(lcx: &mut Lcx, ctr: &mut InsId, callx: ObjRef<CALLX>) -> InsId {
         //   &mut Ccx<Lower> -> &mut Ccx<UnsafeCell<Lower>>
         let lcx: &mut CLcx = unsafe { core::mem::transmute(&mut *lcx) };
         let lower = Access::borrow(&lcx.data);
-        lang.lower(lcx, callx, &lower.func, &lower.tmp_ins[base..])
+        lang.lower(lcx, *ctr, callx, &lower.func, &lower.tmp_ins[base..])
     };
     lcx.data.tmp_ins.truncate(base);
     value
@@ -1240,7 +1240,7 @@ fn emitcat(lcx: &mut Lcx, ctr: &mut InsId, cat: &CAT) -> InsId {
     let out = reserve(&lcx.data.func, 1);
     let len = lcx.data.func.code.push(Ins::KINT(IRT_IDX, cat.elems.len() as _));
     let size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, elemsize, len));
-    let buf = lcx.data.func.code.push(Ins::ALLOC(size, elemsize));
+    let buf = lcx.data.func.code.push(Ins::ALLOC(size, elemsize, *ctr));
     let mut ret = buf;
     for (i,&e) in cat.elems.iter().enumerate() {
         let v = emitvalue(lcx, ctr, e);
@@ -1312,10 +1312,10 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
 
 fn alloctensordata(
     lcx: &mut Lcx,
+    ctr: InsId,
     type_: &TTEN,
     shape: InsId
 ) -> (
-    /* element decomposition size: */ usize,
     /* data pointers: */ InsId,
     /* element sizes: */ InsId
 ) {
@@ -1328,10 +1328,10 @@ fn alloctensordata(
     for (i, ty) in decomposition(&lcx.objs, type_.elem, &mut lcx.tmp).iter().enumerate() {
         lower.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
         let size = lower.func.code.push(Ins::MUL(IRT_IDX, len, esizes + i as isize));
-        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize));
+        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize, ctr));
     }
     lcx.tmp.truncate(base);
-    (ds, ptrs, esizes)
+    (ptrs, esizes)
 }
 
 struct Collect {
@@ -1339,16 +1339,19 @@ struct Collect {
     ds: u16,
     dim: u8,
     shape: InsId,
-    esizes: InsId
+    esizes: InsId,
+    ptrs: InsId
 }
 
 fn newcollect(lcx: &mut Lcx, cty: &TTEN, shape: InsId) -> Collect {
-    let (ds, ptrs, esizes) = alloctensordata(lcx, cty, shape);
+    let ds = decomposition_size(&lcx.objs, cty.elem);
     let lower = &*lcx.data;
-    let l_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::PTR), ds));
-    let r_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::PTR), ds));
-    let reduce = newreduce(&lower.func, l_phis, r_phis, ptrs, ds as _);
-    Collect { reduce, ds: ds as _, esizes, dim: cty.dim, shape }
+    let l_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
+    let r_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
+    let inits = lower.func.code.extend(repeat_n(Ins::NOP(Type::FX), ds));
+    let reduce = newreduce(&lower.func, l_phis, r_phis, inits, ds as _);
+    let (ptrs, esizes) = alloctensordata(lcx, reduce.loop_.head, cty, shape);
+    Collect { reduce, ds: ds as _, esizes, dim: cty.dim, shape, ptrs }
 }
 
 fn closecollect(
@@ -1362,41 +1365,41 @@ fn closecollect(
     /* ctr instruction: */ Ins,
 ) {
     let lower = &*lcx.data;
-    let Collect { mut reduce, ds, esizes, dim, shape } = collect;
+    let Collect { mut reduce, ds, esizes, dim, shape, ptrs } = collect;
     let ds = ds as usize;
     let next = reserve(&lower.func, ds);
     match i.unpack() {
         Some(j) => {
             for i in 0..ds as isize {
                 let ofs = lower.func.code.push(Ins::MUL(IRT_IDX, esizes + i, j));
-                let ptr = lower.func.code.push(Ins::ADDP(reduce.value + i, ofs));
+                let ptr = lower.func.code.push(Ins::ADDP(ptrs + i, ofs));
                 let store = lower.func.code.push(Ins::STORE(ptr, value + i));
-                lower.func.code.set(next + i, Ins::MOVF(Type::PTR, reduce.value + i, store));
+                lower.func.code.set(next + i, Ins::MOVF(Type::FX, reduce.value + i, store));
             }
         },
         None => {
             let p_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::PTR), ds));
+            let heads = reserve(&lower.func, ds);
             for i in 0..ds as isize {
-                let head = reserve(&lower.func, 1);
-                lower.func.code.set(reduce.loop_.head, Ins::JMP(reduce.init + i, head, p_phis + i));
-                reduce.loop_.head = head;
+                lower.func.code.set(reduce.loop_.head, Ins::JMP(ptrs + i, heads + i, p_phis + i));
+                reduce.loop_.head = heads + i;
             }
             let body = reduce.loop_.body;
+            let tails = reserve(&lower.func, ds);
             for i in 0..ds as isize {
                 let ptr = lower.func.code.push(Ins::PHI(Type::PTR, body, p_phis + i));
                 let store = lower.func.code.push(Ins::STORE(ptr, value + i));
-                lower.func.code.set(next+i, Ins::MOVF(Type::PTR, reduce.value+i, store));
+                lower.func.code.set(next + i, Ins::MOVF(Type::FX, reduce.value + i, store));
                 let next_ptr = lower.func.code.push(Ins::ADDP(ptr, esizes + i));
-                let tail = reserve(&lower.func, 1);
-                lower.func.code.set(reduce.loop_.tail, Ins::JMP(next_ptr, tail, p_phis+i));
-                reduce.loop_.tail = tail;
+                lower.func.code.set(reduce.loop_.tail, Ins::JMP(next_ptr, tails + i, p_phis + i));
+                reduce.loop_.tail = tails + i;
             }
         }
     }
     let start = reduce.start;
     let out = reduce.loop_.out;
-    let ptrs = closereduce(&lower.func, &reduce, next);
-    let ret = lower.func.code.extend((0..ds as isize).map(|i| Ins::MOV(Type::PTR, ptrs+i)));
+    let stores = closereduce(&lower.func, &reduce, next);
+    let ret = lower.func.code.extend((0..ds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, stores+i)));
     lcx.data.func.code.extend((0..dim as isize).map(|i| Ins::MOV(IRT_IDX, shape+i)));
     (out, ret, start)
 }
@@ -1419,7 +1422,7 @@ fn materializecollect(
     for (i, ty) in decomposition__old(&lcx.objs, cty.elem, &mut lower.tmp_ty).iter().enumerate() {
         lower.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
         let size = lower.func.code.push(Ins::MUL(IRT_IDX, len, esizes + i as isize));
-        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize));
+        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize, *ctr));
     }
     let l_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
     let r_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
@@ -1584,17 +1587,21 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
             (reduce, inits)
         }
         let shape = reserve(&lcx.data.func, dim);
-        let (ds, ptrs, esizes) = alloctensordata(lcx, cty, shape);
         // emit inner loop
+        let ds = decomposition_size(objs, cty.elem);
         let (mut reduce, mut inits) = xnewreduce(&lcx.data.func, ds, None);
         let mut next = reserve(&lcx.data.func, 2*ds);
-        for i in 0..ds as isize {
+        let base = lcx.tmp.end();
+        for (i, ty) in decomposition(objs, cty.elem, &mut lcx.tmp).iter().enumerate() {
+            let i = i as isize;
             let effect = reduce.value + i;
             let ptr = reduce.value + ds as isize + i;
             let store = lcx.data.func.code.push(Ins::STORE(ptr, value + i));
             lcx.data.func.code.set(next + i, Ins::MOVF(Type::FX, store, effect));
-            lcx.data.func.code.set(next + ds as isize + i, Ins::ADDP(ptr, esizes + i));
+            let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
+            lcx.data.func.code.set(next + ds as isize + i, Ins::ADDP(ptr, size));
         }
+        lcx.tmp.truncate(base);
         // emit outer loops
         let mut shapeend = shape + dim as isize;
         // have tail?
@@ -1651,6 +1658,7 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
                         0 /* outermost explicit dimension */ => {
                             let s = emitshape(lcx, ctr, i);
                             let j = emititer(lcx, &mut reduce.loop_, i);
+                            let (ptrs, _) = alloctensordata(lcx, *ctr, cty, shape);
                             if let Some((start, out)) = innerloop {
                                 lcx.data.func.code.set(reduce.loop_.body, start);
                                 reduce.loop_.body = out;
@@ -1762,7 +1770,7 @@ fn emitnew(lcx: &mut Lcx, ctr: &mut InsId, new: &NEW) -> InsId {
     for (i,&ty) in deco.iter().enumerate() {
         let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
         let num = lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, size));
-        lcx.data.func.code.set(out + i as isize, Ins::ALLOC(num, size));
+        lcx.data.func.code.set(out + i as isize, Ins::ALLOC(num, size, *ctr));
     }
     lcx.tmp.truncate(base);
     for i in 0..0+new.shape.len() {
@@ -1797,7 +1805,7 @@ fn emitwhich(lcx: &mut Lcx, ctr: &mut InsId, cty: &TTEN, expr: ObjRef<EXPR>) -> 
     let lower = &mut *lcx.data;
     let idxsize = lower.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
     let size = lower.func.code.push(Ins::MUL(IRT_IDX, shape, idxsize));
-    let buf = lower.func.code.push(Ins::ALLOC(size, idxsize));
+    let buf = lower.func.code.push(Ins::ALLOC(size, idxsize, *ctr));
     let bufphi = lower.func.phis.push(Phi::new(Type::PTR));
     let l_storephi = lower.func.phis.push(Phi::new(Type::FX));
     lower.func.phis.push(Phi::new(IRT_IDX)); // l_numphi, must be here
@@ -2190,7 +2198,7 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
             },
             _ /* VECTOR */ => {
                 let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
-                let ptr = lcx.data.func.code.push(Ins::ALLOC(size, size));
+                let ptr = lcx.data.func.code.push(Ins::ALLOC(size, size, ctr));
                 let store = lcx.data.func.code.push(Ins::STORE(ptr, zero));
                 let ptr = lcx.data.func.code.push(Ins::MOVF(Type::PTR, ptr, store));
                 fail = lcx.data.func.code.push(Ins::JMP(ptr, fail, ret));
@@ -2264,7 +2272,7 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
                     let l_phis = lcx.data.func.phis.extend([Phi::new(Type::FX), Phi::new(IRT_IDX)]);
                     let r_phis = lcx.data.func.phis.extend([Phi::new(Type::FX), Phi::new(IRT_IDX)]);
                     let fbytes = lcx.data.func.code.push(Ins::MUL(IRT_IDX, flen, idxsize));
-                    let alloc = lcx.data.func.code.push(Ins::ALLOC(fbytes, idxsize));
+                    let alloc = lcx.data.func.code.push(Ins::ALLOC(fbytes, idxsize, ctr));
                     let init = lcx.data.func.code.push(Ins::STORE(alloc, zero));
                     lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0)); // cursor init, must be here
                     let mut reduce = newreduce(&lcx.data.func, l_phis, r_phis, init, 2);
@@ -2292,7 +2300,7 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
                     // skip first element of f (zero)
                     let f = lcx.data.func.code.push(Ins::ADDP(f, idxsize));
                     let bbytes = lcx.data.func.code.push(Ins::MUL(IRT_IDX, n, idxsize));
-                    let alloc = lcx.data.func.code.push(Ins::ALLOC(bbytes, idxsize));
+                    let alloc = lcx.data.func.code.push(Ins::ALLOC(bbytes, idxsize, ctr));
                     // alloc must become a phi here to prevent the scheduler from sinking it inside
                     // the loop (TODO: actually this is true for the above loop, too)
                     let l_phi = lcx.data.func.phis.push(Phi::new(Type::PTR));
