@@ -93,7 +93,6 @@ pub enum Token {
     #[token("'")]         Apostrophe,
     #[token("$")]         Dollar,
     #[token("..")]        DotDot,
-    #[token("##")]        HashHash,
     #[token("$$")]        DollarDollar,
 
     // keywords
@@ -166,7 +165,6 @@ impl Token {
             Ge         => ">=",
             Ne         => "!=",
             DotDot     => "..",
-            HashHash   => "##",
             DollarDollar => "$$",
             Dot        => ".",
             Apostrophe => "'",

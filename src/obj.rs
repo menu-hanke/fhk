@@ -314,6 +314,7 @@ define_ops! {
     // (TFUNC for functions + generic type annotations TPAR/TCON etc)
     // expressions. ann must be first.
     NIL         { ann: ObjRef<TTUP> };
+    SPLAT       { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     KINT        { ann: ObjRef/*TY*/, k: i32 };
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };

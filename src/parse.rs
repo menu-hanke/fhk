@@ -12,7 +12,7 @@ use crate::err::ErrorMessage;
 use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LOAD, MOD, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, Binding, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
@@ -252,7 +252,18 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             next(pcx)?;
             let base = pcx.tmp.end();
             while pcx.data.token != Token::RBracket {
-                let value = parse_expr(pcx)?;
+                let value = if check(pcx, Token::DotDot)? {
+                    // UNARY_PRIORITY here makes it behave like an unary operator, so that eg.
+                    //   [..a+b]
+                    // is not syntactically valid, you need to say
+                    //   [..(a+b)]
+                    // just in case this becomes an actual unary operator later.
+                    // plus it looks cleaner anyway.
+                    let value = parse_binop(pcx, UNARY_PRIORITY)?;
+                    pcx.objs.push(SPLAT::new(ObjRef::NIL, value)).cast()
+                } else {
+                    parse_expr(pcx)?
+                };
                 pcx.tmp.push(value);
                 if !check(pcx, Token::Comma)? { break }
             }

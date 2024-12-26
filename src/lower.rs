@@ -15,7 +15,7 @@ use crate::index::{IndexOption, InvalidValue};
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::{Primitive, IRT_IDX};
@@ -559,6 +559,23 @@ fn emitarrayptr(func: &Func, base: InsId, mut idx: InsId, ty: Type) -> InsId {
     func.code.push(Ins::ADDP(base, idx))
 }
 
+fn emitmultistore(
+    func: &Func,
+    buf: InsId,
+    stride: InsId,
+    idx: InsId,
+    value: InsId,
+    num: usize
+) -> InsId {
+    let store = reserve(func, num);
+    for i in 0..num as isize {
+        let ofs = func.code.push(Ins::MUL(IRT_IDX, idx, stride+i));
+        let ptr = func.code.push(Ins::ADDP(buf+i, ofs));
+        func.code.set(store+i, Ins::STORE(ptr, value+i));
+    }
+    store
+}
+
 fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var> {
     objs[&var.erase()].cast()
 }
@@ -675,6 +692,13 @@ fn newreduce(func: &Func, l_phi: PhiId, r_phi: PhiId, init: InsId, num: u16) -> 
     }
 }
 
+fn newreducefx(func: &Func, num: u16) -> Reduce {
+    let l_phis = func.phis.extend(repeat_n(Phi::new(Type::FX), num as usize));
+    let r_phis = func.phis.extend(repeat_n(Phi::new(Type::FX), num as usize));
+    let inits = func.code.extend(repeat_n(Ins::NOP(Type::FX), num as usize));
+    newreduce(func, l_phis, r_phis, inits, num)
+}
+
 // logically this takes ownership of the reduce, in the sense that it shouldn't be used anymore.
 // but taking a reference here makes usage a bit more ergonomic.
 fn closereduce(func: &Func, reduce: &Reduce, next: InsId) -> InsId {
@@ -695,6 +719,31 @@ fn closereduce(func: &Func, reduce: &Reduce, next: InsId) -> InsId {
         (0..num as isize)
         .map(|i| Ins::PHI(func.phis.at(r_phi+i).type_, reduce.loop_.out, r_phi+i))
     )
+}
+
+fn emitreducestore(
+    func: &Func,
+    reduce: &mut Reduce,
+    bufs: InsId,
+    strides: InsId,
+    values: InsId,
+    start: IndexOption<InsId>
+) -> InsId {
+    let idx_phi = func.phis.push(Phi::new(IRT_IDX));
+    let [head, tail] = areserve(func);
+    let start = match start.unpack() {
+        Some(i) => i,
+        None => func.code.push(Ins::KINT(IRT_IDX, 0))
+    };
+    func.code.set(reduce.loop_.head, Ins::JMP(start, head, idx_phi));
+    reduce.loop_.head = head;
+    let idx = func.code.push(Ins::PHI(IRT_IDX, reduce.loop_.body, idx_phi));
+    let next = emitmultistore(func, bufs, strides, idx, values, reduce.num as _);
+    let one = func.code.push(Ins::KINT(IRT_IDX, 1));
+    let next_idx = func.code.push(Ins::ADD(IRT_IDX, idx, one));
+    func.code.set(reduce.loop_.tail, Ins::JMP(next_idx, tail, idx_phi));
+    reduce.loop_.tail = tail;
+    next
 }
 
 /* ---- Indexing ------------------------------------------------------------ */
@@ -1230,27 +1279,51 @@ fn emitcallx(lcx: &mut Lcx, ctr: &mut InsId, callx: ObjRef<CALLX>) -> InsId {
     value
 }
 
-// TODO: use code from materializecollect for splat `..x` implementation
 fn emitcat(lcx: &mut Lcx, ctr: &mut InsId, cat: &CAT) -> InsId {
-    debug_assert!(lcx.objs[cat.ann].op == Obj::TTEN);
-    if lcx.objs[cat.ann.cast::<TTEN>()].dim != 1 { todo!() }
-    let pri = Primitive::from_u8(lcx.objs[lcx.objs[cat.ann.cast::<TTEN>()].elem.cast::<TPRI>()].ty);
-    let ty = pri.to_ir();
-    let elemsize = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
-    let out = reserve(&lcx.data.func, 1);
-    let len = lcx.data.func.code.push(Ins::KINT(IRT_IDX, cat.elems.len() as _));
-    let size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, elemsize, len));
-    let buf = lcx.data.func.code.push(Ins::ALLOC(size, elemsize, *ctr));
-    let mut ret = buf;
-    for (i,&e) in cat.elems.iter().enumerate() {
-        let v = emitvalue(lcx, ctr, e);
-        let ofs = lcx.data.func.code.push(Ins::KINT(IRT_IDX, (i*ty.size()) as _));
-        let ptr = lcx.data.func.code.push(Ins::ADDP(buf, ofs));
-        let store = lcx.data.func.code.push(Ins::STORE(ptr, v));
-        ret = lcx.data.func.code.push(Ins::MOVF(Type::PTR, ret, store));
+    let objs = Access::borrow(&lcx.objs);
+    let cty = &objs[cat.ann.cast::<TTEN>()];
+    debug_assert!(cty.op == Obj::TTEN);
+    if cty.dim != 1 { todo!() }
+    let idxs = reserve(&lcx.data.func, (cat.elems.len()+1) as _);
+    lcx.data.func.code.set(idxs, Ins::KINT(IRT_IDX, 0));
+    for (i, &e) in cat.elems.iter().enumerate() {
+        let len = match objs[e].op {
+            Obj::SPLAT => emitshape(lcx, ctr, objs[e.cast::<SPLAT>()].value),
+            _ => lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1))
+        };
+        lcx.data.func.code.set(idxs + 1 + i as isize, Ins::ADD(IRT_IDX, idxs + i as isize, len));
     }
-    lcx.data.func.code.set(out, Ins::MOV(Type::PTR, ret));
-    out
+    let ds = decomposition_size(objs, cty.elem);
+    let (ptrs, esizes) = alloctensordata(lcx, *ctr, cty, idxs + cat.elems.len() as isize);
+    let mut effects: IndexOption<InsId> = None.into();
+    for (i, &e) in cat.elems.iter().enumerate() {
+        let stores = match objs[e].op {
+            Obj::SPLAT => {
+                let mut reduce = newreducefx(&lcx.data.func, ds as _);
+                let value = emititer(lcx, &mut reduce.loop_, objs[e.cast::<SPLAT>()].value);
+                let next = emitreducestore(&lcx.data.func, &mut reduce, ptrs, esizes, value,
+                    Some(idxs + i as isize).into());
+                swapctr(&lcx.data.func, ctr, reduce.start, reduce.loop_.out);
+                closereduce(&lcx.data.func, &reduce, next)
+            },
+            _ => {
+                let value = emitvalue(lcx, ctr, e);
+                emitmultistore(&lcx.data.func, ptrs, esizes, idxs + i as isize, value, ds)
+            }
+        };
+        effects = Some(match effects.unpack() {
+            Some(fx) => lcx.data.func.code.extend(
+                (0..ds as isize).map(|j| Ins::MOVF(Type::FX, fx+j, stores+j))),
+            None => stores
+        }).into();
+    }
+    let ret = match effects.unpack() {
+        Some(fx) => lcx.data.func.code.extend(
+            (0..ds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, fx+i))),
+        None => lcx.data.func.code.extend((0..ds as isize).map(|i| Ins::MOV(Type::PTR, ptrs+i)))
+    };
+    lcx.data.func.code.push(Ins::MOV(IRT_IDX, idxs + cat.elems.len() as isize));
+    ret
 }
 
 fn emitget(lcx: &mut Lcx, ctr: &mut InsId, get: &GET) -> InsId {
@@ -1344,14 +1417,10 @@ struct Collect {
 }
 
 fn newcollect(lcx: &mut Lcx, cty: &TTEN, shape: InsId) -> Collect {
-    let ds = decomposition_size(&lcx.objs, cty.elem);
-    let lower = &*lcx.data;
-    let l_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
-    let r_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::FX), ds));
-    let inits = lower.func.code.extend(repeat_n(Ins::NOP(Type::FX), ds));
-    let reduce = newreduce(&lower.func, l_phis, r_phis, inits, ds as _);
+    let ds = decomposition_size(&lcx.objs, cty.elem) as u16;
+    let reduce = newreducefx(&lcx.data.func, ds);
     let (ptrs, esizes) = alloctensordata(lcx, reduce.loop_.head, cty, shape);
-    Collect { reduce, ds: ds as _, esizes, dim: cty.dim, shape, ptrs }
+    Collect { reduce, ds, esizes, dim: cty.dim, shape, ptrs }
 }
 
 fn closecollect(
@@ -1378,6 +1447,7 @@ fn closecollect(
             }
         },
         None => {
+            // TODO: remove this, use emitreducestore
             let p_phis = lower.func.phis.extend(repeat_n(Phi::new(Type::PTR), ds));
             let heads = reserve(&lower.func, ds);
             for i in 0..ds as isize {

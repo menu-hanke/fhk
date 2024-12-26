@@ -12,7 +12,7 @@ use crate::compile::{self, Ccx, Phase};
 use crate::dump::trace_objs;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
-use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, GET, INTR, KFP64, KINT, KINT64, LOAD, MOD, NEW, QUERY, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, GET, INTR, KFP64, KINT, KINT64, LOAD, MOD, NEW, QUERY, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, PRI_IDX};
@@ -770,6 +770,7 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Type
 fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
     let objs = Access::borrow(&tcx.objs);
     match objs.get(idx.erase()) {
+        ObjectRef::SPLAT(&SPLAT { value, .. }) => Some(Type::var(exprtype(tcx, value))),
         ObjectRef::KINT(&KINT { k, .. }) => Some(Type::pri(kintpri(k as _))),
         ObjectRef::KINT64(&KINT64 { k, .. }) => Some(Type::pri(kintpri(tcx.intern.bump()[k].get()))),
         ObjectRef::KFP64(&KFP64 { k, .. }) => Some(Type::pri(kfpri(tcx.intern.bump()[k].get()))),
@@ -788,13 +789,18 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::CAT(CAT { elems, .. } ) => {
             let e = newtypevar(&mut tcx.data.sub);
             let d = newtypevar(&mut tcx.data.sub);
+            let ty = Type::con(Constructor::TENSOR, e);
             for &v in elems {
                 let ety = exprtype(tcx, v);
-                let (ee, ed) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
-                unifyvar(&mut tcx.data.sub, e, Type::var(ee));
-                unifyvar(&mut tcx.data.sub, d, Type::con(Constructor::NEXT, ed));
+                if objs[v].op == Obj::SPLAT {
+                    unifyvar(&mut tcx.data.sub, ety, ty);
+                } else {
+                    let (ee, ed) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
+                    unifyvar(&mut tcx.data.sub, e, Type::var(ee));
+                    unifyvar(&mut tcx.data.sub, d, Type::con(Constructor::NEXT, ed));
+                }
             }
-            Some(Type::con(Constructor::TENSOR, e))
+            Some(ty)
         },
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
