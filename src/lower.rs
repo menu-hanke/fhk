@@ -328,14 +328,24 @@ fn isprefixidx(
     // TODO: analyze explicit indices
     if !idx.is_empty() { return false; }
     if source == target { return true; } // skip
-    let sdim = objs.dim(source);
+    let sax = &objs[objs[source].shape].fields;
+    let sdim = sax.len();
     if sdim == 0 { return true; } // skip
+    let tax = &objs[objs[target].shape].fields;
     let tdim = objs.dim(target);
     if sdim > tdim { return false; }
-    objs.allequal(
-        cast_args(&objs[objs[source].shape].fields),
-        cast_args(&objs[objs[target].shape].fields[..sdim])
-    )
+    if tdim == sdim+1 && tax[..sdim].iter().all(|o| o.is_nil()) {
+        // explicitly detect the special case:
+        //   table A[...]
+        //   table B[:,...,:,A.var]
+        // TODO more sophisticated analysis for this
+        if let ObjectRef::VGET(&VGET { var, idx: [], .. }) = objs.get(tax[sdim].erase()) {
+            if objs[var].tab == source {
+                return true;
+            }
+        }
+    }
+    objs.allequal(cast_args(sax), cast_args(&tax[..sdim]))
 }
 
 fn issimplemod(objs: &Objects, model: &MOD) -> bool {
@@ -810,21 +820,46 @@ fn idxbtran(
     }
 }
 
+fn commonprefixobj(objs: &Objects, a: &Tab, b: &Tab) -> usize {
+    zip(a.axes.iter(), b.axes.iter())
+        .take_while(|(aa, ab)| objs.equal(aa.size.erase(), ab.size.erase()))
+        .count()
+}
+
 // given tables
 //   A[i1, ..., iN]
 //   B[j1, ..., jM]
 // returns the largest K such that
 //   ik = jk for all 0 <= k < K
-fn commonprefix(objs: &Objects, a: &Tab, b: &Tab) -> usize {
-    if a as *const Tab as *const () == b as *const Tab as *const () { return a.axes.len() }
-    zip(a.axes.iter(), b.axes.iter())
-        .take_while(|(a, b)| objs.equal(a.size.erase(), b.size.erase()))
-        .count()
+fn commonprefix(lcx: &Lcx, mut a: BumpRef<Tab>, b: BumpRef<Tab>) -> usize {
+    let mut ta = &lcx.data.bump[a];
+    if a == b { return ta.axes.len() };
+    let mut tb = &lcx.data.bump[b];
+    if tb.axes.len() < ta.axes.len() {
+        (a, ta, tb) = (b, tb, ta);
+    }
+    let adim = ta.axes.len();
+    let bdim = tb.axes.len();
+    if bdim == adim+1 && tb.axes[..adim].iter().all(|x| x.size.is_nil()) {
+        // explicitly detect:
+        //   table A[...]
+        //   table B[;...,:,A.var]
+        // TODO more sophisticated analysis for this
+        if let ObjectRef::VGET(&VGET { var, idx: [], .. }) = lcx.objs.get(tb.axes[adim].size.erase()) {
+            if let Some(v) = lcx.data.objs.get(&var.erase()) {
+                if lcx.data.bump[v.cast::<Var>()].tab == a {
+                    return adim;
+                }
+            }
+        }
+    }
+    commonprefixobj(&lcx.objs, ta, tb)
 }
 
 // do A and B have the exact same shape?
 fn sametab(objs: &Objects, a: &Tab, b: &Tab) -> bool {
-    a.n == b.n && a.n as usize == commonprefix(objs, a, b)
+    (a as *const Tab as *const () == b as *const Tab as *const ())
+        || (a.n == b.n && a.n as usize == commonprefixobj(objs, a, b))
 }
 
 fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
@@ -840,8 +875,8 @@ fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
 // (source and target may be equal. if target_axis > source_axis, additional indices are zeros)
 fn idxtransfer(
     lcx: &mut Lcx,
-    source: &Tab,
-    target: &Tab,
+    source: BumpRef<Tab>,
+    target: BumpRef<Tab>,
     mut source_axis: usize,
     target_axis: usize,
     mut flat: InsId
@@ -849,7 +884,10 @@ fn idxtransfer(
     if target_axis == 0 {
         return lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
     }
-    let prefix = commonprefix(&lcx.objs, source, target);
+    let prefix = commonprefix(lcx, source, target);
+    let bump = Access::borrow(&lcx.data.bump);
+    let source = &bump[source];
+    let target = &bump[target];
     let sourcecall = match source_axis > min(target_axis, prefix) {
         true  => emittabcall(&lcx.data.func, source.func),
         false => InsId::INVALID.into()
@@ -866,17 +904,18 @@ fn idxtransfer(
         // here we have target_axis >= source_axis > prefix, due to the previous loop.
         // this necessarily implies source != target.
         // we must now transfer source_axis in `source` to source_axis in `target`.
-        // base+i will hold the prefix+1+i'th NON-flat index.
+        // base+i will hold the prefix+1+i'th NON-flat index in `source`.
         let source_axis0 = source_axis;
         let mut base = reserve(&lcx.data.func, source_axis-prefix);
         while source_axis > prefix {
-            flat = idxbtran(lcx, source, sourcecall, source_axis, flat);
+            let prev = idxbtran(lcx, source, sourcecall, source_axis, flat);
             source_axis -= 1;
-            let start = idxftran(lcx, source, sourcecall, source_axis, flat);
+            let start = idxftran(lcx, source, sourcecall, source_axis, prev);
             lcx.data.func.code.set(
                 base + (source_axis-prefix) as isize,
                 Ins::SUB(IRT_IDX, flat, start)
             );
+            flat = prev;
         }
         while source_axis < source_axis0 {
             flat = idxftran(lcx, target, targetcall, source_axis, flat);
@@ -898,7 +937,7 @@ fn idxtransfer(
 //   i{target_axis}
 fn axisidx(
     lcx: &mut Lcx,
-    tab: &Tab,
+    tab: BumpRef<Tab>,
     source_axis: usize,
     target_axis: usize,
     flat: InsId
@@ -909,6 +948,8 @@ fn axisidx(
         // 1: index is `flat-0`
         return flat;
     }
+    let bump = Access::borrow(&lcx.data.bump);
+    let tab = &bump[tab];
     let call = emittabcall(&lcx.data.func, tab.func);
     let back = idxbtran(lcx, tab, call, target_axis, flat);
     let fwd = idxftran(lcx, tab, call, target_axis-1, back);
@@ -1047,14 +1088,19 @@ enum ControlFlow<'a> {
 //   N = min(dim(lcx.data.tab, dim(tab)-M))
 // and p1, ..., pN is a flat (prefix) index for the current table.
 // NOTE: idx must be iterable in a single loop.
-fn emitidx(lcx: &mut Lcx, mut ctr: ControlFlow, target: &Tab, idx: &[ObjRef<EXPR>]) -> InsId {
-    debug_assert!(!isnestedloopidx(lcx, target, idx));
+fn emitidx(
+    lcx: &mut Lcx,
+    mut ctr: ControlFlow,
+    dest: BumpRef<Tab>,
+    idx: &[ObjRef<EXPR>]
+) -> InsId {
     let bump = Access::borrow(&lcx.data.bump);
-    let source = &bump[lcx.data.tab];
-    let sdim = source.axes.len();
+    let target = &bump[dest];
+    debug_assert!(!isnestedloopidx(lcx, target, idx));
+    let sdim = bump[lcx.data.tab].axes.len();
     let tdim = target.axes.len();
     let mut axis = min(sdim, tdim-idx.len());
-    let mut flat = idxtransfer(lcx, source, target, sdim, axis, INS_FLATIDX);
+    let mut flat = idxtransfer(lcx, lcx.data.tab, dest, sdim, axis, INS_FLATIDX);
     if axis == tdim {
         // nothing to do here (skip emitting the tabcall).
         return flat;
@@ -1361,7 +1407,7 @@ fn emitvget1(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
     debug_assert!(vget.ann == lcx.objs[vget.var].ann);
     let var = vardata(&lcx.data.objs, vget.var);
     let bump = Access::borrow(&lcx.data.bump);
-    let i = emitidx(lcx, ControlFlow::Straight(ctr), &bump[bump[var].tab], &vget.idx);
+    let i = emitidx(lcx, ControlFlow::Straight(ctr), bump[var].tab, &vget.idx);
     let inline = isdisjointidx(&bump[lcx.data.tab], &bump[bump[var].tab], &vget.idx);
     emitvarload(lcx, var, i, inline)
 }
@@ -1372,14 +1418,14 @@ fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
         ObjectRef::VGET(&VGET { var, ann, ref idx, .. }) => {
             let bump = Access::borrow(&lcx.data.bump);
             let v = vardata(&lcx.data.objs, var);
-            let tab = &bump[bump[v].tab];
+            let tab = bump[v].tab;
             if ann == lcx.objs[var].ann {
                 // scalar load of a vector variable
                 let i = emitidx(lcx, ControlFlow::Straight(ctr), tab, idx);
                 emitvarloadshape(lcx, v, i, i == INS_FLATIDX)
             } else {
                 // vector load
-                emitidxshape(lcx, ctr, tab, idx, ann)
+                emitidxshape(lcx, ctr, &bump[tab], idx, ann)
             }
         },
         ObjectRef::IDX(_) => todo!(),
@@ -1734,7 +1780,7 @@ fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
     // 3. prefix
     {
         debug_assert!(axis == min(sdim, tdim-vget.idx.len()));
-        let prefix = idxtransfer(lcx, source, target, sdim, axis, INS_FLATIDX);
+        let prefix = idxtransfer(lcx, lcx.data.tab, bump[var].tab, sdim, axis, INS_FLATIDX);
         lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
         // close pending loop
         let (start, out) = innerloop.unwrap();
@@ -1889,9 +1935,8 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                         Ins::KSTR(ty, zerocopy::transmute!(k))),
                     ObjectRef::DIM(&DIM { axis, .. }) => {
                         debug_assert!(ty == IRT_IDX);
-                        let bump = Access::borrow(&lcx.data.bump);
-                        let tab = &bump[lcx.data.tab];
-                        axisidx(lcx, tab, tab.n as _, (axis+1) as _, INS_FLATIDX)
+                        let source = lcx.data.bump[lcx.data.tab].axes.len();
+                        axisidx(lcx, lcx.data.tab, source, (axis+1) as _, INS_FLATIDX)
                     },
                     ObjectRef::LEN(&LEN { axis, value, .. }) =>
                         emitshape(lcx, ctr, value) + axis as isize,
@@ -1958,9 +2003,9 @@ fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId 
             debug_assert!(lcx.objs[ann].op == Obj::TTEN);
             let v = vardata(&lcx.data.objs, var);
             let bump = Access::borrow(&lcx.data.bump);
-            let tab = &bump[bump[v].tab];
+            let tab = bump[v].tab;
             let i = emitidx(lcx, ControlFlow::Loop(loop_), tab, idx);
-            let inline = isdisjointidx(&bump[lcx.data.tab], tab, idx);
+            let inline = isdisjointidx(&bump[lcx.data.tab], &bump[tab], idx);
             let mut value = emitvarload(lcx, v, i, inline);
             if ann == lcx.objs[var].ann {
                 let objs = Access::borrow(&lcx.objs);
@@ -2084,12 +2129,11 @@ fn emitcheckvgetloop(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET, inline: bool, 
     let bump = Access::borrow(&lcx.data.bump);
     let var = vardata(&lcx.data.objs, vget.var);
     let tab = bump[var].tab;
-    let source = &bump[lcx.data.tab];
     let target = &bump[tab];
-    let sdim = source.axes.len();
+    let sdim = bump[lcx.data.tab].axes.len();
     let tdim = target.axes.len();
     let mut axis = min(sdim, tdim-vget.idx.len());
-    let mut flat = idxtransfer(lcx, source, target, sdim, axis, INS_FLATIDX);
+    let mut flat = idxtransfer(lcx, lcx.data.tab, tab, sdim, axis, INS_FLATIDX);
     debug_assert!(axis < tdim); // else: it's a scalar access
     let call = emittabcall(&lcx.data.func, target.func);
     let [lhead, lout] = areserve(&lcx.data.func); // for outermost loop
@@ -2160,8 +2204,8 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef, fail: InsId) {
     if let ObjectRef::VGET(vget) = objs.get(expr.erase()) {
         let v = vardata(&lcx.data.objs, vget.var);
         let bump = Access::borrow(&lcx.data.bump);
-        let target = &bump[bump[v].tab];
-        let inline = isdisjointidx(&bump[lcx.data.tab], target, &vget.idx);
+        let target = bump[v].tab;
+        let inline = isdisjointidx(&bump[lcx.data.tab], &bump[target], &vget.idx);
         if vget.ann == lcx.objs[vget.var].ann {
             let i = emitidx(lcx, ControlFlow::Straight(ctr), target, &vget.idx);
             emitvarcheck(lcx, ctr, v, i, inline, fail);
@@ -2393,7 +2437,7 @@ fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
                 let var = &bump[vset.var];
                 // SourcePrefix on VSET implies:
                 debug_assert!(bump[model.tab].n <= bump[var.tab].n);
-                let idx = idxtransfer(lcx, &bump[var.tab], &bump[model.tab], bump[var.tab].n as _,
+                let idx = idxtransfer(lcx, var.tab, model.tab, bump[var.tab].n as _,
                     bump[model.tab].n as _, INS_FLATIDX);
                 let call = emitcallvm1(&lcx.data, idx, model.base + Mod::SUB_AVAIL);
                 let check = lcx.data.func.code.push(Ins::RES(Type::B1, call, 0.into()));
@@ -2435,7 +2479,7 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
             VSet::PREFIX => {
                 let model = &bump[vset.model];
                 let modeldim = bump[model.tab].n as usize;
-                let idx = idxtransfer(lcx, &bump[var.tab], &bump[model.tab], vardim, modeldim,
+                let idx = idxtransfer(lcx, var.tab, model.tab, vardim, modeldim,
                     INS_FLATIDX);
                 let call = emitcallvm1(&lcx.data, idx, model.base + Mod::SUB_VALUE);
                 if lcx.objs[lcx.objs[vset.obj].value].ann == lcx.objs[var.obj].ann {
@@ -2452,7 +2496,7 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
                     // dimensions, ie. the dim(var.tab) - dim(mod.tab)
                     // -> we "peel off" one layer by loading the flat index on each return slot.
                     debug_assert!(modeldim < vardim);
-                    let baseidx = idxtransfer(lcx, &bump[model.tab], &bump[var.tab], modeldim,
+                    let baseidx = idxtransfer(lcx, model.tab, var.tab, modeldim,
                         vardim, idx);
                     let ofs = lcx.data.func.code.push(Ins::SUB(IRT_IDX, INS_FLATIDX, baseidx));
                     let base = reserve(&lcx.data.func, ds);
