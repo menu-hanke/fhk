@@ -12,7 +12,7 @@ use crate::compile::{self, Ccx, Phase};
 use crate::dump::trace_objs;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
-use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, GET, INTR, KFP64, KINT, KINT64, LOAD, MOD, NEW, QUERY, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, GET, INTR, KFP64, KINT, KINT64, LEN, LOAD, MOD, NEW, QUERY, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, PRI_IDX};
@@ -777,6 +777,11 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::KFP64(&KFP64 { k, .. }) => Some(Type::pri(kfpri(tcx.intern.bump()[k].get()))),
         ObjectRef::KSTR(_) => Some(Type::pri(Primitive::STR)),
         ObjectRef::DIM(_) => Some(Type::pri(PRI_IDX)),
+        ObjectRef::LEN(&LEN { value, .. }) => {
+            // TODO: make sure here that it has at least as many dimensions as our axis.
+            let _ety = exprtype(tcx, value);
+            Some(Type::pri(PRI_IDX))
+        },
         ObjectRef::TUPLE(TUPLE { fields, .. }) => {
             let mut ty = Type::UNIT;
             for &e in fields.iter().rev() {

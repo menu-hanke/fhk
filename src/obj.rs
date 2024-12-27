@@ -67,20 +67,6 @@ impl<T: ?Sized> Debug for ObjRef<T> {
     }
 }
 
-impl ObjRef {
-
-    // ORDER OBJ
-    pub const NIL: ObjRef = zerocopy::transmute!(0);          // NIL
-    pub const TUP0: ObjRef<TTUP> = zerocopy::transmute!(2);   // TTUP []
-    pub const B1: ObjRef<TPRI> = zerocopy::transmute!(3);     // TPRI.B1
-    pub const PTR: ObjRef<TPRI> = zerocopy::transmute!(4);    // TPRI.PTR
-    pub const FALSE: ObjRef<KINT> = zerocopy::transmute!(5);  // KINT B1 0
-    pub const TRUE: ObjRef<KINT> = zerocopy::transmute!(8);   // KINT B1 1
-                                                              // TUPLE NIL
-    pub const GLOBAL: ObjRef<TAB> = zerocopy::transmute!(13); // TAB GLOBAL []
-
-}
-
 impl<T: ?Sized> ObjRef<T> {
 
     pub fn cast<U: ?Sized + ObjType>(self) -> ObjRef<U> {
@@ -319,7 +305,8 @@ define_ops! {
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
     KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
-    DIM.axis    { ann: ObjRef/*TY*/ };
+    DIM.axis    { ann: ObjRef/*TPRI.IDX*/ };
+    LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     VGET.flat   { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
@@ -809,6 +796,36 @@ impl<T> IndexMut<ObjRef<T>> for Objects
     }
 }
 
+macro_rules! default_objs {
+    ( $( $vis:vis $name:ident $(: $type:ident)? ($idx:literal) = $new:expr;)* ) => {
+
+        impl ObjRef {
+            $( $vis const $name: ObjRef $(<$type>)? = zerocopy::transmute!($idx); )*
+        }
+
+        fn insert_default_objs(objs: &mut Objects) {
+            $(
+                {
+                    let o = objs.push($new);
+                    debug_assert!(o.erase() == ObjRef::$name.erase());
+                }
+            )*
+        }
+
+    };
+}
+
+default_objs! {
+    pub NIL           (0)  = NIL::new(ObjRef::UNIT);
+        UNIT:   TTUP  (2)  = TTUP::new();
+    pub B1:     TPRI  (3)  = TPRI::new(Primitive::B1 as _);
+    pub PTR:    TPRI  (4)  = TPRI::new(Primitive::PTR as _);
+    pub FALSE:  KINT  (5)  = KINT::new(ObjRef::B1.erase(), 0);
+    pub TRUE:   KINT  (8)  = KINT::new(ObjRef::B1.erase(), 1);
+        EMPTY:  TUPLE (11) = TUPLE::new(ObjRef::NIL);
+    pub GLOBAL: TAB   (13) = TAB::new(Ccx::SEQ_GLOBAL, ObjRef::EMPTY);
+}
+
 impl Default for Objects {
 
     fn default() -> Self {
@@ -816,22 +833,7 @@ impl Default for Objects {
             bump: Default::default(),
             lookup: Default::default()
         };
-        // ORDER OBJ
-        let nil = objs.push(NIL::new(ObjRef::TUP0));
-        let tup0 = objs.push(TTUP::new());
-        let b1 = objs.push(TPRI::new(Primitive::B1 as _));
-        let ptr = objs.push(TPRI::new(Primitive::PTR as _));
-        let false_ = objs.push(KINT::new(ObjRef::B1.erase(), 0));
-        let true_ = objs.push(KINT::new(ObjRef::B1.erase(), 1));
-        let empty = objs.push(TUPLE::new(ObjRef::NIL));
-        let global = objs.push(TAB::new(Ccx::SEQ_GLOBAL, empty.cast()));
-        debug_assert!(nil == ObjRef::NIL.cast());
-        debug_assert!(tup0 == ObjRef::TUP0.cast());
-        debug_assert!(b1 == ObjRef::B1);
-        debug_assert!(ptr == ObjRef::PTR);
-        debug_assert!(false_ == ObjRef::FALSE);
-        debug_assert!(true_ == ObjRef::TRUE);
-        debug_assert!(global == ObjRef::GLOBAL);
+        insert_default_objs(&mut objs);
         objs.lookup.insert_unique(
             fxhash((Operator::TAB as u32, Ccx::SEQ_GLOBAL)),
             ObjRef::GLOBAL.erase(),

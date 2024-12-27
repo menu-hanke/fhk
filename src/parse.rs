@@ -12,7 +12,7 @@ use crate::err::ErrorMessage;
 use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LEN, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, Binding, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
@@ -83,6 +83,7 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
 
 fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
     const IDENT: u8 = Token::Ident as _;
+    const INT: u8 = Token::Int as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
     const LCURLY: u8 = Token::LCurly as _;
     const RCURLY: u8 = Token::RCurly as _;
@@ -98,22 +99,32 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
             false => None
         };
     }
-    // TODO: just make this special syntax, eg. a load keyword or something, since it always
-    // requires a type annotation and this is a mess.
-    if stem == b"load" {
-        let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
-        let ty: [u8; 4] = tail[3..7].try_into().unwrap();
-        let pri = pcx.objs.push(TPRI::new(Primitive::from_name(
-                    pcx.intern.get_slice(zerocopy::transmute!(ty)))? as u8)).erase();
-        let ann = match args.len() {
-            1 => pri,
-            n => pcx.objs.push(TTEN::new(n as u8 - 1, pri)).erase()
-        };
-        // TODO: allow some special syntax eg. `_` here to elide the size when returning
-        // a full table variable.
-        return Some(pcx.objs.push_args::<LOAD>(LOAD::new(ann, args[0]), &args[1..]).cast());
+    // TODO: this needs some cleanup
+    match stem {
+        b"load" => {
+            let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
+            let ty: [u8; 4] = tail[3..7].try_into().unwrap();
+            let pri = pcx.objs.push(TPRI::new(Primitive::from_name(
+                        pcx.intern.get_slice(zerocopy::transmute!(ty)))? as u8)).erase();
+            let ann = match args.len() {
+                1 => pri,
+                n => pcx.objs.push(TTEN::new(n as u8 - 1, pri)).erase()
+            };
+            // TODO: allow some special syntax eg. `_` here to elide the size when returning
+            // a full table variable.
+            Some(pcx.objs.push_args::<LOAD>(LOAD::new(ann, args[0]), &args[1..]).cast())
+        },
+        b"len" => {
+            let dim: u32 = match rest {
+                &[] => 0,
+                &[APOSTROPHE, LCURLY, INT, x0, x1, x2, x3, RCURLY] =>
+                    zerocopy::transmute!([x0, x1, x2, x3]),
+                _ => return None
+            };
+            Some(pcx.objs.push(LEN::new(dim as _, ObjRef::NIL, args[0])).cast())
+        },
+        _ => None
     }
-    None
 }
 
 fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {

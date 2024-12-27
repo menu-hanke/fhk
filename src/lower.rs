@@ -15,7 +15,7 @@ use crate::index::{IndexOption, InvalidValue};
 use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LOAD, MOD, NEW, QUERY, RESET, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LOAD, MOD, NEW, QUERY, RESET, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::{Primitive, IRT_IDX};
@@ -1893,6 +1893,8 @@ fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
                         let tab = &bump[lcx.data.tab];
                         axisidx(lcx, tab, tab.n as _, (axis+1) as _, INS_FLATIDX)
                     },
+                    ObjectRef::LEN(&LEN { axis, value, .. }) =>
+                        emitshape(lcx, ctr, value) + axis as isize,
                     ObjectRef::VGET(o) => emitvget1(lcx, ctr, o),
                     ObjectRef::IDX(_) => todo!(),
                     ObjectRef::BINOP(&BINOP { binop, left, right, .. }) => {
