@@ -1224,24 +1224,23 @@ fn broadcastbinop(
     }
 }
 
-// args passed in lcx.data.tmp_ins[base..]
 fn emitscalarintrinsic(
     lcx: &mut Lcx,
     _ctr: &mut InsId,
     f: Intrinsic,
     _args: &[ObjRef<EXPR>],
-    _ty: Type,
-    base: usize
+    ty: Type,
+    base: BumpRef<InsId>
 ) -> InsId {
     use Intrinsic::*;
-    let _argv = &lcx.data.tmp_ins[base..];
+    let argv = &lcx.tmp[base..];
+    let func = &lcx.data.func;
     match f {
-        UNM   => todo!(), // name it consistently UNM? NEG?
-        EXP   => todo!(), // ir intrinsic call?
-        LOG   => todo!(), // ir intrinsic call?
-        NOT   => todo!(),
-        CONV  => todo!(),
-        _     => unreachable!() // non-scalar
+        UNM|NOT => func.code.push(Ins::NEG(ty, argv[0])),
+        EXP     => todo!(), // ir intrinsic call?
+        LOG     => todo!(), // ir intrinsic call?
+        CONV    => todo!(),
+        _       => unreachable!() // non-scalar
     }
 }
 
@@ -1291,13 +1290,13 @@ fn scalarintrinsic(
         SUM => emitsum(lcx, ctr, args[0], ty),
         ANY|ALL => emitanyall(lcx, ctr, args[0], f),
         _ => {
-            let base = lcx.data.tmp_ins.len();
+            let base = lcx.tmp.end();
             for &arg in args {
                 let v = emitvalue(lcx, ctr, arg);
-                lcx.data.tmp_ins.push(v);
+                lcx.tmp.push(v);
             }
-            let v = emitscalarintrinsic(lcx, ctr, f, args, ty, base);
-            lcx.data.tmp_ins.truncate(base);
+            let v = emitscalarintrinsic(lcx, ctr, f, args, ty, base.cast_up());
+            lcx.tmp.truncate(base);
             v
         }
     }
@@ -1310,21 +1309,22 @@ fn broadcastintrinsic(
     args: &[ObjRef<EXPR>],
     ety: ObjRef
 ) -> InsId {
-    let base = lcx.data.tmp_ins.len();
+    let base = lcx.tmp.end();
     for &arg in args {
         let v = emititer(lcx, loop_, arg);
-        lcx.data.tmp_ins.push(v);
+        lcx.tmp.push(v);
     }
     let v = match lcx.objs.get(ety) {
         ObjectRef::TPRI(&TPRI { ty, .. }) => {
-            emitscalarintrinsic(lcx, &mut loop_.body, f, args, Primitive::from_u8(ty).to_ir(), base)
+            emitscalarintrinsic(lcx, &mut loop_.body, f, args, Primitive::from_u8(ty).to_ir(),
+                base.cast_up())
         },
         _ => {
             // see comment in `broadcastbinop`
             todo!()
         }
     };
-    lcx.data.tmp_ins.truncate(base);
+    lcx.tmp.truncate(base);
     v
 }
 

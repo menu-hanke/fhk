@@ -245,6 +245,20 @@ fn ins_addp(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = InsValue::from_value(emit.fb.ins().iadd(emit.values[left].value(), right));
 }
 
+fn ins_neg(ecx: &mut Ecx, id: InsId) {
+    use Type::*;
+    let emit = &mut *ecx.data;
+    let ins = emit.code[id];
+    let operand = emit.values[ins.decode_V()].value();
+    let value = match ins.type_() {
+        I8|I16|I32|I64 => emit.fb.ins().ineg(operand),
+        F32|F64 => emit.fb.ins().fneg(operand),
+        B1 => emit.fb.ins().bxor_imm(operand, 1),
+        _ => unreachable!()
+    };
+    emit.values[id] = InsValue::from_value(value);
+}
+
 fn ins_cmp(ecx: &mut Ecx, id: InsId) {
     use {Type::*, Opcode::*};
     let emit = &mut *ecx.data;
@@ -460,7 +474,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             ADD | SUB | MUL | DIV | UDIV => ins_arith(ecx, id),
             POW => ins_pow(ecx, id),
             ADDP => ins_addp(ecx, id),
-            NEG => todo!(),
+            NEG => ins_neg(ecx, id),
             EQ | NE | LT | LE | ULT | ULE => ins_cmp(ecx, id),
             ALLOC => ins_alloc(ecx, id),
             STORE => ins_store(ecx, id),
