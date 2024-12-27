@@ -54,7 +54,7 @@ local function puttab(buf, tab)
 		if type(v) == "table" then
 			puttab(buf, v)
 		else
-			buf:put(v)
+			buf:put(tostring(v))
 		end
 	end
 	buf:put(" ]")
