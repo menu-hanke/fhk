@@ -1213,6 +1213,26 @@ fn emitsum(lcx: &mut Lcx, ctr: &mut InsId, arg: ObjRef<EXPR>, ty: Type) -> InsId
     closereduce(&lcx.data.func, &reduce, next)
 }
 
+fn emitanyall(lcx: &mut Lcx, ctr: &mut InsId, arg: ObjRef<EXPR>, f: Intrinsic) -> InsId {
+    let resphi = lcx.data.func.phis.push(Phi::new(Type::B1));
+    let [tail, body, merge] = areserve(&lcx.data.func);
+    let default = lcx.data.func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ALL) as _));
+    let notdefault = lcx.data.func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ANY) as _));
+    let out = lcx.data.func.code.push(Ins::JMP(default, merge, resphi));
+    let found = lcx.data.func.code.push(Ins::JMP(notdefault, merge, resphi));
+    let mut loop_ = LoopState { head: *ctr, tail, body, out };
+    let value = emititer(lcx, &mut loop_, arg);
+    lcx.data.func.code.set(loop_.body, if f == Intrinsic::ALL {
+        Ins::IF(value, tail, found)
+    } else {
+        Ins::IF(value, found, tail)
+    });
+    lcx.data.func.code.set(loop_.tail, Ins::GOTO(body));
+    lcx.data.func.code.set(loop_.head, Ins::GOTO(body));
+    *ctr = merge;
+    lcx.data.func.code.push(Ins::PHI(Type::B1, merge, resphi))
+}
+
 fn scalarintrinsic(
     lcx: &mut Lcx,
     ctr: &mut InsId,
@@ -1220,8 +1240,10 @@ fn scalarintrinsic(
     args: &[ObjRef<EXPR>],
     ty: Type
 ) -> InsId {
+    use Intrinsic::*;
     match f {
-        Intrinsic::SUM => emitsum(lcx, ctr, args[0], ty),
+        SUM => emitsum(lcx, ctr, args[0], ty),
+        ANY|ALL => emitanyall(lcx, ctr, args[0], f),
         _ => {
             let base = lcx.data.tmp_ins.len();
             for &arg in args {
@@ -2025,7 +2047,7 @@ fn emitlen(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
 fn isiterable(lcx: &Lcx, expr: ObjRef<EXPR>) -> bool {
     let obj = lcx.objs[expr.erase()];
     match obj.op {
-        Obj::INTR => obj.data != Intrinsic::WHICH as _,
+        Obj::INTR => Intrinsic::from_u8(obj.data).is_broadcast(),
         Obj::CAT  => false,
         Obj::VGET => {
             let vget: &VGET = &lcx.objs[expr.cast()];

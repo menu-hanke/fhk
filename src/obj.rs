@@ -443,6 +443,8 @@ define_intrinsics! {
     LOG     b"log";
     SUM     b"sum";
     WHICH   b"which";
+    ANY     b"any";
+    ALL     b"all";
     CONV    b"conv";
     REP     b"rep";
 }

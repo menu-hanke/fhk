@@ -23,6 +23,9 @@ local function equal(a, b, tol)
 			return a == b
 		end
 	end
+	if type(a) == "boolean" then
+		return a == b
+	end
 	if #a ~= #b then
 		return false
 	end

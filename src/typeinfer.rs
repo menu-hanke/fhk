@@ -760,6 +760,7 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Type
         // TODO (?): generalize WHICH to return tuples.
         WHICH => I!(a :: a[Tensor Type::pri(Primitive::B1) Type::V1D]
             => Tensor Type::pri(PRI_IDX) Type::V1D),
+        ANY | ALL => I!(a,n :: a[Tensor Type::pri(Primitive::B1) n] => pri Primitive::B1),
         CONV => I!(a,b e n :: a[Tensor e n] => Tensor b n),
         REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
     };
