@@ -1,5 +1,6 @@
 //! Type inference.
 
+use core::cmp::min;
 use core::hash::Hasher;
 use core::iter::zip;
 
@@ -635,16 +636,12 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
     let objs = Access::borrow(&tcx.objs);
     let axes = &objs[objs[objs[var].tab].shape].fields;
     let need = axes.len();
-    if have < need {
-        // not enough indices mentioned, insert current expression's index.
-        // these are scalar indices, so they don't increase the dimension.
-        // if this results in too many indices being mentioned, it's a type error.
-        have += tcx.objs.dim(tcx.data.tab);
-    }
     if have > need {
         // too many indices mentioned.
         return Type::NEVER;
     }
+    let prefix = min(objs.dim(tcx.data.tab), need-have);
+    have += prefix;
     let mut ty = Type::var(vartype(tcx, var));
     let mut dim = 0;
     if have < need {
@@ -674,11 +671,12 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
         // here the dimensionality depends on the dimension of the non-flat index expressions.
         // what we do here is:
         // * start from `v_0 = tensor(T, N)`, where `T` is the type of the variable and `N` is the
-        //   dimension of its table.
+        //   number of axes after the implicit prefix.
         // * every explicit index `e_0, ..., e_k` gets a constraint:
         //     Index(v_{j+1}, v_j, e_j)
         // * every flat index `(f_1, ..., f_m)` flattens the result type by `m-1` dimensions.
-        let d = createdimtype(&mut tcx.data, need as _);
+        debug_assert!(need > prefix);
+        let d = createdimtype(&mut tcx.data, (need-prefix) as _);
         let mut v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
         for &e in idx {
             match objs[e].op {
