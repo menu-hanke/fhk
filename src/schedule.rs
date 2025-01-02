@@ -404,6 +404,9 @@ pub fn compute_schedule(
         })
     );
     placeblock(gcm, &func.code, InsId::START);
+    // TODO: should either:
+    //   (1) place unreachable blocks here, or
+    //   (2) require that the cfg has no unreachable blocks here
     gcm.cfg.compute_uses();
     compute_dataflow(&mut gcm.dfg, &func.code);
     earlyschedule(gcm, &func.code);

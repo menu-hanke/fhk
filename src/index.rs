@@ -180,6 +180,19 @@ impl<I: Index+InvalidValue> IndexOption<I> {
         self.into()
     }
 
+    pub fn is_none(self) -> bool {
+        self.raw.into() == I::INVALID
+    }
+
+    pub fn is_some(self) -> bool {
+        !self.is_none()
+    }
+
+    pub fn unwrap(self) -> I {
+        debug_assert!(self.is_some());
+        self.raw
+    }
+
 }
 
 // interior mutability vec type that doesn't hand out slices but can be modified through

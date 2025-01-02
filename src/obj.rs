@@ -291,7 +291,7 @@ define_ops! {
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
     RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
-    VSET.flat   { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
+    VSET.dim    { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     // types
     TVAR        {};
     TPRI.ty     {};
@@ -299,7 +299,8 @@ define_ops! {
     TTUP        {} elems: [ObjRef/*TY*/];
     // (TFUNC for functions + generic type annotations TPAR/TCON etc)
     // expressions. ann must be first.
-    NIL         { ann: ObjRef<TTUP> };
+    SPEC.what   { ann: ObjRef<TTUP/*UNIT*/> };
+    FLAT        { ann: ObjRef<TTUP/*UNIT*/> } idx: [ObjRef<EXPR>];
     SPLAT       { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     KINT        { ann: ObjRef/*TY*/, k: i32 };
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
@@ -308,7 +309,7 @@ define_ops! {
     DIM.axis    { ann: ObjRef/*TPRI.IDX*/ };
     LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
-    VGET.flat   { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR>];
+    VGET.dim    { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     BINOP.binop { ann: ObjRef/*TY*/, left: ObjRef<EXPR>, right: ObjRef<EXPR> };
@@ -345,7 +346,7 @@ impl Operator {
     }
 
     pub fn is_expr_raw(op: u8) -> bool {
-        op >= Self::KINT as u8
+        op >= Self::SPEC as u8
     }
 
     pub fn is_type_raw(op: u8) -> bool {
@@ -449,6 +450,11 @@ impl Intrinsic {
          (UNM|NOT|EXP|LOG|CONV).contains(self)
      }
 
+}
+
+impl SPEC {
+    pub const NIL: u8   = 0;
+    pub const SLURP: u8 = 1;
 }
 
 // TODO: put fieldtype and fieldname in separate arrays so this can just be implemented as
@@ -585,6 +591,9 @@ impl Objects {
             (TPRI(a),  TPRI(b))   => a.ty == b.ty,
             (TTEN(a),  TTEN(b))   => a.dim == b.dim && self.equal(a.elem, b.elem),
             (TTUP(a),  TTUP(b))   => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
+            (SPEC(a),  SPEC(b))   => a.what == b.what,
+            (FLAT(a),  FLAT(b))   => self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
+            (SPLAT(a), SPLAT(b))  => self.equal(a.value.erase(), b.value.erase()),
             (KINT(a),  KINT(b))   => a.k == b.k,
             (KINT64(a),KINT64(b)) => a.k == b.k,
             (KFP64(a), KFP64(b))  => a.k == b.k,
@@ -816,14 +825,15 @@ macro_rules! default_objs {
 }
 
 default_objs! {
-    pub NIL           (0)  = NIL::new(ObjRef::UNIT);
-        UNIT:   TTUP  (2)  = TTUP::new();
-    pub B1:     TPRI  (3)  = TPRI::new(Primitive::B1 as _);
-    pub PTR:    TPRI  (4)  = TPRI::new(Primitive::PTR as _);
-    pub FALSE:  KINT  (5)  = KINT::new(ObjRef::B1.erase(), 0);
-    pub TRUE:   KINT  (8)  = KINT::new(ObjRef::B1.erase(), 1);
-        EMPTY:  TUPLE (11) = TUPLE::new(ObjRef::NIL);
-    pub GLOBAL: TAB   (13) = TAB::new(Ccx::SEQ_GLOBAL, ObjRef::EMPTY);
+    pub NIL           (0)  = SPEC::new(SPEC::NIL, ObjRef::UNIT);
+    pub SLURP         (2)  = SPEC::new(SPEC::SLURP, ObjRef::UNIT);
+    pub UNIT:   TTUP  (4)  = TTUP::new();
+    pub B1:     TPRI  (5)  = TPRI::new(Primitive::B1 as _);
+    pub PTR:    TPRI  (6)  = TPRI::new(Primitive::PTR as _);
+    pub FALSE:  KINT  (7)  = KINT::new(ObjRef::B1.erase(), 0);
+    pub TRUE:   KINT  (10) = KINT::new(ObjRef::B1.erase(), 1);
+        EMPTY:  TUPLE (13) = TUPLE::new(ObjRef::NIL);
+    pub GLOBAL: TAB   (15) = TAB::new(Ccx::SEQ_GLOBAL, ObjRef::EMPTY);
 }
 
 impl Default for Objects {

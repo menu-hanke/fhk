@@ -12,7 +12,7 @@ use crate::compile::{self, Ccx, Phase};
 use crate::dump::trace_objs;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
-use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, GET, INTR, KFP64, KINT, KINT64, LEN, LOAD, MOD, NEW, QUERY, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, LEN, LOAD, MOD, NEW, QUERY, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, PRI_IDX};
@@ -631,10 +631,9 @@ fn vartype(tcx: &mut Tcx, var: ObjRef<VAR>) -> TypeVar {
     tv
 }
 
-fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], flat: bool) -> Type {
+fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: usize) -> Type {
     let objs = Access::borrow(&tcx.objs);
     let axes = &objs[objs[objs[var].tab].shape].fields;
-    let mut have = idx.len();
     let need = axes.len();
     if have < need {
         // not enough indices mentioned, insert current expression's index.
@@ -647,50 +646,73 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], flat: bool) 
         return Type::NEVER;
     }
     let mut ty = Type::var(vartype(tcx, var));
-    // handle tail:
-    // * empty tail     ->  zero dimensions
-    // * flat tail      ->  one dimension
-    // * implicit tail  ->  one dimension per scalar axis, one nest per vector axis
     let mut dim = 0;
     if have < need {
-        if flat {
-            dim = 1;
-        } else {
-            for i in (have..need).rev() {
-                dim += 1;
-                if i > 0 && axes[i-1].is_nil() {
-                    // vector axis or end of tail
-                    let d = createdimtype(&mut tcx.data, dim as _);
-                    ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
-                    dim = 0;
-                }
+        for i in (have..need).rev() {
+            dim += 1;
+            if i > 0 && axes[i-1].is_nil() {
+                // vector axis or end of tail
+                let d = createdimtype(&mut tcx.data, dim as _);
+                ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
+                dim = 0;
             }
         }
     }
-    if idx.is_empty() {
-        // no explicit indices mentioned, so we know the exact dimensions at this point.
+    if idx.iter().all(|&i| objs[i].op == Obj::FLAT) {
+        // special case: exact dimension known
+        dim += idx.len();
+        for &e in idx {
+            exprtype(tcx, e);
+        }
         if dim > 0 {
             let d = createdimtype(&mut tcx.data, dim as _);
             ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
         }
         ty
     } else {
-        // explicit indices mentioned.
-        // here the dimensionality depends on the dimension of the index expressions.
+        // general case: index expression with non-flat indices.
+        // here the dimensionality depends on the dimension of the non-flat index expressions.
         // what we do here is:
         // * start from `v_0 = tensor(T, N)`, where `T` is the type of the variable and `N` is the
         //   dimension of its table.
         // * every explicit index `e_0, ..., e_k` gets a constraint:
         //     Index(v_{j+1}, v_j, e_j)
+        // * every flat index `(f_1, ..., f_m)` flattens the result type by `m-1` dimensions.
         let d = createdimtype(&mut tcx.data, need as _);
         let mut v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, d]);
         for &e in idx {
-            let ety = exprtype(tcx, e);
-            let (elem, dim) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
-            unifyvar(&mut tcx.data.sub, elem, Type::pri(PRI_IDX));
-            let vnext = newtypevar(&mut tcx.data.sub);
-            constraint(&mut tcx.data, Constraint::Index(vnext, v, dim));
-            v = Type::var(vnext);
+            match objs[e].op {
+                Obj::SPEC if objs[e].data == SPEC::NIL => continue,
+                Obj::SPEC if objs[e].data == SPEC::SLURP => {
+                    // dimension can't go to zero here because this is always followed by an
+                    // explicit index, so we don't need a constraint.
+                    let (_, dim) = unpacktensor(&mut tcx.data.sub, v);
+                    let dim = newcontype(&mut tcx.data.sub, Constructor::Next, &[Type::var(dim)]);
+                    v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, dim]);
+                },
+                Obj::FLAT => {
+                    // dimension can't go to zero here because this behaves like a 1D tensor index,
+                    // so we don't need a constraint.
+                    exprtype(tcx, e);
+                    let m = objs[e.cast::<FLAT>()].idx.len();
+                    if m > 1 {
+                        let (_, dim) = unpacktensor(&mut tcx.data.sub, v);
+                        let mut dim = Type::var(dim);
+                        for _ in 1..m {
+                            dim = newcontype(&mut tcx.data.sub, Constructor::Next, &[dim]);
+                        }
+                        v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, dim]);
+                    }
+                },
+                _ => {
+                    let ety = exprtype(tcx, e);
+                    let (elem, edim) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
+                    unifyvar(&mut tcx.data.sub, elem, Type::pri(PRI_IDX));
+                    let vnext = newtypevar(&mut tcx.data.sub);
+                    constraint(&mut tcx.data, Constraint::Index(vnext, v, edim));
+                    v = Type::var(vnext);
+                }
+            }
         }
         // increment dimension if we have implicit dimensions
         if dim > 0 {
@@ -771,7 +793,18 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Type
 fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
     let objs = Access::borrow(&tcx.objs);
     match objs.get(idx.erase()) {
+        ObjectRef::SPEC(_) => Some(Type::UNIT),
         ObjectRef::SPLAT(&SPLAT { value, .. }) => Some(Type::var(exprtype(tcx, value))),
+        ObjectRef::FLAT(FLAT { idx, .. }) => {
+            for &i in idx {
+                if objs[i].op != Obj::SPEC {
+                    let ety = exprtype(tcx, i);
+                    let (e, _) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
+                    unifyvar(&mut tcx.data.sub, e, Type::pri(PRI_IDX));
+                }
+            }
+            Some(Type::UNIT)
+        },
         ObjectRef::KINT(&KINT { k, .. }) => Some(Type::pri(kintpri(k as _))),
         ObjectRef::KINT64(&KINT64 { k, .. }) => Some(Type::pri(kintpri(tcx.intern.bump()[k].get()))),
         ObjectRef::KFP64(&KFP64 { k, .. }) => Some(Type::pri(kfpri(tcx.intern.bump()[k].get()))),
@@ -790,8 +823,7 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
             }
             Some(ty)
         },
-        ObjectRef::VGET(&VGET { flat, var, ref idx, .. })
-            => Some(visitvref(tcx, var, idx, flat != 0)),
+        ObjectRef::VGET(&VGET { dim, var, ref idx, .. }) => Some(visitvref(tcx, var, idx, dim as _)),
         ObjectRef::CAT(CAT { elems, .. } ) => {
             let e = newtypevar(&mut tcx.data.sub);
             let d = newtypevar(&mut tcx.data.sub);
@@ -916,7 +948,8 @@ fn exprtype(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
 }
 
 fn visitall(tcx: &mut Tcx) {
-    tcx.data.ann.insert_unique_unchecked(ObjRef::NIL, Type::UNIT);
+    tcx.data.ann.insert_unique_unchecked(ObjRef::NIL, Type::var(TypeVar::UNIT));
+    tcx.data.ann.insert_unique_unchecked(ObjRef::SLURP, Type::var(TypeVar::UNIT));
     let b1 = tcx.data.sub.push(Type::pri(Primitive::B1));
     tcx.data.ann.insert_unique_unchecked(ObjRef::TRUE.erase(), Type::var(b1));
     tcx.data.ann.insert_unique_unchecked(ObjRef::FALSE.erase(), Type::var(b1));
@@ -936,8 +969,8 @@ fn visitall(tcx: &mut Tcx) {
                     unifyvar(&mut tcx.data.sub, ety, Type::pri(Primitive::B1));
                 }
                 for &vset in value.iter() {
-                    let &VSET { flat, var, value, ref idx, .. } = &objs[vset];
-                    let vty = visitvref(tcx, var, idx, flat != 0);
+                    let &VSET { dim, var, value, ref idx, .. } = &objs[vset];
+                    let vty = visitvref(tcx, var, idx, dim as _);
                     let ety = exprtype(tcx, value);
                     unifyvar(&mut tcx.data.sub, ety, vty);
                 }

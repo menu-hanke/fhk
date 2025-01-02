@@ -1,6 +1,7 @@
 //! Source -> Graph.
 
 use core::cmp::max;
+use core::iter::repeat_n;
 use core::mem::replace;
 use core::ops::Range;
 
@@ -12,7 +13,7 @@ use crate::err::ErrorMessage;
 use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, GET, INTR, KINT, LEN, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KINT, LEN, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, Binding, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
@@ -144,28 +145,87 @@ fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> 
     Ok(expr)
 }
 
-// pushes indices on pcx.tmp, returns flat
-fn parse_vrefidx(pcx: &mut Pcx) -> compile::Result<bool> {
-    let mut flat = false;
+fn parse_idxelem(pcx: &mut Pcx, ingroup: bool) -> compile::Result<usize> {
+    let mut dim = 0;
+    while check(pcx, Token::Colon)? {
+        dim += 1;
+    }
+    if (Token::Comma|Token::RParen|Token::RBracket).contains(pcx.data.token) {
+        match dim {
+            0 => return syntaxerr(pcx, ErrorMessage::ExpectedValue),
+            1 => {
+                pcx.tmp.push(ObjRef::NIL);
+            },
+            _ if ingroup => {
+                pcx.tmp.extend(repeat_n(ObjRef::NIL, dim));
+            },
+            _ => {
+                let flat = pcx.objs.push_extend::<FLAT,_>(FLAT::new(ObjRef::UNIT),
+                    repeat_n(ObjRef::NIL.cast(), dim));
+                pcx.tmp.push(flat);
+            }
+        }
+    } else {
+        if dim > 0 {
+            pcx.tmp.extend(repeat_n(ObjRef::SLURP, dim));
+        }
+        let value = parse_expr(pcx)?;
+        pcx.tmp.push(value);
+        dim += 1;
+    }
+    Ok(dim)
+}
+
+// pushes indices on pcx.tmp, return total number of mentioned axes
+// note: lower and typeinfer assume that NIL may not preceded by a SLURP, ie they assume
+// the following canonicalization:
+//   * A[::]   -> A[(:,:)]
+//   * A[(::)] -> A[(:,:)]
+fn parse_vrefidx(pcx: &mut Pcx) -> compile::Result<u8> {
+    let mut dim = 0;
     if check(pcx, Token::LBracket)? {
         while pcx.data.token != Token::RBracket {
-            if check(pcx, Token::DotDot)? {
-                flat = true;
-                break
+            if check(pcx, Token::LParen)? {
+                if pcx.data.token != Token::Colon {
+                    let value = parse_expr(pcx)?;
+                    dim += 1;
+                    match pcx.data.token {
+                        Token::RParen => {
+                            next(pcx)?;
+                            let value = parse_binop_rhs(pcx, 0, value)?;
+                            pcx.tmp.push(value);
+                        },
+                        Token::Comma => {
+                            next(pcx)?;
+                            let base = pcx.tmp.end();
+                            pcx.tmp.push(value);
+                            while pcx.data.token != Token::RParen {
+                                dim += parse_idxelem(pcx, true)?;
+                                if !check(pcx, Token::Comma)? { break }
+                            }
+                            consume(pcx, Token::RParen)?;
+                            let flat = pcx.objs.push_args::<FLAT>(FLAT::new(ObjRef::UNIT),
+                                &pcx.tmp[base.cast_up()..]);
+                            pcx.tmp.truncate(base);
+                            pcx.tmp.push(flat);
+                        },
+                        _ => return pcx.error(TokenError { want: Token::RParen | Token::Comma })
+                    }
+                }
+            } else {
+                dim += parse_idxelem(pcx, false)?;
             }
-            let idx = parse_expr(pcx)?;
-            pcx.tmp.push(idx);
             if !check(pcx, Token::Comma)? { break }
         }
         consume(pcx, Token::RBracket)?;
     }
-    Ok(flat)
+    Ok(dim as _)
 }
 
 fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> {
     let base = pcx.tmp.end();
-    let flat = parse_vrefidx(pcx)?;
-    let vget = pcx.objs.push_args(VGET::new(flat as _, ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
+    let dim = parse_vrefidx(pcx)?;
+    let vget = pcx.objs.push_args(VGET::new(dim as _, ObjRef::NIL, var), &pcx.tmp[base.cast_up()..]);
     pcx.tmp.truncate(base);
     Ok(vget)
 }
@@ -354,8 +414,11 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     }
 }
 
-fn parse_binop(pcx: &mut Pcx, limit: u8) -> compile::Result<ObjRef<EXPR>> {
-    let mut lhs = parse_value(pcx)?;
+fn parse_binop_rhs(
+    pcx: &mut Pcx,
+    limit: u8,
+    mut lhs: ObjRef<EXPR>
+) -> compile::Result<ObjRef<EXPR>> {
     while pcx.data.token.is_binop() {
         let mut op = pcx.data.token;
         let (left, right) = PRIORITY[op as usize - Token::Or as usize];
@@ -375,6 +438,11 @@ fn parse_binop(pcx: &mut Pcx, limit: u8) -> compile::Result<ObjRef<EXPR>> {
         )).cast();
     }
     Ok(lhs)
+}
+
+fn parse_binop(pcx: &mut Pcx, limit: u8) -> compile::Result<ObjRef<EXPR>> {
+    let lhs = parse_value(pcx)?;
+    parse_binop_rhs(pcx, limit, lhs)
 }
 
 fn parse_table(pcx: &mut Pcx) -> compile::Result {
@@ -420,9 +488,9 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
         let var = parse_vref(pcx)?;
         pcx.objs[var].mark = 0;
         let base2 = pcx.tmp.end();
-        let flat = parse_vrefidx(pcx)?;
+        let dim = parse_vrefidx(pcx)?;
         let ann = parse_maybeann(pcx)?;
-        let vset = pcx.objs.push_args::<VSET>(VSET::new(flat as _, var, ann.cast()),
+        let vset = pcx.objs.push_args::<VSET>(VSET::new(dim as _, var, ann.cast()),
             &pcx.tmp[base2.cast_up()..]);
         pcx.tmp.truncate(base2);
         pcx.tmp.push(vset);
