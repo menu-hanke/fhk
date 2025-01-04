@@ -53,10 +53,10 @@ impl Image {
         where UnsafeAlloc: FnMut(usize, usize) -> *mut u8
     {
         let inst = alloc(self.size as _, align_of::<Instance>()) as *mut Instance;
-        (*inst).dup = 0;
         if !template.is_null() {
             core::ptr::copy_nonoverlapping(template as *const u8, inst as *mut u8, self.size as _);
         }
+        (*inst).dup = 0;
         // reset new instance
         // special case 0 and -1 to avoid shift by 64.
         match reset {
