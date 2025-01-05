@@ -36,6 +36,9 @@ use crate::parser::{check, consume, Pcx};
 #[cfg(unix)]
 const R_LIBNAME: &'static [u8] = b"/usr/lib/R/lib/libR.so\0";
 
+#[cfg(windows)]
+const R_LIBNAME: &'static [u8] = b"R.dll\0";
+
 // unfortunately there's no good way to tell if anyone else is using the R environment,
 // nor is there even a way to tell if it's already initialized.
 // the best we can really do is refcount our own uses.
@@ -293,7 +296,10 @@ unsafe fn rinit(lib: &LibR) -> compile::Result {
     if std::env::var("R_HOME").is_err() {
         // R_HOME is not set. try running `R RHOME`.
         if let Ok(mut output) = std::process::Command::new("R").arg("RHOME").output() {
-            output.stdout.pop(); // remove trailing newline
+            // on linux this contains a trailing newline, on windows it doesn't.
+            if let Some(&b'\n') = output.stdout.last() {
+                output.stdout.pop();
+            }
             std::env::set_var(
                 "R_HOME",
                 std::ffi::OsStr::from_encoded_bytes_unchecked(&output.stdout)

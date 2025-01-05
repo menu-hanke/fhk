@@ -123,3 +123,32 @@ mod target {
     }
 
 }
+
+#[cfg(windows)]
+mod target {
+
+    use core::ffi::{c_char, c_int, c_void};
+    use core::ptr::NonNull;
+
+    use super::{Lib, LibBox};
+
+    #[link(name="KERNEL32")]
+    extern "C" {
+        fn LoadLibraryA(lpLibFileName: *const c_char) -> *mut c_void;
+        fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
+        fn FreeLibrary(hLibModule: *mut c_void) -> c_int;
+    }
+
+    pub unsafe fn open(name: *const c_char) -> Option<LibBox> {
+        Some(LibBox(NonNull::new(LoadLibraryA(name).cast())?))
+    }
+
+    pub unsafe fn sym(lib: &Lib, name: *const c_char) -> *mut c_void {
+        GetProcAddress(lib as *const Lib as *mut Lib as *mut c_void, name)
+    }
+
+    pub unsafe fn close(lib: &Lib) {
+        FreeLibrary(lib as *const Lib as *mut Lib as *mut c_void);
+    }
+
+}
