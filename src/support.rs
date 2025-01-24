@@ -182,19 +182,21 @@ unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u
         let ptr = (vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8;
         let data = match slot.is_bitmap() {
             true => {
+                // round to 8 so that it can be cleared one 64-bit word at a time.
+                let size = (size + 7) & !7;
                 if !(*ptr).is_null() {
-                    let words = core::slice::from_raw_parts_mut(*ptr as *mut u64, ((size+7)>>3) as _);
+                    let words = core::slice::from_raw_parts_mut(*ptr as *mut u64, (size>>3) as _);
                     let mask = 0x0101010101010101 * 0xfeu8.rotate_left(slot.bit()) as u64;
                     for word in words { *word &= mask; }
                     continue
                 }
                 let data = match slot.is_dup() {
                     true => {
-                        debug_assert!(size_of::<DupHeader>() == 8);
+                        debug_assert!(size_of::<DupHeader>() == 8); // must match alignment
                         let data = vmctx.host.alloc((size+8) as _, 8) as *mut DupHeader;
                         *data = DupHeader {
                             size,
-                            next: replace(&mut vmctx.dup, slot.offset())
+                            next: replace(&mut vmctx.dup, ofs)
                         };
                         data.add(1) as _
                     },
@@ -210,8 +212,6 @@ unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u
         };
         // *don't* use `ptr` here, it's UB because we access the vmctx reference in between.
         *((vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8) = data;
-        let mut _x = 123;
-        *(&mut _x) = 1234;
     }
 }
 
