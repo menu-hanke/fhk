@@ -95,7 +95,7 @@ impl Image {
                     };
                     *newptr = copy.add(1);
                     core::ptr::copy_nonoverlapping(
-                        new.sub(1) as *const u8,
+                        new as *const u8,
                         copy.add(1) as *mut u8,
                         size as _
                     );
