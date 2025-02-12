@@ -685,6 +685,19 @@ impl<W> core::ops::DerefMut for Bump<W> {
     }
 }
 
+impl<W> Drop for Bump<W> {
+    fn drop(&mut self) {
+        if self.cap != 0 {
+            unsafe {
+                alloc::alloc::dealloc(
+                    self.ptr.as_ptr(),
+                    Layout::from_size_align_unchecked(self.cap as _, MAX_ALIGN)
+                );
+            }
+        }
+    }
+}
+
 /* ---- VLAs ---------------------------------------------------------------- */
 
 macro_rules! vla_struct {
