@@ -1,6 +1,17 @@
 local ffi = require "ffi"
 local buffer = require "string.buffer"
 
+for cmd,var in pairs {
+	v = "FHK_LUAJIT_VERBOSE",
+	p = "FHK_LUAJIT_PROFILE",
+	dump = "FHK_LUAJIT_DUMP"
+} do
+	local e = os.getenv(var)
+	if e then
+		require("jit."..cmd).start(cmd ~= "v" and e)
+	end
+end
+
 -- these are mis-declared on purpose:
 -- * we don't care about the second argument of fhk_swap, we only want to pass control to the host
 -- * int gives better code than int64_t
