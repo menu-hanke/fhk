@@ -194,7 +194,10 @@ pub type CLcx<'a, 'b, 'c> = Ccx<Access<Lower, R<'a>>, R<'b>, R<'c>>;
 // note: var.def only has 8 bits anyway, so this can't go higher
 const IRT_ARM: Type = Type::I8;
 
-// vars, models, and tabs always emit this as ins #1 (where start = #0):
+// entry instruction is always emitted as #0
+const INS_ENTRY: InsId = zerocopy::transmute!(0u16);
+
+// vars, models, and tabs always emit this as ins #1
 const INS_FLATIDX: InsId = zerocopy::transmute!(1u16);
 
 // expr obj.mark:
@@ -485,7 +488,7 @@ fn collectobjs(ctx: &mut Ccx<Lower>) {
 
 fn emitarg(func: &Func, idx: usize) -> InsId {
     let phi = func.ret + idx as isize;
-    func.code.push(Ins::PHI(func.phis.at(phi).type_, InsId::START, phi))
+    func.code.push(Ins::PHI(func.phis.at(phi).type_, INS_ENTRY, phi))
 }
 
 pub fn reserve(func: &Func, num: usize) -> InsId {
@@ -2495,7 +2498,7 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef, fail: InsId) {
 // * returns 1.. are allocated in order, starting from the first axis, with 1 slot (i64 size)
 //   per static dimension, and 2 slots (ptr F, ptr B) per dynamic dimension.
 fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let mut len: IndexOption<InsId> = None.into();
     let bump = Access::borrow(&lcx.data.bump);
     let tab = &bump[tab];
@@ -2657,13 +2660,13 @@ fn emitbinit(lcx: &mut Lcx, tab: BumpRef<Tab>, bundle: FuncId) {
     let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, tabcall, 0.into()));
     let binit = lcx.data.func.code.push(Ins::BINIT(size, bundle));
     let ret = lcx.data.func.code.push(Ins::RET());
-    lcx.data.func.code.set(InsId::START, Ins::JMP(binit, ret, 0.into()));
+    lcx.data.func.code.set(INS_ENTRY, Ins::JMP(binit, ret, 0.into()));
 }
 
 /* ---- Variables ----------------------------------------------------------- */
 
 fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let ret = lcx.data.func.code.push(Ins::RET());
     let bump = Access::borrow(&lcx.data.bump);
     for (i, &setter) in bump[var].value.iter().enumerate() {
@@ -2702,7 +2705,7 @@ fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
 }
 
 fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let bump = Access::borrow(&lcx.data.bump);
     let var = &bump[var];
     lcx.data.tmp_vty.clear();
@@ -2813,7 +2816,7 @@ fn emitvarcheck(
 // simple models emit directly into the variable definition.
 
 fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let bump = Access::borrow(&lcx.data.bump);
     let model = &bump[model];
     let ret = lcx.data.func.code.push(Ins::RET());
@@ -2832,7 +2835,7 @@ fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
 }
 
 fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let bump = Access::borrow(&lcx.data.bump);
     let model = &bump[model];
     for vset in &model.value {
@@ -2852,7 +2855,7 @@ fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
 /* ---- Queries ------------------------------------------------------------- */
 
 fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
-    let mut ctr = InsId::START;
+    let mut ctr = INS_ENTRY;
     let mut ret: PhiId = 0.into();
     let objs = Access::borrow(&lcx.objs);
     let fail = lcx.data.func.code.push(Ins::ABORT());
@@ -2889,6 +2892,7 @@ fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) 
     debug_assert!(lcx.data.func.code.is_empty());
     lcx.data.expr.clear();
     // start:
+    lcx.data.func.entry = INS_ENTRY;
     reserve(&lcx.data.func, 1);
     // flatidx:
     match &lcx.data.func.kind {

@@ -166,6 +166,7 @@ pub fn dump_ir(buf: &mut Bump, ir: &IR) {
             "---------- FUNC {} ----------\n",
             {let i: u16 = zerocopy::transmute!(id); i}
         ).unwrap();
+        write!(buf, "ENTRY ->{:?}\n", func.entry).unwrap();
         dump_phis(buf, func);
         dump_code(buf, &func.code);
     }

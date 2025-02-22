@@ -58,7 +58,7 @@ pub struct Gcm {
     solver_ins: DataflowSystem<InsId>
 }
 
-// NOTE: for correctness we only need to ensure that block(InsId::START) = BlockId::START.
+// NOTE: for correctness we only need to ensure that block(func.entry) = BlockId::START.
 // visiting in preorder guarantees that the domtree algorithm terminates reasonably fast
 // (but it is correct for any ordering).
 fn placeblock(gcm: &mut Gcm, code: &Code, id: InsId) -> BlockId {
@@ -403,7 +403,7 @@ pub fn compute_schedule(
             n: 1
         })
     );
-    placeblock(gcm, &func.code, InsId::START);
+    placeblock(gcm, &func.code, func.entry);
     // TODO: should either:
     //   (1) place unreachable blocks here, or
     //   (2) require that the cfg has no unreachable blocks here

@@ -2,6 +2,7 @@
 
 use core::mem::{transmute, ManuallyDrop};
 
+use enumset::EnumSet;
 use zerocopy::IntoBytes;
 
 use crate::bump::{Bump, BumpRef};
@@ -18,7 +19,7 @@ use crate::lower::Lower;
 use crate::mcode::MCode;
 use crate::mem::{Layout, ResetSeq};
 use crate::obj::Objects;
-use crate::optimize::Optimize;
+use crate::optimize::{OptFlag, Optimize};
 use crate::parser::Parser;
 use crate::typeinfer::TypeInfer;
 use crate::typestate::{typestate_union, Absent, Access, R, RW};
@@ -90,6 +91,8 @@ pub struct Ccx<P=(), O=RW, I=RW> {
     pub host: HostCtx,
     // compilation result
     pub image: Option<Image>,
+    // optimization flags
+    pub flags: EnumSet<OptFlag>
 }
 
 pub struct CompileStage<'a, P, T: StageMarker> {
@@ -122,6 +125,7 @@ impl Ccx<Absent> {
             mcode: Default::default(),
             image: Default::default(),
             layout: Default::default(),
+            flags: EnumSet::all()
         }
     }
 

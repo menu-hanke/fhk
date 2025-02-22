@@ -8,7 +8,7 @@ use enumset::EnumSetType;
 
 use crate::bump::BumpRef;
 use crate::foreach_lang;
-use crate::index::{index, IndexValueVec, IndexVec};
+use crate::index::{index, IndexValueVec, IndexVec, InvalidValue};
 use crate::lang::Lang;
 use crate::mcode::MCodeData;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
@@ -18,10 +18,6 @@ use crate::support::DynSlot;
 index!(pub struct FuncId(u16) invalid(!0) debug("f{}"));
 index!(pub struct InsId(u16)  invalid(!0) debug("{:04}"));
 index!(pub struct PhiId(u16)  invalid(!0) debug("ϕ{}"));
-
-impl InsId {
-    pub const START: Self = Self(0);
-}
 
 /* ---- Types --------------------------------------------------------------- */
 
@@ -355,6 +351,10 @@ impl Opcode {
         (JMP|GOTO|IF|RET|TRET|UB|ABORT).contains(self)
     }
 
+    pub fn is_data(self) -> bool {
+        !self.is_control()
+    }
+
     pub fn is_lang(self) -> bool {
         use Opcode::*;
         (LO|LOV|LOVV|LOVX|LOX|LOXX).contains(self)
@@ -363,6 +363,16 @@ impl Opcode {
     pub fn is_pinned(self) -> bool {
         use Opcode::*;
         (PHI|ALLOC|ABOX).contains(self)
+    }
+
+    pub fn is_cse(self) -> bool {
+        use Opcode::*;
+        !(ALLOC|ABOX).contains(self)
+    }
+
+    pub fn is_const(self) -> bool {
+        use Opcode::*;
+        (KINT|KINT64|KFP64|KSTR|KREF).contains(self)
     }
 
     pub fn num_v(self) -> usize {
@@ -405,7 +415,7 @@ const fn count_operands(opcode: Opcode, opr: Operand) -> usize {
  *
  * NOTE: do not derive FromBytes. opcode and type must always be valid.
  */
-#[derive(Clone, Copy, PartialEq, Eq, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct Ins(u64);
 
@@ -417,6 +427,7 @@ pub struct Ins(u64);
 impl Ins {
 
     pub const NOP_FX: Ins = Ins::NOP(Type::FX);
+    const MARK_BIT: u64 = 0x100;
 
     pub const fn new(op: Opcode, ty: Type) -> Self {
         Self((op as u64) | ((ty as u64) << 9))
@@ -435,7 +446,15 @@ impl Ins {
     }
 
     pub const fn is_marked(self) -> bool {
-        self.0 & 0x100 != 0
+        self.0 & Self::MARK_BIT != 0
+    }
+
+    pub const fn mark(self) -> Self {
+        Self(self.0 | Self::MARK_BIT)
+    }
+
+    pub const fn unmark(self) -> Self {
+        Self(self.0 & !Self::MARK_BIT)
     }
 
     pub const fn a(self) -> u16 {
@@ -589,6 +608,7 @@ pub enum FuncKind {
 
 pub struct Func {
     pub code: Code,
+    pub entry: InsId,
     pub ret: PhiId, // one past last return value
     pub arg: PhiId, // one past last argument
     pub phis: IndexValueVec<PhiId, Phi>,
@@ -621,6 +641,7 @@ impl Func {
     pub fn new(kind: FuncKind) -> Self {
         Self {
             kind,
+            entry: InsId::INVALID.into(),
             code: Default::default(),
             phis: Default::default(),
             ret: 0.into(),
@@ -639,6 +660,12 @@ impl Func {
 
     pub fn params(&self) -> Range<PhiId> {
         self.ret .. self.arg
+    }
+
+    pub fn unmark(&self) {
+        for (id,ins) in self.code.pairs() {
+            self.code.set(id, ins.unmark());
+        }
     }
 
 }
