@@ -13,7 +13,7 @@ use enumset::EnumSet;
 
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Aligned, Bump};
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
@@ -624,7 +624,7 @@ fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
     Ok(())
 }
 
-impl Phase for Emit {
+impl Stage for Emit {
 
     fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self> {
         let langs = ccx.ir.funcs.raw.iter()

@@ -9,7 +9,7 @@ use enumset::{enum_set, EnumSet};
 use hashbrown::{hash_map, hash_table, HashTable};
 use rustc_hash::FxHasher;
 
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::dump::trace_objs;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
@@ -1078,7 +1078,7 @@ fn annotate(ccx: &mut Ccx<TypeInfer>) {
     }
 }
 
-impl Phase for TypeInfer {
+impl Stage for TypeInfer {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         let mut sub: IndexVec<TypeVar, Type> = Default::default();

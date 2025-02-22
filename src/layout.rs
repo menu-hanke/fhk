@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_layout;
 use crate::image::Instance;
 use crate::index::{self, index, IndexSlice, IndexVec};
@@ -215,7 +215,7 @@ fn makemasks(ctx: &mut Ctx, breakpoints: &mut IndexVec<BreakpointId, (ResetSet, 
     }
 }
 
-impl Phase for ComputeLayout {
+impl Stage for ComputeLayout {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Default::default())

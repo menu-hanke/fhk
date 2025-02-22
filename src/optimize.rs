@@ -1,6 +1,6 @@
 //! Optimizer entry point.
 
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::typestate::Absent;
 
 #[derive(Default)]
@@ -8,7 +8,7 @@ pub struct Optimize {
 
 }
 
-impl Phase for Optimize {
+impl Stage for Optimize {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Default::default())

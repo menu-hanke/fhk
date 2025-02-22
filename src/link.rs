@@ -2,7 +2,7 @@
 
 use core::mem::take;
 
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::image::Image;
 use crate::mcode::{MCode, Reloc, Sym};
 use crate::mmap::{Mmap, Prot};
@@ -73,7 +73,7 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
     Ok(map)
 }
 
-impl Phase for Link {
+impl Stage for Link {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Default::default())

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Bump, BumpRef};
-use crate::compile::{self, Ccx, Phase};
+use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
@@ -187,7 +187,7 @@ pub struct Lower<O=RW, F=RW> {
 pub type Lcx<'a, 'b, 'c> = Ccx<Lower<R<'a>, R<'b>>, R<'c>>;
 
 // for callx (&mut Lcx -> &mut CLcx is ok because &mut T -> &mut UnsafeCell<T> is ok).
-// the point of this is to tell the compiler that emitcallx won't replace the current phase data.
+// the point of this is to tell the compiler that emitcallx won't replace the current stage data.
 pub type CLcx<'a, 'b, 'c> = Ccx<Access<Lower, R<'a>>, R<'b>, R<'c>>;
 
 // integer type used for selecting models.
@@ -3085,7 +3085,7 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
     }
 }
 
-impl Phase for Lower {
+impl Stage for Lower {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Lower {

@@ -10,7 +10,7 @@ use hashbrown::hash_map::Entry;
 use logos::Logos;
 
 use crate::bump::Bump;
-use crate::compile::{self, Ccx, CompileError, Phase};
+use crate::compile::{self, Ccx, CompileError, Stage};
 use crate::err::ErrorMessage;
 use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
@@ -774,7 +774,7 @@ pub fn parse<'a,F,R>(ccx: &'a mut Ccx<Parser>, input: &'a [u8], func: F) -> comp
 
 /* -------------------------------------------------------------------------- */
 
-impl Phase for Parser {
+impl Stage for Parser {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Self {

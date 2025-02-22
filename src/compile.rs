@@ -25,28 +25,28 @@ use crate::typestate::{typestate_union, Absent, Access, R, RW};
 
 pub type Result<T=()> = core::result::Result<T, ()>;
 
-pub trait Phase: Sized {
+pub trait Stage: Sized {
     fn new(ccx: &mut Ccx<Absent>) -> Result<Self>;
     fn run(_: &mut Ccx<Self>) -> Result { Ok(()) }
 }
 
-macro_rules! define_phases {
+macro_rules! define_stages {
     ($( $name:ident $data:ty; )*) => {
         typestate_union! {
-            pub union PhaseData:_PhaseData {
+            pub union StageData:_StageData {
                 $($name: $data),*
             }
         }
-        $( unsafe impl PhaseMarker for $data {} )*
+        $( unsafe impl StageMarker for $data {} )*
     };
 }
 
-pub unsafe trait PhaseMarker: Phase {}
+pub unsafe trait StageMarker: Stage {}
 
-define_phases! {
-    // special "pseudo"-phases
-    ABSENT      Absent;       // no phase data, can create a new one
-    // actual phases
+define_stages! {
+    // special "pseudo"-stages
+    ABSENT      Absent;       // no stage data, can create a new one
+    // actual stages
     PARSE       Parser;
     TYPE        TypeInfer;
     LOWER       Lower;
@@ -56,13 +56,13 @@ define_phases! {
     LINK        Link;
 }
 
-impl Phase for Absent { fn new(_: &mut Ccx<Absent>) -> Result<Self> { Ok(Self) } }
-impl Phase for () { fn new(_: &mut Ccx<Absent>) -> Result<Self> { unreachable!() } }
+impl Stage for Absent { fn new(_: &mut Ccx<Absent>) -> Result<Self> { Ok(Self) } }
+impl Stage for () { fn new(_: &mut Ccx<Absent>) -> Result<Self> { unreachable!() } }
 
 #[repr(C)] // need repr(C) for transmuting references.
 pub struct Ccx<P=(), O=RW, I=RW> {
-    // current phase data
-    pub data: PhaseData<P>,
+    // current stage data
+    pub data: StageData<P>,
     // object graph
     pub objs: Access<Objects, O>,
     // IR
@@ -92,7 +92,7 @@ pub struct Ccx<P=(), O=RW, I=RW> {
     pub image: Option<Image>,
 }
 
-pub struct CompilePhase<'a, P, T: PhaseMarker> {
+pub struct CompileStage<'a, P, T: StageMarker> {
     pub ccx: &'a mut Ccx<P, RW, RW>,
     pub data: ManuallyDrop<T>
 }
@@ -127,19 +127,19 @@ impl Ccx<Absent> {
 
 }
 
-impl<P: PhaseMarker> Ccx<P, RW, RW> {
+impl<P: StageMarker> Ccx<P, RW, RW> {
 
-    pub fn begin<PP: PhaseMarker>(&mut self) -> Result<CompilePhase<'_, PP, P>> {
+    pub fn begin<PP: StageMarker>(&mut self) -> Result<CompileStage<'_, PP, P>> {
         // safety: transmute to absent, new can't do anything to data.
         let new = ManuallyDrop::new(PP::new(unsafe { transmute(&mut *self) })?);
         // safety: self.data contains a valid P
         let data = ManuallyDrop::new(unsafe { core::ptr::read(&self.data as *const _  as *const P) });
-        // safety: PhaseData is a repr(C) union containing PP
+        // safety: StageData is a repr(C) union containing PP
         let ccx: &mut Ccx<PP> = unsafe {
             core::ptr::write(&mut self.data as *mut _ as _, new);
             transmute(self)
         };
-        Ok(CompilePhase { ccx, data })
+        Ok(CompileStage { ccx, data })
     }
 
 }
@@ -173,7 +173,7 @@ pub trait CompileError<P=()> {
 }
 
 // shorthand so that you don't have to write ccx.erase().error(...) for generic errors.
-impl<T,P> CompileError<P> for T where T: CompileError<()>, P: PhaseMarker {
+impl<T,P> CompileError<P> for T where T: CompileError<()>, P: StageMarker {
     fn write(self, ccx: &mut Ccx<P, R, R>) {
         self.write(ccx.erase())
     }
@@ -182,9 +182,9 @@ impl<T,P> CompileError<P> for T where T: CompileError<()>, P: PhaseMarker {
 impl<P,G,I> Ccx<P,G,I> {
 
     pub fn erase(&mut self) -> &mut Ccx<(), G, I> {
-        // safety: caller cannot (safely) overwrite current phase data:
-        //   * `()` doesn't implement PhaseMarker so they can't call begin()
-        //   * there is no way to safely obtain an instance of PhaseData<()>, so they can't set
+        // safety: caller cannot (safely) overwrite current stage data:
+        //   * `()` doesn't implement StageMarker so they can't call begin()
+        //   * there is no way to safely obtain an instance of StageData<()>, so they can't set
         //     it directly
         unsafe { transmute(self) }
     }
@@ -211,7 +211,7 @@ impl<P,G,I> Ccx<P,G,I> {
 
 }
 
-impl<'a, P, T: PhaseMarker> CompilePhase<'a, P, T> {
+impl<'a, P, T: StageMarker> CompileStage<'a, P, T> {
 
     pub fn leak(self) -> &'a mut Ccx<P, RW, RW> {
         let ccx = self.ccx as *mut _;
@@ -221,7 +221,7 @@ impl<'a, P, T: PhaseMarker> CompilePhase<'a, P, T> {
 
 }
 
-impl<'a, P, T: PhaseMarker> Drop for CompilePhase<'a, P, T> {
+impl<'a, P, T: StageMarker> Drop for CompileStage<'a, P, T> {
     fn drop(&mut self) {
         // safety: ccx.data contains a valid P and we have a valid T,
         // which is a field in the repr(C) union ccx.data
@@ -235,7 +235,7 @@ impl<'a, P, T: PhaseMarker> Drop for CompilePhase<'a, P, T> {
     }
 }
 
-fn run<P: PhaseMarker>(ccx: &mut Ccx<Absent>) -> Result {
+fn run<P: StageMarker>(ccx: &mut Ccx<Absent>) -> Result {
     P::run(ccx.begin::<P>()?.ccx)
 }
 
