@@ -172,6 +172,7 @@ r_api! {
     rt extern R_GlobalEnv: SEXP;
     rt extern R_DimSymbol: SEXP;
     extern R_NilValue: SEXP;
+    extern R_SignalHandlers: c_int;
 }
 
 pub struct R {
@@ -311,6 +312,7 @@ unsafe fn rinit(lib: &LibR) -> compile::Result {
             // return Err(());
         }
     }
+    *lib.R_SignalHandlers = 0;
     // TODO: can a failure here be caught?
     let argv: [*const i8; 3] = [c"R".as_ptr(), c"--quiet".as_ptr(), c"--no-save".as_ptr()];
     lib.Rf_initEmbeddedR(argv.len() as _, argv.as_ptr());
