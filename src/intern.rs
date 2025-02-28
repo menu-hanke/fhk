@@ -126,18 +126,20 @@ unsafe fn bigsize(mut end: *const u8, mut raw_size: usize) -> usize {
     let mut shift = 0;
     let mut size = 0;
     loop {
-        size |= (*end as usize) << shift;
+        size |= (unsafe { *end } as usize) << shift;
         raw_size += 1;
         if raw_size == 0x10 { return size }
-        end = end.add(1);
+        end = unsafe { end.add(1) };
         shift += 8;
     }
 }
 
 unsafe fn bigbytes<'a>(data: *const u8, end: usize, raw_size: usize) -> &'a [u8] {
-    let end = data.add(end);
-    let size = bigsize(end, raw_size);
-    core::slice::from_raw_parts(end.sub(size), size)
+    unsafe {
+        let end = data.add(end);
+        let size = bigsize(end, raw_size);
+        core::slice::from_raw_parts(end.sub(size), size)
+    }
 }
 
 unsafe fn bytesmatch(data: *const u8, r: RawRef, bytes: &[u8]) -> bool {
@@ -146,26 +148,26 @@ unsafe fn bytesmatch(data: *const u8, r: RawRef, bytes: &[u8]) -> bool {
     if bytes.len() <= RawRef::MAX_SMALL as _ {
         // if `r` is big then the first comparison is always false
         raw_size == bytes.len()
-            && bytes == core::slice::from_raw_parts(data.add(end-raw_size), raw_size)
+            && bytes == unsafe { core::slice::from_raw_parts(data.add(end-raw_size), raw_size) }
     } else {
-        raw_size > RawRef::MAX_SMALL as _ && bytes == bigbytes(data, end, raw_size)
+        raw_size > RawRef::MAX_SMALL as _ && bytes == unsafe { bigbytes(data, end, raw_size) }
     }
 }
 
 unsafe fn refmatch(bump: &[u8], r: RawRef, bytes: &[u8], align: u32) -> bool {
-    r.end() & (align - 1) == 0 && bytesmatch(bump.as_ptr(), r, bytes)
+    r.end() & (align - 1) == 0 && unsafe { bytesmatch(bump.as_ptr(), r, bytes) }
 }
 
 unsafe fn refdata<'a>(data: *const u8, r: RawRef) -> &'a [u8] {
     let raw_size = r.raw_size() as usize;
     let end = r.end() as usize;
-    let ep = data.add(end);
+    let ep = unsafe { data.add(end) };
     let size = if raw_size <= RawRef::MAX_SMALL as _ {
         raw_size
     } else {
-        bigsize(ep, raw_size)
+        unsafe { bigsize(ep, raw_size) }
     };
-    core::slice::from_raw_parts(ep.sub(size), size)
+    unsafe { core::slice::from_raw_parts(ep.sub(size), size) }
 }
 
 // safety: tab and bump must come from the same intern table
@@ -179,8 +181,8 @@ unsafe fn entry<'tab, 'short>(
         fxhash(bytes),
         // note: this tests that the *end* is aligned, which works as long as size is a multiple
         // of alignment.
-        |&r| refmatch(bump, r, bytes, align),
-        |&r| fxhash(refdata(bump.as_ptr(), r))
+        |&r| unsafe { refmatch(bump, r, bytes, align) },
+        |&r| fxhash(unsafe { refdata(bump.as_ptr(), r) })
     )
 }
 

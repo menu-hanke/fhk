@@ -50,7 +50,7 @@ cfg_if! {
                     //  while compiling with panic="abort" due to some horrible design decisions
                     //  by the rust people, as usual.)
                     #[allow(clashing_extern_declarations)]
-                    extern "C" {
+                    unsafe extern "C" {
                         $(
                             pub fn $name($($pname:$pty),*) $(-> $rty)?;
                         )*
@@ -62,7 +62,7 @@ cfg_if! {
                         #[inline(always)]
                         #[allow(dead_code)]
                         unsafe fn $name(&self, $($pname:$pty),*) $(-> $rty)? {
-                            host_liblua::$name($($pname),*)
+                            unsafe { host_liblua::$name($($pname),*) }
                         }
                     )*
                 }
@@ -344,110 +344,114 @@ const STACK_FUNCS: c_int = 2;     // table containing all jump table functions
 
 unsafe fn toabsidx(lib: &LuaLib, L: *mut lua_State, idx: c_int) -> c_int {
     if idx < 0 {
-        lib.lua_gettop(L) + idx + 1
+        (unsafe { lib.lua_gettop(L) }) + idx + 1
     } else {
         idx
     }
 }
 
 unsafe fn pushctype(objs: &Objects, lib: &LuaLib, L: *mut lua_State, tab: c_int, idx: ObjRef) {
-    lib.lua_rawgeti(L, tab, {let idx: u32 = zerocopy::transmute!(idx); idx as _});
-    if lib.lua_type(L, -1) != LUA_TNIL {
-        return;
+    unsafe {
+        lib.lua_rawgeti(L, tab, {let idx: u32 = zerocopy::transmute!(idx); idx as _});
+        if lib.lua_type(L, -1) != LUA_TNIL {
+            return;
+        }
+        lib.lua_settop(L, -2);
+        match objs.get(idx) {
+            ObjectRef::TPRI(&TPRI { ty, .. }) => {
+                lib.lua_getfield(L, STACK_TENSORLIB, c"scalar_ctype".as_ptr());
+                lib.lua_pushnumber(L, ty as _);
+                lib.lua_call(L, 1, 1);
+            },
+            ObjectRef::TTEN(&TTEN { elem, dim: 1, .. }) if objs[elem].op == Obj::TPRI => {
+                lib.lua_getfield(L, STACK_TENSORLIB, c"vector_ctype".as_ptr());
+                pushctype(objs, lib, L, tab, elem);
+                lib.lua_call(L, 1, 1);
+            },
+            ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
+                lib.lua_getfield(L, STACK_TENSORLIB, c"tensor_ctype".as_ptr());
+                pushctype(objs, lib, L, tab, elem);
+                lib.lua_pushnumber(L, dim as _);
+                lib.lua_call(L, 2, 1);
+            },
+            _ => unreachable!()
+        }
+        lib.lua_pushvalue(L, -1);
+        lib.lua_rawseti(L, tab, {let idx: u32 = zerocopy::transmute!(idx); idx as _});
     }
-    lib.lua_settop(L, -2);
-    match objs.get(idx) {
-        ObjectRef::TPRI(&TPRI { ty, .. }) => {
-            lib.lua_getfield(L, STACK_TENSORLIB, c"scalar_ctype".as_ptr());
-            lib.lua_pushnumber(L, ty as _);
-            lib.lua_call(L, 1, 1);
-        },
-        ObjectRef::TTEN(&TTEN { elem, dim: 1, .. }) if objs[elem].op == Obj::TPRI => {
-            lib.lua_getfield(L, STACK_TENSORLIB, c"vector_ctype".as_ptr());
-            pushctype(objs, lib, L, tab, elem);
-            lib.lua_call(L, 1, 1);
-        },
-        ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
-            lib.lua_getfield(L, STACK_TENSORLIB, c"tensor_ctype".as_ptr());
-            pushctype(objs, lib, L, tab, elem);
-            lib.lua_pushnumber(L, dim as _);
-            lib.lua_call(L, 2, 1);
-        },
-        _ => unreachable!()
-    }
-    lib.lua_pushvalue(L, -1);
-    lib.lua_rawseti(L, tab, {let idx: u32 = zerocopy::transmute!(idx); idx as _});
 }
 
 unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile::Result<usize> {
-    let mut jump = 0;
-    lib.lua_createtable(L, 0, 0);
-    let ctidx = toabsidx(lib, L, -1);
-    for func in &ccx.ir.funcs.raw {
-        for (id, ins) in func.code.pairs() {
-            if ins.opcode() == Opcode::LOVV && ins.decode_L() == LangOp::Lua(LOP_CALL) {
-                let (mut args, cref, _) = ins.decode_LOVV();
-                lib.lua_createtable(L, 0, 4); // {load,template,inputs,returns}
-                lib.lua_createtable(L, 0, 0); // inputs
-                lib.lua_createtable(L, 0, 0); // insid -> input idx
-                let mut n_in = 0;
-                while func.code.at(args).opcode() != Opcode::NOP {
-                    let (next, value) = func.code.at(args).decode_CARG();
-                    lib.lua_rawgeti(L, -1, {let idx: u16 = zerocopy::transmute!(value); idx as _});
-                    if lib.lua_type(L, -1) == LUA_TNIL {
-                        // TODO: handle constants (constant scalars) here specially. they don't
-                        // need a memory write, just put the value in the table and hardcode
-                        // it in the generated lua code.
-                        lib.lua_settop(L, -2);
-                        lib.lua_createtable(L, 0, 0);
-                        let (_, tref, _) = func.code.at(value).decode_LOVV();
-                        let tobj: ObjRef = zerocopy::transmute!(func.code.at(tref).bc());
-                        pushctype(&ccx.objs, lib, L, ctidx, tobj);
-                        lib.lua_setfield(L, -2, c"ctype".as_ptr());
-                        n_in += 1;
-                        lib.lua_rawseti(L, -3, n_in as _);
-                        lib.lua_pushnumber(L, n_in as _);
+    unsafe {
+        let mut jump = 0;
+        lib.lua_createtable(L, 0, 0);
+        let ctidx = toabsidx(lib, L, -1);
+        for func in &ccx.ir.funcs.raw {
+            for (id, ins) in func.code.pairs() {
+                if ins.opcode() == Opcode::LOVV && ins.decode_L() == LangOp::Lua(LOP_CALL) {
+                    let (mut args, cref, _) = ins.decode_LOVV();
+                    lib.lua_createtable(L, 0, 4); // {load,template,inputs,returns}
+                    lib.lua_createtable(L, 0, 0); // inputs
+                    lib.lua_createtable(L, 0, 0); // insid -> input idx
+                    let mut n_in = 0;
+                    while func.code.at(args).opcode() != Opcode::NOP {
+                        let (next, value) = func.code.at(args).decode_CARG();
+                        lib.lua_rawgeti(L, -1, {let idx: u16 = zerocopy::transmute!(value); idx as _});
+                        if lib.lua_type(L, -1) == LUA_TNIL {
+                            // TODO: handle constants (constant scalars) here specially. they don't
+                            // need a memory write, just put the value in the table and hardcode
+                            // it in the generated lua code.
+                            lib.lua_settop(L, -2);
+                            lib.lua_createtable(L, 0, 0);
+                            let (_, tref, _) = func.code.at(value).decode_LOVV();
+                            let tobj: ObjRef = zerocopy::transmute!(func.code.at(tref).bc());
+                            pushctype(&ccx.objs, lib, L, ctidx, tobj);
+                            lib.lua_setfield(L, -2, c"ctype".as_ptr());
+                            n_in += 1;
+                            lib.lua_rawseti(L, -3, n_in as _);
+                            lib.lua_pushnumber(L, n_in as _);
+                        }
+                        lib.lua_rawseti(L, -3, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
+                        args = next;
                     }
-                    lib.lua_rawseti(L, -3, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
-                    args = next;
+                    lib.lua_settop(L, -2);
+                    lib.lua_setfield(L, -2, c"inputs".as_ptr());
+                    let cref: IRef<LuaCall> = zerocopy::transmute!(func.code.at(cref).bc());
+                    let call = &ccx.intern[cref];
+                    lib.lua_createtable(L, 0, 0); // returns
+                    for (i,&ret) in ccx.intern.get_slice(call.ret).iter().enumerate() {
+                        lib.lua_createtable(L, 0, 0);
+                        pushctype(&ccx.objs, lib, L, ctidx, ret);
+                        lib.lua_setfield(L, -2, c"ctype".as_ptr());
+                        lib.lua_pushnumber(L, {let ret: u32 = zerocopy::transmute!(ret); ret as _});
+                        lib.lua_setfield(L, -2, c"ann".as_ptr());
+                        lib.lua_rawseti(L, -2, (i+1) as _);
+                    }
+                    lib.lua_setfield(L, -2, c"returns".as_ptr());
+                    let load = ccx.intern.get_slice(call.load);
+                    lib.lua_pushlstring(L, load.as_ptr(), load.len() as _);
+                    lib.lua_setfield(L, -2, c"load".as_ptr());
+                    let template = ccx.intern.get_slice(call.template);
+                    lib.lua_pushlstring(L, template.as_ptr(), template.len() as _);
+                    lib.lua_setfield(L, -2, c"template".as_ptr());
+                    jump += 1;
+                    lib.lua_rawseti(L, STACK_FUNCS, jump as _);
+                    func.code.set(id, ins.set_b(jump as _).set_opcode(Opcode::LOVX));
                 }
-                lib.lua_settop(L, -2);
-                lib.lua_setfield(L, -2, c"inputs".as_ptr());
-                let cref: IRef<LuaCall> = zerocopy::transmute!(func.code.at(cref).bc());
-                let call = &ccx.intern[cref];
-                lib.lua_createtable(L, 0, 0); // returns
-                for (i,&ret) in ccx.intern.get_slice(call.ret).iter().enumerate() {
-                    lib.lua_createtable(L, 0, 0);
-                    pushctype(&ccx.objs, lib, L, ctidx, ret);
-                    lib.lua_setfield(L, -2, c"ctype".as_ptr());
-                    lib.lua_pushnumber(L, {let ret: u32 = zerocopy::transmute!(ret); ret as _});
-                    lib.lua_setfield(L, -2, c"ann".as_ptr());
-                    lib.lua_rawseti(L, -2, (i+1) as _);
-                }
-                lib.lua_setfield(L, -2, c"returns".as_ptr());
-                let load = ccx.intern.get_slice(call.load);
-                lib.lua_pushlstring(L, load.as_ptr(), load.len() as _);
-                lib.lua_setfield(L, -2, c"load".as_ptr());
-                let template = ccx.intern.get_slice(call.template);
-                lib.lua_pushlstring(L, template.as_ptr(), template.len() as _);
-                lib.lua_setfield(L, -2, c"template".as_ptr());
-                jump += 1;
-                lib.lua_rawseti(L, STACK_FUNCS, jump as _);
-                func.code.set(id, ins.set_b(jump as _).set_opcode(Opcode::LOVX));
             }
         }
-    }
-    lib.luaL_loadbuffer(L, CALL_LUA.as_ptr(), CALL_LUA.len(), c"fhk:call".as_ptr());
-    lib.lua_pushvalue(L, STACK_FUNCS);
-    lib.lua_pushnumber(L, fhk_swap as usize as _);
-    lib.lua_call(L, 2, 2);
-    if lib.lua_type(L, -2) == LUA_TNIL {
-        let msg = lib.lua_tolstring(L, -1, core::ptr::null_mut());
-        ccx.error(CStr::from_ptr(msg))
-    } else {
-        let mem = lib.lua_tointeger(L, -2);
-        lib.lua_settop(L, -3);
-        Ok(mem as _)
+        lib.luaL_loadbuffer(L, CALL_LUA.as_ptr(), CALL_LUA.len(), c"fhk:call".as_ptr());
+        lib.lua_pushvalue(L, STACK_FUNCS);
+        lib.lua_pushnumber(L, fhk_swap as usize as _);
+        lib.lua_call(L, 2, 2);
+        if lib.lua_type(L, -2) == LUA_TNIL {
+            let msg = lib.lua_tolstring(L, -1, core::ptr::null_mut());
+            ccx.error(CStr::from_ptr(msg))
+        } else {
+            let mem = lib.lua_tointeger(L, -2);
+            lib.lua_settop(L, -3);
+            Ok(mem as _)
+        }
     }
 }
 
@@ -545,37 +549,43 @@ struct InitCtx {
 
 #[cold]
 unsafe extern "C" fn fhk_lua_swap_exit(coro: usize, errmsg: *const c_char) -> i64 {
-    let inst = &mut *fhk_swap_instance(coro);
-    inst.host.set_error(CStr::from_ptr(errmsg).to_bytes());
-    fhk_swap_exit(coro)
+    unsafe {
+        let inst = &mut *fhk_swap_instance(coro);
+        inst.host.set_error(CStr::from_ptr(errmsg).to_bytes());
+        fhk_swap_exit(coro)
+    }
 }
 
 unsafe extern "C" fn run(ctx: *mut ()) -> ! {
-    let init = &*(ctx as *const InitCtx);
+    let init = unsafe { &*(ctx as *const InitCtx) };
     let L = init.L;
     let mem = init.base;
     #[cfg(feature="host-Lua")]
     let lua_call = host_liblua::lua_call;
     #[cfg(not(feature="host-Lua"))]
     let lua_call = todo!();
-    lua_call(L, 1, 0);
-    loop { fhk_swap(mem, 0); }
+    unsafe {
+        lua_call(L, 1, 0);
+        loop { fhk_swap(mem, 0); }
+    }
 }
 
 unsafe fn init(lua: &Lua, stack: usize) {
-    let &Lua { L, ref lib, base } = lua;
-    lib.lua_settop(L, 0);
-    lib.lua_getfield(L, LUA_GLOBALSINDEX, c"__fhk_run".as_ptr());
-    lib.lua_pushnumber(L, fhk_lua_swap_exit as usize as _);
-    let mut ctx = InitCtx { L, base };
-    fhk_swap_init(&SwapInit {
-        coro: base,
-        stack,
-        func: run,
-        ctx: &mut ctx as *mut _ as *mut _,
-        #[cfg(windows)]
-        bottom: stack - CORO_STACK
-    })
+    unsafe {
+        let &Lua { L, ref lib, base } = lua;
+        lib.lua_settop(L, 0);
+        lib.lua_getfield(L, LUA_GLOBALSINDEX, c"__fhk_run".as_ptr());
+        lib.lua_pushnumber(L, fhk_lua_swap_exit as usize as _);
+        let mut ctx = InitCtx { L, base };
+        fhk_swap_init(&SwapInit {
+            coro: base,
+            stack,
+            func: run,
+            ctx: &mut ctx as *mut _ as *mut _,
+            #[cfg(windows)]
+            bottom: stack - CORO_STACK
+        })
+    }
 }
 
 /* ---- Finalization -------------------------------------------------------- */

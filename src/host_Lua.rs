@@ -20,7 +20,7 @@ use crate::image::fhk_vmcall_native as fhk_vmcall;
 type lua_State = c_void;
 
 #[cfg_attr(windows, link(name="lua51"))]
-extern "C-unwind" {
+unsafe extern "C-unwind" {
     fn luaL_loadbuffer(L: *mut lua_State, buff: *const u8, sz: usize, name: *const c_char) -> c_int;
     fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int);
     fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void);
@@ -75,11 +75,11 @@ extern "C" fn fhk_newgraph() -> *mut fhk_Graph {
 
 unsafe extern "C" fn fhk_destroygraph(G: *mut fhk_Graph) {
     // NOTE: G must have a valid parse context even if we are done or errored out from compile
-    drop(Box::from_raw(G))
+    drop(unsafe { Box::from_raw(G) })
 }
 
 unsafe extern "C" fn fhk_destroyimage(image: *mut fhk_Image) {
-    drop(Box::from_raw(image))
+    drop(unsafe { Box::from_raw(image) })
 }
 
 extern "C" fn fhk_buf(G: &mut fhk_Graph) -> *const c_char {
@@ -96,10 +96,12 @@ extern "C" fn fhk_objnum(G: &fhk_Graph) -> ObjRef {
 }
 
 unsafe fn slice_from_raw_parts<'a,T>(src: *const T, num: usize) -> &'a [T] {
-    core::slice::from_raw_parts(
-        match num { 0 => core::mem::transmute(align_of::<T>()), _ => src },
-        num
-    )
+    unsafe {
+        core::slice::from_raw_parts(
+            match num { 0 => core::mem::transmute(align_of::<T>()), _ => src },
+            num
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -155,7 +157,7 @@ unsafe extern "C" fn fhk_parse(
     len: usize,
     what: c_int
 ) -> fhk_Result {
-    doparse(G, tab, Source::String(slice_from_raw_parts(src as _, len)), what)
+    doparse(G, tab, Source::String(unsafe { slice_from_raw_parts(src as _, len) }), what)
 }
 
 unsafe extern "C" fn fhk_tparse(
@@ -166,7 +168,7 @@ unsafe extern "C" fn fhk_tparse(
     num: usize,
     what: c_int
 ) -> fhk_Result {
-    doparse(G, tab, Source::Template(template, slice_from_raw_parts(caps, num)), what)
+    doparse(G, tab, Source::Template(template, unsafe { slice_from_raw_parts(caps, num) }), what)
 }
 
 extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
@@ -185,7 +187,7 @@ unsafe extern "C" fn fhk_newquery(
     values: *const fhk_ObjRef<EXPR>,
     num: usize
 ) -> fhk_ObjRef<QUERY> {
-    G.objs.push_args(QUERY::new(tab, 0), slice_from_raw_parts(values, num))
+    G.objs.push_args(QUERY::new(tab, 0), unsafe { slice_from_raw_parts(values, num) })
 }
 
 unsafe extern "C" fn fhk_newreset(
@@ -195,7 +197,7 @@ unsafe extern "C" fn fhk_newreset(
 ) -> fhk_ObjRef<RESET> {
     G.objs.push_args(
         RESET::new(zerocopy::transmute!(G.resets.next()), 0, 0),
-        slice_from_raw_parts(objs, num)
+        unsafe { slice_from_raw_parts(objs, num) }
     )
 }
 
@@ -208,7 +210,7 @@ unsafe extern "C" fn fhk_compile(G: &mut fhk_Graph, image: *mut *mut fhk_Image) 
     let result = G.begin().unwrap().ccx.compile();
     match result {
         Ok(()) => {
-            *image = Box::leak(Box::new(G.image.take().unwrap()));
+            unsafe { *image = Box::leak(Box::new(G.image.take().unwrap())); }
             0
         },
         Err(()) => -1
@@ -232,9 +234,11 @@ unsafe extern "C" fn fhk_newinstance(
 ) -> *mut fhk_Instance {
     // TODO: only reset if this query depends on the reset mask (save mask for queries too)
     // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
-    let inst = image.instantiate(prev, reset, |size, align| alloc(udata, size, align));
-    (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
-    inst
+    unsafe {
+        let inst = image.instantiate(prev, reset, |size, align| alloc(udata, size, align));
+        (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
+        inst
+    }
 }
 
 macro_rules! define_api {
@@ -288,19 +292,21 @@ define_api! {
     char *(*fhk_vmerr)(fhk_Instance *);
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 unsafe extern "C-unwind" fn luaopen_fhk(L: *mut lua_State) -> c_int {
-    luaL_loadbuffer(L, HOST_APIDEF.as_ptr(), HOST_APIDEF.len(), c"fhk:hostapi".as_ptr());
-    lua_call(L, 0, 0);
-    luaL_loadbuffer(L, HOST_LUA.as_ptr(), HOST_LUA.len(), c"fhk".as_ptr());
-    luaL_loadbuffer(L, TENSOR_LUA.as_ptr(), TENSOR_LUA.len(), c"fhk:tensor".as_ptr());
-    lua_call(L, 0, 1);
-    lua_pushlightuserdata(L, HOST_API.as_ptr() as _);
-    lua_pushlightuserdata(L, Operator::NAME.as_ptr() as _);
-    lua_pushlightuserdata(L, Operator::NAME_OFS.as_ptr() as _);
-    lua_pushlightuserdata(L, Operator::FIELDS.0.as_ptr() as _);
-    lua_pushlightuserdata(L, Operator::FIELDS.1.as_ptr() as _);
-    lua_pushinteger(L, Operator::NAME_OFS.len() as isize - 1);
-    lua_call(L, 7, 1);
+    unsafe {
+        luaL_loadbuffer(L, HOST_APIDEF.as_ptr(), HOST_APIDEF.len(), c"fhk:hostapi".as_ptr());
+        lua_call(L, 0, 0);
+        luaL_loadbuffer(L, HOST_LUA.as_ptr(), HOST_LUA.len(), c"fhk".as_ptr());
+        luaL_loadbuffer(L, TENSOR_LUA.as_ptr(), TENSOR_LUA.len(), c"fhk:tensor".as_ptr());
+        lua_call(L, 0, 1);
+        lua_pushlightuserdata(L, HOST_API.as_ptr() as _);
+        lua_pushlightuserdata(L, Operator::NAME.as_ptr() as _);
+        lua_pushlightuserdata(L, Operator::NAME_OFS.as_ptr() as _);
+        lua_pushlightuserdata(L, Operator::FIELDS.0.as_ptr() as _);
+        lua_pushlightuserdata(L, Operator::FIELDS.1.as_ptr() as _);
+        lua_pushinteger(L, Operator::NAME_OFS.len() as isize - 1);
+        lua_call(L, 7, 1);
+    }
     1
 }

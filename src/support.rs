@@ -117,7 +117,7 @@ impl NativeFunc {
 /* ---- Math ---------------------------------------------------------------- */
 
 #[link(name="m")]
-extern "C" {
+unsafe extern "C" {
     fn pow(x: f64, y: f64) -> f64;
     fn exp(x: f64) -> f64;
     fn log(x: f64) -> f64;
@@ -176,16 +176,18 @@ impl DynSlot {
 }
 
 unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u32, size: u32) {
-    let slots = core::slice::from_raw_parts(slots, num as _);
+    let slots = unsafe { core::slice::from_raw_parts(slots, num as _) };
     for &slot in slots {
         let ofs = slot.offset();
-        let ptr = (vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8;
+        let ptr = unsafe { (vmctx as *mut _ as *mut u8).add(ofs as _) } as *mut *mut u8;
         let data = match slot.is_bitmap() {
             true => {
                 // round to 8 so that it can be cleared one 64-bit word at a time.
                 let size = (size + 7) & !7;
-                if !(*ptr).is_null() {
-                    let words = core::slice::from_raw_parts_mut(*ptr as *mut u64, (size>>3) as _);
+                if !(unsafe { *ptr }).is_null() {
+                    let words = unsafe {
+                        core::slice::from_raw_parts_mut(*ptr as *mut u64, (size>>3) as _)
+                    };
                     let mask = 0x0101010101010101 * 0xfeu8.rotate_left(slot.bit()) as u64;
                     for word in words { *word &= mask; }
                     continue
@@ -194,15 +196,17 @@ unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u
                     true => {
                         debug_assert!(size_of::<DupHeader>() == 8); // must match alignment
                         let data = vmctx.host.alloc((size+8) as _, 8) as *mut DupHeader;
-                        *data = DupHeader {
-                            size,
-                            next: replace(&mut vmctx.dup, ofs)
-                        };
-                        data.add(1) as _
+                        unsafe {
+                            *data = DupHeader {
+                                size,
+                                next: replace(&mut vmctx.dup, ofs)
+                            };
+                            data.add(1) as _
+                        }
                     },
                     false => vmctx.host.alloc(size as _, 8)
                 };
-                core::ptr::write_bytes(data, 0, size as _);
+                unsafe { core::ptr::write_bytes(data, 0, size as _); }
                 data
             },
             false => {
@@ -210,8 +214,10 @@ unsafe extern "C" fn rt_init(vmctx: &mut Instance, slots: *const DynSlot, num: u
                 vmctx.host.alloc((ss*size) as _, ss as _)
             }
         };
-        // *don't* use `ptr` here, it's UB because we access the vmctx reference in between.
-        *((vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8) = data;
+        unsafe {
+            // *don't* use `ptr` here, it's UB because we access the vmctx reference in between.
+            *((vmctx as *mut _ as *mut u8).add(ofs as _) as *mut *mut u8) = data;
+        }
     }
 }
 
@@ -250,7 +256,7 @@ fn supp_alloc(ecx: &mut Ecx) {
 
 unsafe extern "C" fn rt_abort(vmctx: &mut Instance) -> ! {
     vmctx.host.set_error(b"query aborted (no suitable model)");
-    fhk_vmexit(vmctx)
+    unsafe { fhk_vmexit(vmctx) }
 }
 
 fn supp_abort(ecx: &mut Ecx) {

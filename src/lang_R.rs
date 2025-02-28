@@ -301,10 +301,12 @@ unsafe fn rinit(lib: &LibR) -> compile::Result {
             if let Some(&b'\n') = output.stdout.last() {
                 output.stdout.pop();
             }
-            std::env::set_var(
-                "R_HOME",
-                std::ffi::OsStr::from_encoded_bytes_unchecked(&output.stdout)
-            );
+            unsafe {
+                std::env::set_var(
+                    "R_HOME",
+                    std::ffi::OsStr::from_encoded_bytes_unchecked(&output.stdout)
+                );
+            }
         } else {
             // TODO: report error
             todo!()
@@ -312,10 +314,12 @@ unsafe fn rinit(lib: &LibR) -> compile::Result {
             // return Err(());
         }
     }
-    *lib.R_SignalHandlers = 0;
-    // TODO: can a failure here be caught?
     let argv: [*const i8; 3] = [c"R".as_ptr(), c"--quiet".as_ptr(), c"--no-save".as_ptr()];
-    lib.Rf_initEmbeddedR(argv.len() as _, argv.as_ptr());
+    unsafe {
+        *lib.R_SignalHandlers = 0;
+        // TODO: can a failure here be caught?
+        lib.Rf_initEmbeddedR(argv.len() as _, argv.as_ptr());
+    }
     Ok(())
 }
 
@@ -441,23 +445,27 @@ fn pri2sexp(pri: Primitive) -> SEXPTYPE {
 
 unsafe fn importprivalue(dst: *mut (), src: *const (), pri: Primitive) {
     use Primitive::*;
-    match pri {
-        F64 => *dst.cast::<f64>()       = *src.cast::<f64>(),
-        F32 => *dst.cast::<f64>()       = *src.cast::<f32>() as _,
-        I64|U64 => *dst.cast::<c_int>() = *src.cast::<i64>() as _,
-        I32|U32 => *dst.cast::<c_int>() = *src.cast::<i32>(),
-        I16 => *dst.cast::<c_int>()     = *src.cast::<i16>() as _,
-        I8  => *dst.cast::<c_int>()     = *src.cast::<i8>() as _,
-        U16 => *dst.cast::<c_int>()     = *src.cast::<u16>() as _,
-        U8|B1 => *dst.cast::<c_int>()   = *src.cast::<u8>() as _,
-        STR|PTR => todo!("importprivalue ptr") // is str c_char?
+    unsafe {
+        match pri {
+            F64 => *dst.cast::<f64>()       = *src.cast::<f64>(),
+            F32 => *dst.cast::<f64>()       = *src.cast::<f32>() as _,
+            I64|U64 => *dst.cast::<c_int>() = *src.cast::<i64>() as _,
+            I32|U32 => *dst.cast::<c_int>() = *src.cast::<i32>(),
+            I16 => *dst.cast::<c_int>()     = *src.cast::<i16>() as _,
+            I8  => *dst.cast::<c_int>()     = *src.cast::<i8>() as _,
+            U16 => *dst.cast::<c_int>()     = *src.cast::<u16>() as _,
+            U8|B1 => *dst.cast::<c_int>()   = *src.cast::<u8>() as _,
+            STR|PTR => todo!("importprivalue ptr") // is str c_char?
+        }
     }
 }
 
 unsafe fn importscalar(lib: &RuntimeLibR, src: *const (), pri: Primitive) -> SEXP {
-    let v = (lib.Rf_allocVector)(pri2sexp(pri), 1);
-    importprivalue((lib.DATAPTR)(v) as _, src, pri);
-    v
+    unsafe {
+        let v = (lib.Rf_allocVector)(pri2sexp(pri), 1);
+        importprivalue((lib.DATAPTR)(v) as _, src, pri);
+        v
+    }
 }
 
 unsafe fn importarray(lib: &RuntimeLibR, array: Array) -> SEXP {
@@ -468,10 +476,10 @@ unsafe fn importarray(lib: &RuntimeLibR, array: Array) -> SEXP {
     };
     let (vec, size) = match array.shape() {
         &[size] => {
-            let vec = (lib.Rf_protect)((lib.Rf_allocVector)(ety, size as _));
+            let vec = unsafe { (lib.Rf_protect)((lib.Rf_allocVector)(ety, size as _)) };
             (vec, size)
         },
-        shape => {
+        shape => unsafe {
             let size: Idx = shape.iter().product();
             let vec = (lib.Rf_protect)((lib.Rf_allocVector)(ety, size as _));
             let dims = (lib.Rf_protect)((lib.Rf_allocVector)(SEXPTYPE::INTSXP, shape.len() as _));
@@ -488,85 +496,93 @@ unsafe fn importarray(lib: &RuntimeLibR, array: Array) -> SEXP {
     let dsize = ety.size();
     if type_.is_tensor() {
         let pri = type_.primitive();
-        let mut data = (lib.DATAPTR)(vec) as *mut u8;
+        let mut data = unsafe { (lib.DATAPTR)(vec) as *mut u8 };
         let mut src = array.data()[0] as *const u8;
         if (Primitive::F64|Primitive::I32|Primitive::U32).contains(pri) {
-            core::ptr::copy_nonoverlapping(src, data, dsize*size);
+            unsafe { core::ptr::copy_nonoverlapping(src, data, dsize*size); }
         } else {
             let esize = pri.size();
             for _ in 0..size {
-                importprivalue(data.cast(), src.cast(), pri);
-                data = data.add(dsize);
-                src = src.add(esize);
+                unsafe {
+                    importprivalue(data.cast(), src.cast(), pri);
+                    data = data.add(dsize);
+                    src = src.add(esize);
+                }
             }
         }
     } else {
         let mut buf = ArrayBuf::<ABUFSLOTS>::default();
         for i in 0..size {
-            let v = importarray(lib, array.get(i, &mut buf));
-            (lib.SET_VECTOR_ELT)(vec, i as _, v);
+            unsafe {
+                let v = importarray(lib, array.get(i, &mut buf));
+                (lib.SET_VECTOR_ELT)(vec, i as _, v);
+            }
         }
     }
     vec
 }
 
 unsafe fn importvalue(lib: &RuntimeLibR, ptr: *const (), aty: ArrayType) -> SEXP {
-    match aty.is_scalar() {
-        true  => importscalar(lib, ptr, aty.primitive()),
-        false => importarray(lib, Array::new_unchecked(NonNull::new_unchecked(ptr as _), aty))
+    unsafe {
+        match aty.is_scalar() {
+            true  => importscalar(lib, ptr, aty.primitive()),
+            false => importarray(lib, Array::new_unchecked(NonNull::new_unchecked(ptr as _), aty))
+        }
     }
 }
 
 unsafe fn exportprivalue(dst: *mut (), src: *const (), pri: Primitive, vty: SEXPTYPE) {
     use {Primitive::*, SEXPTYPE::*};
-    match vty {
-        REALSXP => {
-            let value = *src.cast::<f64>();
-            match pri {
-                F64      => *dst.cast::<f64>() = value,
-                F32      => *dst.cast::<f32>() = value as _,
-                I64      => *dst.cast::<i64>() = value as _,
-                U64      => *dst.cast::<u64>() = value as _,
-                I32      => *dst.cast::<i32>() = value as _,
-                U32      => *dst.cast::<u32>() = value as _,
-                I16      => *dst.cast::<i16>() = value as _,
-                U16      => *dst.cast::<u16>() = value as _,
-                I8       => *dst.cast::<i8>()  = value as _,
-                U8       => *dst.cast::<u8>()  = value as _,
-                B1       => *dst.cast::<u8>()  = (value != 0.0) as _,
-                _ => unreachable!()
+    unsafe {
+        match vty {
+            REALSXP => {
+                let value = *src.cast::<f64>();
+                match pri {
+                    F64      => *dst.cast::<f64>() = value,
+                    F32      => *dst.cast::<f32>() = value as _,
+                    I64      => *dst.cast::<i64>() = value as _,
+                    U64      => *dst.cast::<u64>() = value as _,
+                    I32      => *dst.cast::<i32>() = value as _,
+                    U32      => *dst.cast::<u32>() = value as _,
+                    I16      => *dst.cast::<i16>() = value as _,
+                    U16      => *dst.cast::<u16>() = value as _,
+                    I8       => *dst.cast::<i8>()  = value as _,
+                    U8       => *dst.cast::<u8>()  = value as _,
+                    B1       => *dst.cast::<u8>()  = (value != 0.0) as _,
+                    _ => unreachable!()
+                }
+            },
+            INTSXP|LGLSXP => {
+                let value = *src.cast::<c_int>();
+                match pri {
+                    F64      => *dst.cast::<f64>() = value as _,
+                    F32      => *dst.cast::<f32>() = value as _,
+                    I64      => *dst.cast::<i64>() = value as _,
+                    U64      => *dst.cast::<u64>() = value as _,
+                    I32|U32  => *dst.cast::<i32>() = value,
+                    I16|U16  => *dst.cast::<i16>() = value as _,
+                    I8|U8    => *dst.cast::<i8>()  = value as _,
+                    B1       => *dst.cast::<u8>()  = (value != 0) as _,
+                    _ => unreachable!()
+                }
+            },
+            _ => {
+                todo!("error reporting (bad primitive SEXPTYPE)")
             }
-        },
-        INTSXP|LGLSXP => {
-            let value = *src.cast::<c_int>();
-            match pri {
-                F64      => *dst.cast::<f64>() = value as _,
-                F32      => *dst.cast::<f32>() = value as _,
-                I64      => *dst.cast::<i64>() = value as _,
-                U64      => *dst.cast::<u64>() = value as _,
-                I32|U32  => *dst.cast::<i32>() = value,
-                I16|U16  => *dst.cast::<i16>() = value as _,
-                I8|U8    => *dst.cast::<i8>()  = value as _,
-                B1       => *dst.cast::<u8>()  = (value != 0) as _,
-                _ => unreachable!()
-            }
-        },
-        _ => {
-            todo!("error reporting (bad primitive SEXPTYPE)")
         }
     }
 }
 
 unsafe fn exportscalar(lib: &RuntimeLibR, dst: *mut (), src: SEXP, pri: Primitive) {
-    exportprivalue(dst, (lib.DATAPTR)(src) as _, pri, (lib.TYPEOF)(src))
+    unsafe { exportprivalue(dst, (lib.DATAPTR)(src) as _, pri, (lib.TYPEOF)(src)) }
 }
 
 unsafe fn exportarray(vmctx: &mut Instance, lib: &RuntimeLibR, value: SEXP, mut array: ArrayMut) {
     let type_ = array.borrow().type_();
-    let size = (lib.Rf_length)(value) as usize;
-    match array.borrow_mut().shape_mut() {
+    let size = unsafe { (lib.Rf_length)(value) as usize };
+    match unsafe { array.borrow_mut().shape_mut() } {
         [s] => *s = size as _,
-        shape => {
+        shape => unsafe {
             let dims = (lib.Rf_getAttrib)(value, lib.R_DimSymbol);
             if (lib.Rf_length)(dims) != shape.len() as _ {
                 todo!("error reporting (R returned bad array shape)")
@@ -577,31 +593,33 @@ unsafe fn exportarray(vmctx: &mut Instance, lib: &RuntimeLibR, value: SEXP, mut 
             }
         }
     }
-    let src = (lib.DATAPTR)(value);
-    let vty = (lib.TYPEOF)(value);
+    let src = unsafe { (lib.DATAPTR)(value) };
+    let vty = unsafe { (lib.TYPEOF)(value) };
     if type_.is_tensor() {
         let pri = type_.primitive();
         let esize = pri.size();
         let mut data = vmctx.host.alloc(esize*size, esize);
-        array.data_mut()[0] = data.cast();
+        unsafe { array.data_mut()[0] = data.cast() };
         let mut src = src as *const u8;
         if matches!((pri, vty), (Primitive::F64, SEXPTYPE::REALSXP)
             | (Primitive::I32|Primitive::U32, SEXPTYPE::INTSXP|SEXPTYPE::LGLSXP))
         {
-            core::ptr::copy_nonoverlapping(src, data, esize*size);
+            unsafe { core::ptr::copy_nonoverlapping(src, data, esize*size); }
         } else {
             let vsize = vty.size();
             for _ in 0..size {
-                exportprivalue(data.cast(), src.cast(), pri, vty);
-                src = src.add(vsize);
-                data = data.add(esize);
+                unsafe {
+                    exportprivalue(data.cast(), src.cast(), pri, vty);
+                    src = src.add(vsize);
+                    data = data.add(esize);
+                }
             }
         }
     } else {
         if vty != SEXPTYPE::VECSXP {
             todo!("report error (expected list)")
         }
-        let data = array.borrow_mut().data_mut();
+        let data = unsafe { array.borrow_mut().data_mut() };
         let mut buf = ArrayBuf::<ABUFSLOTS>::default();
         let elem = type_.element();
         let edim = elem.dimension();
@@ -614,12 +632,14 @@ unsafe fn exportarray(vmctx: &mut Instance, lib: &RuntimeLibR, value: SEXP, mut 
         }
         for i in 0..size {
             let mut tmp = ArrayMut::new_empty(elem, &mut buf);
-            exportarray(vmctx, lib, *src.cast::<SEXP>().add(i), tmp.borrow_mut());
-            for (j,&t) in tmp.borrow().data().iter().enumerate() {
-                *data[j].cast::<*const ()>() = t;
-            }
-            for (j,&s) in tmp.borrow().shape().iter().enumerate() {
-                *data[ds+j].cast::<Idx>() = s;
+            unsafe {
+                exportarray(vmctx, lib, *src.cast::<SEXP>().add(i), tmp.borrow_mut());
+                for (j,&t) in tmp.borrow().data().iter().enumerate() {
+                    *data[j].cast::<*const ()>() = t;
+                }
+                for (j,&s) in tmp.borrow().shape().iter().enumerate() {
+                    *data[ds+j].cast::<Idx>() = s;
+                }
             }
         }
     }
@@ -632,10 +652,12 @@ unsafe fn exportvalue(
     aty: ArrayType,
     ptr: *mut ()
 ) {
-    match aty.is_scalar() {
-        true  => exportscalar(lib, ptr, value, aty.primitive()),
-        false => exportarray(vmctx, lib, value,
-            ArrayMut::new_unchecked_mut(NonNull::new_unchecked(ptr), aty))
+    unsafe {
+        match aty.is_scalar() {
+            true  => exportscalar(lib, ptr, value, aty.primitive()),
+            false => exportarray(vmctx, lib, value,
+                ArrayMut::new_unchecked_mut(NonNull::new_unchecked(ptr), aty))
+        }
     }
 }
 
@@ -646,48 +668,50 @@ unsafe extern "C" fn call(
     call: *const Call,
     frame: *mut u8
 ) {
-    let Call { narg, nret, fun, .. } = *call;
-    let c = (lib.Rf_protect)((lib.Rf_allocList)(1 + narg as c_int));
-    (lib.SET_TYPEOF)(c, SEXPTYPE::LANGSXP);
-    (lib.SETCAR)(c, fun);
-    let mut s = c;
-    let mut ptr = &raw const (*call).aty as *const u8;
-    for _ in 0..narg {
-        let ofs = ptr.cast::<u16>().read_unaligned();
-        ptr = ptr.add(2);
-        let v = importvalue(lib, frame.add(ofs as _).cast(), ArrayType::unpack_unchecked(&mut ptr));
-        s = (lib.CDR)(s);
-        (lib.SETCAR)(s, v);
-    }
-    let mut err = 0;
-    let result = (lib.R_tryEval)(c, lib.R_GlobalEnv, &mut err);
-    (lib.Rf_unprotect)(1);
-    if err != 0 {
-        vmctx.host.set_error(CStr::from_ptr((lib.R_curErrorBuf)()).to_bytes());
-        fhk_vmexit(vmctx);
-    }
-    (lib.Rf_protect)(result);
-    match nret {
-        1 => {
+    unsafe {
+        let Call { narg, nret, fun, .. } = *call;
+        let c = (lib.Rf_protect)((lib.Rf_allocList)(1 + narg as c_int));
+        (lib.SET_TYPEOF)(c, SEXPTYPE::LANGSXP);
+        (lib.SETCAR)(c, fun);
+        let mut s = c;
+        let mut ptr = &raw const (*call).aty as *const u8;
+        for _ in 0..narg {
             let ofs = ptr.cast::<u16>().read_unaligned();
             ptr = ptr.add(2);
-            let aty = ArrayType::unpack_unchecked(&mut ptr);
-            exportvalue(vmctx, lib, result, aty, frame.add(ofs as _).cast());
-        },
-        n => {
-            if (lib.TYPEOF)(result) != SEXPTYPE::VECSXP {
-                todo!("error reporting (expected list)")
-            }
-            let data = (lib.DATAPTR)(result) as *const SEXP;
-            for i in 0..n {
+            let v = importvalue(lib, frame.add(ofs as _).cast(), ArrayType::unpack_unchecked(&mut ptr));
+            s = (lib.CDR)(s);
+            (lib.SETCAR)(s, v);
+        }
+        let mut err = 0;
+        let result = (lib.R_tryEval)(c, lib.R_GlobalEnv, &mut err);
+        (lib.Rf_unprotect)(1);
+        if err != 0 {
+            vmctx.host.set_error(CStr::from_ptr((lib.R_curErrorBuf)()).to_bytes());
+            fhk_vmexit(vmctx);
+        }
+        (lib.Rf_protect)(result);
+        match nret {
+            1 => {
                 let ofs = ptr.cast::<u16>().read_unaligned();
                 ptr = ptr.add(2);
                 let aty = ArrayType::unpack_unchecked(&mut ptr);
-                exportvalue(vmctx, lib, *data.add(i as _), aty, frame.add(ofs as _).cast());
+                exportvalue(vmctx, lib, result, aty, frame.add(ofs as _).cast());
+            },
+            n => {
+                if (lib.TYPEOF)(result) != SEXPTYPE::VECSXP {
+                    todo!("error reporting (expected list)")
+                }
+                let data = (lib.DATAPTR)(result) as *const SEXP;
+                for i in 0..n {
+                    let ofs = ptr.cast::<u16>().read_unaligned();
+                    ptr = ptr.add(2);
+                    let aty = ArrayType::unpack_unchecked(&mut ptr);
+                    exportvalue(vmctx, lib, *data.add(i as _), aty, frame.add(ofs as _).cast());
+                }
             }
         }
+        (lib.Rf_unprotect)(1);
     }
-    (lib.Rf_unprotect)(1);
 }
 
 /* ---- Finalization -------------------------------------------------------- */

@@ -530,11 +530,11 @@ impl<T> GetMut for T
 }
 
 unsafe fn transmute_slice<T>(mem: &[u8]) -> &[T] {
-    core::slice::from_raw_parts(mem.as_ptr().cast(), mem.len() / size_of::<T>())
+    unsafe { core::slice::from_raw_parts(mem.as_ptr().cast(), mem.len() / size_of::<T>()) }
 }
 
 unsafe fn transmute_slice_mut<T>(mem: &mut [u8]) -> &mut [T] {
-    core::slice::from_raw_parts_mut(mem.as_mut_ptr().cast(), mem.len() / size_of::<T>())
+    unsafe { core::slice::from_raw_parts_mut(mem.as_mut_ptr().cast(), mem.len() / size_of::<T>()) }
 }
 
 impl BumpPtr {
@@ -592,13 +592,13 @@ impl BumpPtr {
     // safety: alignment
     unsafe fn from_slice_unchecked(mem: &[u8]) -> &Self {
         debug_assert!(mem.as_ptr() as usize % MAX_ALIGN == 0);
-        core::mem::transmute(mem)
+        unsafe { core::mem::transmute(mem) }
     }
 
     // safety: alignment
     unsafe fn from_mut_slice_unchecked(mem: &mut [u8]) -> &mut Self {
         debug_assert!(mem.as_ptr() as usize % MAX_ALIGN == 0);
-        core::mem::transmute(mem)
+        unsafe { core::mem::transmute(mem) }
     }
 
 }

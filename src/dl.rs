@@ -84,7 +84,7 @@ macro_rules! lib {
             $(
                 #[allow(dead_code)]
                 pub unsafe fn $name(&self, $($pname : $pty),*) $(-> $rty)? {
-                    (self.$name)($($pname),*)
+                    unsafe { (self.$name)($($pname),*) }
                 }
             )*
 
@@ -104,7 +104,7 @@ mod target {
     use super::{Lib, LibBox};
 
     pub unsafe fn open(name: *const c_char) -> Option<LibBox> {
-        Some(LibBox(NonNull::new(libc::dlopen(name, libc::RTLD_LAZY).cast())?))
+        Some(LibBox(NonNull::new(unsafe { libc::dlopen(name, libc::RTLD_LAZY) }.cast())?))
     }
 
     pub unsafe fn sym(lib: &Lib, name: *const c_char) -> *mut c_void {
@@ -114,12 +114,12 @@ mod target {
         // unsafecell.
         // but since unsafecell semantics work on byte ranges (i think?) it is not necessary (i
         // think?).
-        libc::dlsym(lib as *const Lib as *mut Lib as *mut c_void, name) as *mut c_void
+        (unsafe { libc::dlsym(lib as *const Lib as *mut Lib as *mut c_void, name) }) as *mut c_void
     }
 
     pub unsafe fn close(lib: &Lib) {
         // see comment in sym()
-        libc::dlclose(lib as *const Lib as *mut Lib as *mut c_void);
+        unsafe { libc::dlclose(lib as *const Lib as *mut Lib as *mut c_void); }
     }
 
 }
@@ -133,22 +133,22 @@ mod target {
     use super::{Lib, LibBox};
 
     #[link(name="KERNEL32")]
-    extern "C" {
+    unsafe extern "C" {
         fn LoadLibraryA(lpLibFileName: *const c_char) -> *mut c_void;
         fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
         fn FreeLibrary(hLibModule: *mut c_void) -> c_int;
     }
 
     pub unsafe fn open(name: *const c_char) -> Option<LibBox> {
-        Some(LibBox(NonNull::new(LoadLibraryA(name).cast())?))
+        Some(LibBox(NonNull::new(unsafe { LoadLibraryA(name) }.cast())?))
     }
 
     pub unsafe fn sym(lib: &Lib, name: *const c_char) -> *mut c_void {
-        GetProcAddress(lib as *const Lib as *mut Lib as *mut c_void, name)
+        unsafe { GetProcAddress(lib as *const Lib as *mut Lib as *mut c_void, name) }
     }
 
     pub unsafe fn close(lib: &Lib) {
-        FreeLibrary(lib as *const Lib as *mut Lib as *mut c_void);
+        unsafe { FreeLibrary(lib as *const Lib as *mut Lib as *mut c_void); }
     }
 
 }

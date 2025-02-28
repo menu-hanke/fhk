@@ -93,5 +93,5 @@ const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
 #[repr(transparent)] struct Version(*const core::ffi::c_char);
 unsafe impl Sync for Version {}
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 static fhk_VERSION: Version = Version(FHK_VERSION_STRING.as_ptr().cast());

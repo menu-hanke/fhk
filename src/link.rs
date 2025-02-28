@@ -15,18 +15,20 @@ pub struct Link;
 
 unsafe fn doreloc(kind: cranelift_codegen::binemit::Reloc, at: *mut u8, what: *const u8) {
     use cranelift_codegen::binemit::Reloc::*;
-    match kind {
-        Abs4 => at.cast::<u32>().write_unaligned(what as _),
-        Abs8 => at.cast::<u64>().write_unaligned(what as _),
-        X86PCRel4 | X86CallPCRel4 =>
-            at.cast::<i32>().write_unaligned((what as isize - at as isize).try_into().unwrap()),
-        S390xPCRel32Dbl | S390xPLTRel32Dbl => at.cast::<i32>().write_unaligned(
-            (((what as isize) - (at as isize)) >> 1).try_into().unwrap()),
-        Arm64Call => at.cast::<u32>().write_unaligned(
-                at.cast::<u32>().read_unaligned()
-                | ((((what as isize) - (at as isize)) >> 2) as u32 & 0x03ffffff)),
-        RiscvCallPlt => todo!(), // can't be bothered right now
-        _ => unimplemented!() // don't need
+    unsafe {
+        match kind {
+            Abs4 => at.cast::<u32>().write_unaligned(what as _),
+            Abs8 => at.cast::<u64>().write_unaligned(what as _),
+            X86PCRel4 | X86CallPCRel4 =>
+                at.cast::<i32>().write_unaligned((what as isize - at as isize).try_into().unwrap()),
+            S390xPCRel32Dbl | S390xPLTRel32Dbl => at.cast::<i32>().write_unaligned(
+                (((what as isize) - (at as isize)) >> 1).try_into().unwrap()),
+            Arm64Call => at.cast::<u32>().write_unaligned(
+                    at.cast::<u32>().read_unaligned()
+                    | ((((what as isize) - (at as isize)) >> 2) as u32 & 0x03ffffff)),
+            RiscvCallPlt => todo!(), // can't be bothered right now
+            _ => unimplemented!() // don't need
+        }
     }
 }
 

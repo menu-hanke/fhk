@@ -16,7 +16,7 @@ enum Nest { Scalar, Tensor, _2, _3, _4, X5 }
 impl Nest {
 
     unsafe fn outer_unchecked(self) -> Nest {
-        core::mem::transmute((self as u8) + 1)
+        unsafe { core::mem::transmute((self as u8) + 1) }
     }
 
     fn outer(self) -> Nest {
@@ -25,7 +25,7 @@ impl Nest {
     }
 
     unsafe fn inner_unchecked(self) -> Nest {
-        core::mem::transmute((self as u8) - 1)
+        unsafe { core::mem::transmute((self as u8) - 1) }
     }
 
     // fn inner(self) -> Nest {
@@ -83,12 +83,16 @@ impl ArrayType {
     // this must be fast
     #[cfg(target_endian="little")]
     pub unsafe fn unpack_unchecked(ptr: &mut *const u8) -> Self {
-        let mut this: ArrayType = core::mem::transmute((*ptr).cast::<u16>().read_unaligned() as u64);
+        let mut this: ArrayType = unsafe {
+            core::mem::transmute((*ptr).cast::<u16>().read_unaligned() as u64)
+        };
         this.deco[0] = 1;
-        *ptr = (*ptr).add(2);
+        unsafe { *ptr = (*ptr).add(2); }
         for i in 1..this.nest as usize+1 {
-            this.deco[i] = **ptr;
-            *ptr = (*ptr).add(1);
+            unsafe {
+                this.deco[i] = **ptr;
+                *ptr = (*ptr).add(1);
+            }
         }
         this
     }
@@ -209,16 +213,18 @@ impl<'a> ArrayMut<'a> {
     #[inline(always)]
     pub unsafe fn shape_mut(self) -> &'a mut [Idx] {
         let (ofs, dim) = self.type_.shape_info();
-        core::slice::from_raw_parts_mut(
-            self.data.as_ptr().cast::<*const ()>().add(ofs).cast(),
-            dim
-        )
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.data.as_ptr().cast::<*const ()>().add(ofs).cast(),
+                dim
+            )
+        }
     }
 
     #[inline(always)]
     pub unsafe fn data_mut(self) -> &'a mut [*mut ()] {
         let ds = self.type_.element_decomposition_size();
-        core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), ds)
+        unsafe { core::slice::from_raw_parts_mut(self.data.as_ptr().cast(), ds) }
     }
 
 }

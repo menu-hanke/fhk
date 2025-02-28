@@ -95,7 +95,7 @@ mod target {
     }
 
     pub unsafe fn unmap(mmap: &Mmap) {
-        libc::munmap(mmap.base, mmap.size);
+        unsafe { libc::munmap(mmap.base, mmap.size); }
     }
 
 }
@@ -112,7 +112,7 @@ mod target {
     use super::{Mmap, Prot};
 
     #[link(name="KERNEL32")]
-    extern "C" {
+    unsafe extern "C" {
         fn VirtualAlloc(lpAddress: *mut c_void, dwSize: usize, flAllocationType: u32, flProtect: u32) -> *mut c_void;
         fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> bool;
         fn VirtualProtect(lpAddress: *mut c_void, dwSize: usize, flNewProtect: u32, lpflOldProtect: *mut u32) -> bool;
@@ -162,7 +162,7 @@ mod target {
     }
 
     pub unsafe fn unmap(mmap: &Mmap) {
-        VirtualFree(mmap.base, 0, MEM_RELEASE);
+        unsafe { VirtualFree(mmap.base, 0, MEM_RELEASE); }
     }
 
 }

@@ -54,14 +54,20 @@ impl Image {
     {
         let inst = alloc(self.size as _, align_of::<Instance>()) as *mut Instance;
         if !template.is_null() {
-            core::ptr::copy_nonoverlapping(template as *const u8, inst as *mut u8, self.size as _);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    template as *const u8,
+                    inst as *mut u8,
+                    self.size as _
+                );
+            }
         }
-        (*inst).dup = 0;
+        unsafe { (*inst).dup = 0; }
         // reset new instance
         // special case 0 and -1 to avoid shift by 64.
         match reset {
             0 => {},
-            u64::MAX => core::ptr::write_bytes(inst as *mut u8, 0, self.size as _),
+            u64::MAX => unsafe { core::ptr::write_bytes(inst as *mut u8, 0, self.size as _) },
             mut mask => {
                 let mut idx = 0;
                 while mask != 0 {
@@ -69,37 +75,43 @@ impl Image {
                     mask >>= num0;
                     let num1 = mask.trailing_ones() as usize;
                     mask >>= num1;
-                    let start = *self.breakpoints.raw.get_unchecked(idx+num0) as usize;
-                    let end = *self.breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
-                    idx += num0+num1;
-                    core::ptr::write_bytes((inst as *mut u8).add(start), 0, end-start);
+                    unsafe {
+                        let start = *self.breakpoints.raw.get_unchecked(idx+num0) as usize;
+                        let end = *self.breakpoints.raw.get_unchecked(idx+num0+num1) as usize;
+                        idx += num0+num1;
+                        core::ptr::write_bytes((inst as *mut u8).add(start), 0, end-start);
+                    }
                 }
             }
         }
         // copy dup list
         if !template.is_null() {
-            let mut dup = (*template).dup;
+            let mut dup = unsafe { (*template).dup };
             while dup != 0 {
-                let newptr = (inst as *mut u8).add(dup as usize) as *mut *mut DupHeader;
-                let new = *newptr;
+                let newptr = unsafe { (inst as *mut u8).add(dup as usize) } as *mut *mut DupHeader;
+                let new = unsafe { *newptr };
                 if new.is_null() {
-                    dup = (*(*((template as *const u8).add(dup as usize) as *const *const DupHeader))
-                        .sub(1)).next;
-                } else {
-                    let DupHeader { size, next } = *new.sub(1);
-                    debug_assert!(size_of::<DupHeader>() == 8);
-                    let copy = alloc((size+8) as _, 8) as *mut DupHeader;
-                    *copy = DupHeader {
-                        size,
-                        next: core::ptr::replace(&raw mut (*inst).dup, dup)
+                    dup = unsafe {
+                        (*(*((template as *const u8).add(dup as usize) as *const *const DupHeader))
+                        .sub(1)).next
                     };
-                    *newptr = copy.add(1);
-                    core::ptr::copy_nonoverlapping(
-                        new as *const u8,
-                        copy.add(1) as *mut u8,
-                        size as _
-                    );
-                    dup = next;
+                } else {
+                    unsafe {
+                        let DupHeader { size, next } = *new.sub(1);
+                        debug_assert!(size_of::<DupHeader>() == 8);
+                        let copy = alloc((size+8) as _, 8) as *mut DupHeader;
+                        *copy = DupHeader {
+                            size,
+                            next: core::ptr::replace(&raw mut (*inst).dup, dup)
+                        };
+                        *newptr = copy.add(1);
+                        core::ptr::copy_nonoverlapping(
+                            new as *const u8,
+                            copy.add(1) as *mut u8,
+                            size as _
+                        );
+                        dup = next;
+                    }
                 }
             }
         }
@@ -154,7 +166,7 @@ fhk_vmexit:
 );
 
 #[allow(improper_ctypes)]
-extern "sysv64" {
+unsafe extern "sysv64" {
     pub fn fhk_vmcall(vmctx: *mut Instance, result: *mut u8, mcode: *const u8) -> i32;
     #[cold]
     pub fn fhk_vmexit(vmctx: *mut Instance) -> !;
@@ -167,7 +179,7 @@ cfg_if! {
             result: *mut u8,
             mcode: *const u8
         ) -> i32 {
-            fhk_vmcall(vmctx, result, mcode)
+            unsafe { fhk_vmcall(vmctx, result, mcode) }
         }
     } else {
         pub use fhk_vmcall as fhk_vmcall_native;
@@ -379,7 +391,7 @@ pub struct SwapInit {
     pub bottom: usize
 }
 
-extern "C" {
+unsafe extern "C" {
     // `stack` is a pointer to the address of the stack pointer.
     // this function stores regs on the current stacks, swaps stacks, and returns `ret` on the
     // swapped stack.
