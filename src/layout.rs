@@ -6,7 +6,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_layout;
 use crate::image::Instance;
 use crate::index::{self, index, IndexSlice, IndexVec};
-use crate::ir::{Bundle, FuncKind, Type};
+use crate::ir::{Chunk, FuncKind, Type};
 use crate::mem::{BreakpointId, Offset, ResetSet, SizeClass, Slot};
 use crate::obj::{Obj, ObjRef, RESET};
 use crate::support::DynSlot;
@@ -63,7 +63,7 @@ fn collect(ctx: &mut Ccx<ComputeLayout>) {
     // order must match save
     for func in &ctx.ir.funcs.raw {
         match &func.kind {
-            &FuncKind::Bundle(Bundle { reset, scl, .. }) => {
+            &FuncKind::Chunk(Chunk { reset, scl, .. }) => {
                 let mut hasptr = false;
                 for phi in index::iter_range(func.returns()) {
                     let ty = func.phis.at(phi).type_;
@@ -79,9 +79,9 @@ fn collect(ctx: &mut Ccx<ComputeLayout>) {
     }
 }
 
-// for each bundle:
+// for each chunk:
 //   * save slot information
-//   * create dynamic slots for BINIT
+//   * create dynamic slots for CINIT
 fn save(ctx: &mut Ccx<ComputeLayout>) {
     let slotdefs: &IndexSlice<SlotId, SlotDef> = &ctx.data.slots;
     let insert = ctx.perm.align_for::<Slot>();
@@ -89,9 +89,9 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
     // order must match collect
     for (fid, func) in ctx.ir.funcs.pairs_mut() {
         match &mut func.kind {
-            FuncKind::Bundle(Bundle { scl, slots, dynslots, check, .. }) => {
+            FuncKind::Chunk(Chunk { scl, slots, dynslots, check, .. }) => {
                 if scl.is_dynamic() {
-                    // alloc dynamic slot data for BINIT
+                    // alloc dynamic slot data for CINIT
                     *dynslots = ctx.mcode.data.bump().end().cast_up();
                     let mut ds = slot;
                     for phi in index::iter_span(func.ret) {

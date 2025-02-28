@@ -17,7 +17,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
-use crate::ir::{Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
+use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
 use crate::mem::{CursorA, SizeClass, Slot};
@@ -63,7 +63,7 @@ pub struct Emit {
     pub stack: Value,
     pub block: BlockId,
     pub fid: FuncId,
-    pub idx: Value, // meaningful for bundle functions only
+    pub idx: Value, // meaningful for chunks only
     // work arrays (TODO use ccx.tmp):
     pub tmp_val: Vec<Value>
 }
@@ -274,7 +274,7 @@ fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
                 AbiParam::new(irt2cl(Type::PTR))
             ]);
         },
-        FuncKind::Bundle(Bundle { scl, .. }) => {
+        FuncKind::Chunk(Chunk { scl, .. }) => {
             signature.call_conv = CallConv::Fast;
             if scl != SizeClass::GLOBAL {
                 signature.params.push(AbiParam::new(irt2cl(Type::I32)));
@@ -447,7 +447,7 @@ fn emithead(emit: &mut Emit, func: &Func) {
             // optimizer is not allowed to remove query parameters, or add new ones:
             debug_assert!(emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START)).len() == 2);
         },
-        FuncKind::Bundle(Bundle { check, scl, .. }) => {
+        FuncKind::Chunk(Chunk { check, scl, .. }) => {
             let entry = emit.fb.newblock();
             emit.fb.block = entry;
             let idx = match scl {

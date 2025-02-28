@@ -12,7 +12,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
-use crate::ir::{self, Bundle, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
+use crate::ir::{self, Chunk, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
 use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LOAD, MOD, NEW, QUERY, RESET, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
@@ -235,7 +235,7 @@ fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
         axes: []
     });
     let mut ret: PhiId = 1.into();
-    let mut func = Func::new(FuncKind::Bundle(Bundle::new(SizeClass::GLOBAL)));
+    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)));
     let mut sig = func.build_signature().add_return(IRT_IDX);
     for &size in axes {
         let rank = match ctx.objs[ctx.objs[size].ann].op {
@@ -261,7 +261,7 @@ fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
 }
 
 fn makeinitfunc(ir: &mut IR) {
-    let mut func = Func::new(FuncKind::Bundle(Bundle::new(SizeClass::GLOBAL)));
+    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)));
     func.build_signature().add_return(Type::FX).finish_returns().finish_args();
     ir.funcs.push(func);
 }
@@ -291,7 +291,7 @@ fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
     let scl = sizeclass(&ctx.objs, var.tab);
     // value:
     {
-        let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
+        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
         let mut sig = func.build_signature();
         for &ty in decomposition__old(&ctx.objs, var.ann, &mut lower.tmp_ty) {
             sig = sig.add_return(ty);
@@ -303,7 +303,7 @@ fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
     makeinitfunc(&mut ctx.ir);
     // arm:
     {
-        let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
+        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
         maybeidxarg(func.build_signature().add_return(IRT_ARM).finish_returns(), scl).finish_args();
         ctx.ir.funcs.push(func);
     }
@@ -412,7 +412,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         let scl = sizeclass(&ctx.objs, obj.tab);
         // value:
         {
-            let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
+            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
             let mut sig = func.build_signature();
             for vset in &lower.bump[model].value {
                 for &ty in decomposition__old(
@@ -430,7 +430,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         makeinitfunc(&mut ctx.ir);
         // avail
         {
-            let mut func = Func::new(FuncKind::Bundle(Bundle::new(scl)));
+            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
             maybeidxarg(func.build_signature().add_return(Type::B1).finish_returns(), scl)
                 .finish_args();
             ctx.ir.funcs.push(func);
@@ -526,8 +526,8 @@ fn emitjumpifnot(func: &Func, ctr: &mut InsId, cond: InsId, target: InsId) -> In
 
 fn newcall(idx: InsId, init: InsId, node: FuncId, inline: bool) -> Ins {
     let opcode = match inline {
-        false => Opcode::CALLB,
-        true  => Opcode::CALLBI
+        false => Opcode::CALLC,
+        true  => Opcode::CALLCI
     };
     Ins::new(opcode, Type::FX)
         .set_a(zerocopy::transmute!(idx))
@@ -771,7 +771,7 @@ fn emitreducestore(
 fn idxftran(
     lcx: &mut Lcx,
     tab: &Tab,         // *target* table being indexed
-    call: InsId,       // CALLB(I) of tab
+    call: InsId,       // CALLC(I) of tab
     axis: usize,       // current axis (N)
     flat: InsId        // flat index for current axis (N)
 ) -> InsId {
@@ -814,7 +814,7 @@ fn idxftrann(
 fn idxbtran(
     lcx: &mut Lcx,
     tab: &Tab,         // *target* table being indexed
-    call: InsId,       // CALLB(I) of tab
+    call: InsId,       // CALLC(I) of tab
     axis: usize,       // current axis (N+1)
     flat: InsId        // flat index for current axis (N+1)
 ) -> InsId {
@@ -883,7 +883,7 @@ fn sametab(objs: &Objects, a: &Tab, b: &Tab) -> bool {
 fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
     let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
     let init = func.code.push(Ins::NOP(Type::FX));
-    func.code.push(Ins::CALLB(zero, init, tabf))
+    func.code.push(Ins::CALLC(zero, init, tabf))
 }
 
 // given a flat index
@@ -2459,7 +2459,7 @@ fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef, fail: InsId) {
     let objs = Access::borrow(&lcx.objs);
     let raw = objs.get_raw(expr.erase());
     for i in objs[expr.erase()].ref_params() {
-        // only recurse into exprs, other objects are in their own bundles.
+        // only recurse into exprs, other objects are in their own chunks.
         let o: ObjRef = zerocopy::transmute!(raw[i+1]);
         if Operator::is_expr_raw(objs[o].op) {
             emitcheck(lcx, ctr, o, fail);
@@ -2655,12 +2655,12 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
 
 /* ---- Initializers -------------------------------------------------------- */
 
-fn emitbinit(lcx: &mut Lcx, tab: BumpRef<Tab>, bundle: FuncId) {
+fn emitcinit(lcx: &mut Lcx, tab: BumpRef<Tab>, chunk: FuncId) {
     let tabcall = emittabcall(&lcx.data.func, lcx.data.bump[tab].func);
     let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, tabcall, 0.into()));
-    let binit = lcx.data.func.code.push(Ins::BINIT(size, bundle));
+    let cinit = lcx.data.func.code.push(Ins::CINIT(size, chunk));
     let ret = lcx.data.func.code.push(Ins::RET());
-    lcx.data.func.code.set(INS_ENTRY, Ins::JMP(binit, ret, 0.into()));
+    lcx.data.func.code.set(INS_ENTRY, Ins::JMP(cinit, ret, 0.into()));
 }
 
 /* ---- Variables ----------------------------------------------------------- */
@@ -2879,7 +2879,7 @@ fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
 
 enum Template {
     TabInit(BumpRef<Tab>),
-    BundleInit(BumpRef<Tab>, FuncId),
+    ChunkInit(BumpRef<Tab>, FuncId),
     VarVal(BumpRef<Var>),
     VarArm(BumpRef<Var>),
     ModVal(BumpRef<Mod>),
@@ -2896,7 +2896,7 @@ fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) 
     reserve(&lcx.data.func, 1);
     // flatidx:
     match &lcx.data.func.kind {
-        FuncKind::Bundle(bundle) => match bundle.scl {
+        FuncKind::Chunk(chunk) => match chunk.scl {
             SizeClass::GLOBAL => { lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0)); },
             _ => { emitarg(&lcx.data.func, 0); }
         },
@@ -2908,7 +2908,7 @@ fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) 
         let lcx: &mut Lcx = unsafe { core::mem::transmute(&mut *lcx) };
         match template {
             TabInit(tab) => emittab(lcx, tab),
-            BundleInit(tab, bundle) => emitbinit(lcx, tab, bundle),
+            ChunkInit(tab, chunk) => emitcinit(lcx, tab, chunk),
             VarVal(var) => emitvarvalue(lcx, var),
             VarArm(var) => emitvararms(lcx, var),
             ModVal(model) => emitmodvalue(lcx, model),
@@ -2932,18 +2932,18 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                 let Var { base, tab, .. } = lcx.data.bump[bump.cast::<Var>()];
                 lcx.data.tab = tab;
                 emittemplate(lcx, base,   Template::VarVal(bump.cast()));
-                emittemplate(lcx, base+1, Template::BundleInit(tab, base));
+                emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
                 emittemplate(lcx, base+2, Template::VarArm(bump.cast()));
-                emittemplate(lcx, base+3, Template::BundleInit(tab, base+2));
+                emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
             },
             Obj::MOD => {
                 if lcx.data.bump[bump.cast::<Mod>()].mt == Mod::COMPLEX {
                     let Mod { base, tab, .. } = lcx.data.bump[bump.cast::<Mod>()];
                     lcx.data.tab = tab;
                     emittemplate(lcx, base,   Template::ModVal(bump.cast()));
-                    emittemplate(lcx, base+1, Template::BundleInit(tab, base));
+                    emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
                     emittemplate(lcx, base+2, Template::ModAvail(bump.cast()));
-                    emittemplate(lcx, base+3, Template::BundleInit(tab, base+2));
+                    emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
                 }
             },
             Obj::QUERY => {
@@ -3052,14 +3052,14 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
     for (f, func) in ccx.ir.funcs.pairs() {
         for (_, ins) in func.code.pairs() {
             match ins.opcode() {
-                Opcode::CALLB|Opcode::CALLBI => {
-                    let (_, _, g) = ins.decode_CALLB();
+                Opcode::CALLC|Opcode::CALLCI => {
+                    let (_, _, g) = ins.decode_CALLC();
                     if f != g {
                         con.push(Con { f, g });
                     }
                 },
-                Opcode::BINIT => {
-                    let (_, g) = ins.decode_BINIT();
+                Opcode::CINIT => {
+                    let (_, g) = ins.decode_CINIT();
                     con.push(Con { f, g });
                     con.push(Con { f:g, g:f });
                 },
@@ -3082,9 +3082,9 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
     }
     // update ir
     for (id, func) in ccx.ir.funcs.pairs_mut() {
-        if let FuncKind::Bundle(bundle) = &mut func.kind {
+        if let FuncKind::Chunk(chunk) = &mut func.kind {
             let reset: ResetSet = mat[id].try_into().unwrap();
-            bundle.reset = reset | ResetId::GLOBAL;
+            chunk.reset = reset | ResetId::GLOBAL;
         }
     }
 }

@@ -58,7 +58,7 @@ macro_rules! define_types {
 //     from, eg. it's always correct to replace an instruction producing one of these with
 //     a MOV, or any other instruction sequence that produces the same value.
 //   * b1 is also a dumb value, but it has funny semantics when stored to memory. sometimes (eg.
-//     bundle bitmaps) it's stored as a 1-bit value with a mask, colocated with other b1's.
+//     chunk bitmaps) it's stored as a 1-bit value with a mask, colocated with other b1's.
 //     in a register it's just a normal int. zero=false, any nonzero=true.
 //   * fx is also a dumb value. however, it has no machine representation, it just represent that
 //     "something happened". but because it's a dumb value, it can be replaced with any other
@@ -318,12 +318,12 @@ define_opcodes! {
     BREF.PTR  V;
 
     CALL.FX   V F,   decode_CALL;      // args func
-    CALLB.FX  V V F;                   // idx fx bundle  (NOT inlineable)
-    CALLBI.FX V V F;                   // idx fx bundle  (inlineable)
+    CALLC.FX  V V F;                   // idx fx chunk  (NOT inlineable)
+    CALLCI.FX V V F;                   // idx fx chunk  (inlineable)
     CARG.LSV  V V,   decode_CARG;      // arg next
     RES       V P,   decode_RES;       // call phi
 
-    BINIT.FX  V F,   decode_BINIT;     // size bundle
+    CINIT.FX  V F,   decode_CINIT;     // size chunk
 
     LO;
     LOV       V L,   decode_LOV;
@@ -574,13 +574,13 @@ impl Ins {
 
     decode_fn!(pub fn decode_V -> V);
     decode_fn!(pub fn decode_VV -> V V);
-    decode_fn!(pub fn decode_CALLB -> V V F); // CALLB and CALLBI
+    decode_fn!(pub fn decode_CALLC -> V V F); // CALLC and CALLCI
 
 }
 
 /* ---- IR ------------------------------------------------------------------ */
 
-pub struct Bundle {
+pub struct Chunk {
     pub reset: ResetSet,
     pub scl: SizeClass,
     pub check: Slot,
@@ -603,7 +603,7 @@ pub type Code = IndexValueVec<InsId, Ins>;
 pub enum FuncKind {
     User(/*TODO*/),
     Query(Query),
-    Bundle(Bundle)
+    Chunk(Chunk)
 }
 
 pub struct Func {
@@ -670,7 +670,7 @@ impl Func {
 
 }
 
-impl Bundle {
+impl Chunk {
 
     pub fn new(scl: SizeClass) -> Self {
         Self {

@@ -333,7 +333,7 @@ fn computeparams(
                 phis[block].set(phi);
             },
             // TODO: this should be done for user funcs because they return values in RET, but not
-            // for bundles and queries
+            // for chunks and queries
             // Opcode::RET => {
             //     let block = values[id].block();
             //     for r in index::iter_range(func.returns()) {

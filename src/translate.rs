@@ -9,7 +9,7 @@ use crate::lang::Lang;
 use crate::mem::{CursorType, SizeClass};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
-use crate::ir::{Bundle, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
+use crate::ir::{Chunk, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::schedule::BlockId;
 use crate::support::{NativeFunc, SuppFunc};
 
@@ -64,7 +64,7 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
                     let ofs = ecx.perm[offsets.add_size(phi as _)];
                     emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
                 },
-                FuncKind::Bundle(Bundle { scl, slots, .. }) => {
+                FuncKind::Chunk(Chunk { scl, slots, .. }) => {
                     let vmctx = emit.fb.vmctx();
                     let slot = ecx.perm[slots.add_size(phi as _)];
                     storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
@@ -388,10 +388,10 @@ fn ins_bref(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = InsValue::from_value(ptr);
 }
 
-fn ins_callb(ecx: &mut Ecx, id: InsId) {
+fn ins_callc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
-    let (idx, _, bundle) = emit.code[id].decode_CALLB();
-    let FuncKind::Bundle(Bundle { scl, check, .. }) = ecx.ir.funcs[bundle].kind
+    let (idx, _, chunk) = emit.code[id].decode_CALLC();
+    let FuncKind::Chunk(Chunk { scl, check, .. }) = ecx.ir.funcs[chunk].kind
         else { unreachable!() };
     let vmctx = emit.fb.vmctx();
     let bit = loadslot(emit, vmctx, emit.values[idx].value(), scl, check, Type::B1);
@@ -400,7 +400,7 @@ fn ins_callb(ecx: &mut Ecx, id: InsId) {
     emit.fb.ctx.func.layout.set_cold(call_block);
     emit.fb.ins().brif(bit, merge_block, &[], call_block, &[]);
     emit.fb.block = call_block;
-    let funcref = emit.fb.importfunc(&ecx.ir, bundle);
+    let funcref = emit.fb.importfunc(&ecx.ir, chunk);
     let args = [emit.values[idx].value()];
     emit.fb.ins().call(funcref, match scl { SizeClass::GLOBAL => &[], _ => &args });
     emit.fb.ins().jump(merge_block, &[]);
@@ -415,11 +415,11 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
     let (call, phi) = ins.decode_RES();
     let value = match emit.code[call].opcode() {
         Opcode::CALL => todo!(),
-        Opcode::CALLB | Opcode::CALLBI => {
-            let (idx, _, bundle) = emit.code[call].decode_CALLB();
-            let FuncKind::Bundle(Bundle { scl, slots, .. }) = ecx.ir.funcs[bundle].kind
+        Opcode::CALLC | Opcode::CALLCI => {
+            let (idx, _, chunk) = emit.code[call].decode_CALLC();
+            let FuncKind::Chunk(Chunk { scl, slots, .. }) = ecx.ir.funcs[chunk].kind
                 else { unreachable!() };
-            debug_assert!(ecx.ir.funcs[bundle].phis.at(phi).type_ == ty);
+            debug_assert!(ecx.ir.funcs[chunk].phis.at(phi).type_ == ty);
             let vmctx = emit.fb.vmctx();
             let phi: usize = phi.into();
             loadslot(emit, vmctx, emit.values[idx].value(), scl, ecx.perm[slots.add_size(phi as _)], ty)
@@ -429,14 +429,14 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
     ecx.data.values[id] = InsValue::from_value(value);
 }
 
-fn ins_binit(ecx: &mut Ecx, id: InsId) {
+fn ins_cinit(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
-    let (size, bundle) = emit.code[id].decode_BINIT();
-    let func = &ecx.ir.funcs[bundle];
-    let FuncKind::Bundle(bundle) = &func.kind else { unreachable!() };
-    if !bundle.scl.is_dynamic() { /* NOP */ return }
+    let (size, chunk) = emit.code[id].decode_CINIT();
+    let func = &ecx.ir.funcs[chunk];
+    let FuncKind::Chunk(chunk) = &func.kind else { unreachable!() };
+    if !chunk.scl.is_dynamic() { /* NOP */ return }
     let dsinit = emit.fb.importsupp(&ecx.ir, SuppFunc::INIT);
-    let tab = emit.fb.importdataref(bundle.dynslots.cast());
+    let tab = emit.fb.importdataref(chunk.dynslots.cast());
     let tab = emit.fb.dataptr(tab);
     let nret: usize = func.ret.into();
     // bitmap + one for each return
@@ -483,10 +483,10 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             ABOX => ins_abox(ecx, id),
             BREF => ins_bref(ecx, id),
             CALL => todo!(),
-            CALLB | CALLBI => ins_callb(ecx, id),
+            CALLC | CALLCI => ins_callc(ecx, id),
             CARG => { /* NOP */ },
             RES => ins_res(ecx, id),
-            BINIT => ins_binit(ecx, id),
+            CINIT => ins_cinit(ecx, id),
             LO | LOV | LOVV | LOVX | LOX | LOXX => ins_lop(ecx, id)?
         }
     }
