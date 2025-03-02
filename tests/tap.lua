@@ -148,10 +148,19 @@ end
 
 local function bind(self,f) return function(...) return f(self, ...) end end
 
+local function newgraph()
+	local G = fhk.newgraph()
+	local opt = os.getenv("FHK_OPTIMIZE")
+	if opt then
+		G:optimize(opt)
+	end
+	return G
+end
+
 local function testnew()
 	local env = setmetatable({
 		allocs  = {},
-		G       = fhk.newgraph(),
+		G       = newgraph(),
 		check   = check
 	}, {__index=_G})
 	env.query = bind(env, test_query)

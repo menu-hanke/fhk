@@ -3082,10 +3082,8 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
     }
     // update ir
     for (id, func) in ccx.ir.funcs.pairs_mut() {
-        if let FuncKind::Chunk(chunk) = &mut func.kind {
-            let reset: ResetSet = mat[id].try_into().unwrap();
-            chunk.reset = reset | ResetId::GLOBAL;
-        }
+        let reset: ResetSet = mat[id].try_into().unwrap();
+        func.reset = reset | ResetId::GLOBAL;
     }
 }
 

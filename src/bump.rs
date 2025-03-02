@@ -54,6 +54,10 @@ unsafe impl<T> Aligned for [T] {
     const ALIGN: usize = align_of::<T>();
 }
 
+unsafe impl<I: index::Index, T> Aligned for IndexSlice<I, T> {
+    const ALIGN: usize = align_of::<T>();
+}
+
 unsafe impl Aligned for str {
     const ALIGN: usize = 1;
 }
@@ -80,6 +84,14 @@ unsafe impl<T> PackedSliceDst for [T] {
     type Item = T;
     fn ptr_from_raw_parts(addr: *const Self::Head, len: usize) -> *const Self {
         core::ptr::slice_from_raw_parts(addr.cast(), len)
+    }
+}
+
+unsafe impl<I: index::Index, T> PackedSliceDst for IndexSlice<I, T> {
+    type Head = ();
+    type Item = T;
+    fn ptr_from_raw_parts(addr: *const Self::Head, len: usize) -> *const Self {
+        Self::ptr_from_raw(<[T] as PackedSliceDst>::ptr_from_raw_parts(addr, len))
     }
 }
 
@@ -785,36 +797,38 @@ macro_rules! vla_struct {
 use logos::Source;
 pub(crate) use vla_struct;
 
+use crate::index::{self, IndexSlice};
+
 /* ---- Containers ---------------------------------------------------------- */
 
 // note: the `*Raw` structs are a hack to work around the lack of generic support in zerocopy.
 
 #[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
-struct BumpArrayRaw {
+struct BumpSliceRaw {
     data: u32, // BumpRef<T>
     len: u32
 }
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
-pub struct BumpArray<T> {
-    raw: BumpArrayRaw,
+pub struct BumpSlice<T> {
+    raw: BumpSliceRaw,
     _marker: PhantomData<T>
 }
 
-impl<T> Clone for BumpArray<T> {
+impl<T> Clone for BumpSlice<T> {
     fn clone(&self) -> Self {
-        BumpArray { raw: self.raw, _marker: PhantomData }
+        BumpSlice { raw: self.raw, _marker: PhantomData }
     }
 }
 
-impl<T> Copy for BumpArray<T> {}
+impl<T> Copy for BumpSlice<T> {}
 
 #[derive(Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct BumpVecRaw {
-    data: BumpArrayRaw,
+    data: BumpSliceRaw,
     cap: u32
 }
 
@@ -825,7 +839,7 @@ pub struct BumpVec<T> {
     _marker: PhantomData<T>
 }
 
-impl<T> BumpArray<T> {
+impl<T> BumpSlice<T> {
 
     pub fn len(self) -> u32 {
         self.raw.len
@@ -839,18 +853,24 @@ impl<T> BumpArray<T> {
         zerocopy::transmute!(self.raw.data)
     }
 
-    pub fn as_slice<W>(self, bump: &Bump<W>) -> &[T]
+    pub fn as_slice(self, bump: &BumpPtr) -> &[T]
         where T: FromBytes + Immutable
     {
         bump.get_dst(self.base().cast(), self.len() as _)
     }
 
-    pub fn as_mut_slice<W>(self, bump: &mut Bump<W>) -> &mut [T]
+    pub fn as_mut_slice(self, bump: &mut BumpPtr) -> &mut [T]
         where T: FromBytes + IntoBytes + Immutable
     {
         bump.get_dst_mut(self.base().cast(), self.len() as _)
     }
 
+}
+
+impl<T> Default for BumpSlice<T> {
+    fn default() -> Self {
+        Self { raw: Default::default(), _marker: PhantomData }
+    }
 }
 
 impl<T> BumpVec<T> {
@@ -914,8 +934,8 @@ impl<T> Default for BumpVec<T> {
 // there's nothing useful you can do with a &mut BumpArray,
 // but you can misuse it by eg. swapping the data arrays of two bumpvecs
 impl<T> Deref for BumpVec<T> {
-    type Target = BumpArray<T>;
-    fn deref(&self) -> &BumpArray<T> {
+    type Target = BumpSlice<T>;
+    fn deref(&self) -> &BumpSlice<T> {
         zerocopy::transmute_ref!(&self.raw.data)
     }
 }

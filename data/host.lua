@@ -162,6 +162,12 @@ local function graph_dump(graph, flags)
 	return buf:get()
 end
 
+---- Settings ------------------------------------------------------------------
+
+local function graph_optimize(graph, flags)
+	API.fhk_optimize(graph.G, flags, #flags)
+end
+
 ---- Object management ---------------------------------------------------------
 
 -- ORDER FIELDTYPE
@@ -332,6 +338,7 @@ local function makeobjtab(graph)
 	})
 end
 
+-- TODO: cache string value
 local function seq__tostring(seq)
 	return getstr(getgraph(seq), seq.i)
 end
@@ -547,6 +554,7 @@ local graph_mt = {
 	newquery = graph_newquery,
 	newreset = graph_newreset,
 	dump     = graph_dump,
+	optimize = graph_optimize,
 	compile  = graph_compile
 }
 graph_mt.__index = graph_mt

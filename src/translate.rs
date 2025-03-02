@@ -5,12 +5,12 @@ use cranelift_codegen::ir::{InstBuilder, MemFlags, TrapCode, Value};
 use zerocopy::Unalign;
 
 use crate::bump::BumpRef;
+use crate::controlflow::BlockId;
 use crate::lang::Lang;
 use crate::mem::{CursorType, SizeClass};
 use crate::compile;
 use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Chunk, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
-use crate::schedule::BlockId;
 use crate::support::{NativeFunc, SuppFunc};
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {

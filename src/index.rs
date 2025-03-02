@@ -32,6 +32,10 @@ impl<I: Index, T> IndexSlice<I, T> {
         unsafe { transmute(raw) }
     }
 
+    pub fn ptr_from_raw(raw: *const [T]) -> *const Self {
+        unsafe { transmute(raw) }
+    }
+
     pub fn from_raw_box(raw: Box<[T]>) -> Box<Self> {
         unsafe { transmute(raw) }
     }
@@ -240,6 +244,18 @@ impl<I: Index, T> IndexValueVec<I, T> {
 
     pub fn inner_mut(&mut self) -> &mut IndexVec<I, T> {
         self.0.get_mut()
+    }
+
+    pub fn take_inner(&self) -> IndexVec<I, T> {
+        core::mem::take(unsafe { &mut *self.0.get() })
+    }
+
+    pub fn swap_inner(&self, data: &mut IndexVec<I, T>) {
+        core::mem::swap(unsafe { &mut *self.0.get() }, data);
+    }
+
+    pub fn replace_inner(&self, data: IndexVec<I, T>) -> IndexVec<I, T> {
+        core::mem::replace(unsafe { &mut *self.0.get() }, data)
     }
 
     // pub fn pairs_mut(&mut self) -> core::iter::Zip<

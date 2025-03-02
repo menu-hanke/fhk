@@ -7,6 +7,7 @@ use cfg_if::cfg_if;
 
 use crate::bitmap::BitMatrix;
 use crate::bump::Bump;
+use crate::controlflow::BlockId;
 use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
@@ -15,7 +16,6 @@ use crate::lang::Lang;
 use crate::mem::{BreakpointId, Layout};
 use crate::obj::{FieldType, ObjRef, Objects};
 use crate::parser::{stringify, SequenceType};
-use crate::schedule::BlockId;
 use crate::trace::trace;
 
 /* ---- Objects ------------------------------------------------------------- */

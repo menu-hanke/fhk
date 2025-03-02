@@ -63,16 +63,16 @@ fn collect(ctx: &mut Ccx<ComputeLayout>) {
     // order must match save
     for func in &ctx.ir.funcs.raw {
         match &func.kind {
-            &FuncKind::Chunk(Chunk { reset, scl, .. }) => {
+            &FuncKind::Chunk(Chunk { scl, .. }) => {
                 let mut hasptr = false;
                 for phi in index::iter_range(func.returns()) {
                     let ty = func.phis.at(phi).type_;
                     if ty != Type::FX {
-                        ctx.data.slots.push(newslot(reset, scl, ty, false));
+                        ctx.data.slots.push(newslot(func.reset, scl, ty, false));
                         hasptr |= ty == Type::PTR;
                     }
                 }
-                ctx.data.slots.push(newslot(reset, scl, Type::B1, hasptr && scl.is_dynamic()));
+                ctx.data.slots.push(newslot(func.reset, scl, Type::B1, hasptr && scl.is_dynamic()));
             },
             _ => {}
         }

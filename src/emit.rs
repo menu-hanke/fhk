@@ -14,6 +14,7 @@ use enumset::EnumSet;
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Aligned, Bump};
 use crate::compile::{self, Ccx, Stage};
+use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
@@ -21,7 +22,7 @@ use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query,
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
 use crate::mem::{CursorA, SizeClass, Slot};
-use crate::schedule::{compute_schedule, BlockId, Gcm};
+use crate::schedule::{compute_schedule, Gcm};
 use crate::support::{emitsupport, NativeFunc, SuppFunc};
 use crate::trace::trace;
 use crate::translate::translate;
@@ -535,6 +536,12 @@ fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
     loc
 }
 
+fn resetemit(emit: &mut Emit) {
+    emit.fb.clear();
+    emit.bump.clear();
+    emit.frame = None;
+}
+
 fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
     let emit = &mut *ecx.data;
     emit.fid = fid;
@@ -550,9 +557,7 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
         trace_schedule(emit, func, fid);
     }
     // TODO: sink RIGHT HERE
-    emit.fb.clear();
-    emit.bump.clear();
-    emit.frame = None;
+    resetemit(emit);
     let clf = &mut emit.fb.ctx.func;
     makesig(&mut clf.signature, func);
     for (id, phis) in emit.blockparams.pairs() {
@@ -595,7 +600,7 @@ fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
         SuppFunc::SWAP => emitmcode(&mut ecx.mcode, Image::fhk_swap_bytes()),
         _ => {
             let emit = &mut *ecx.data;
-            emit.fb.clear();
+            resetemit(emit);
             supp.signature().to_cranelift(&mut emit.fb.ctx.func.signature);
             let entry = emit.fb.newblock();
             // supp code uses this to get function args:

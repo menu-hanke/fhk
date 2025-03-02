@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::Range;
 use core::slice;
-use enumset::EnumSetType;
+use enumset::{EnumSet, EnumSetType};
 
 use crate::bump::BumpRef;
 use crate::foreach_lang;
@@ -407,17 +407,26 @@ const fn count_operands(opcode: Opcode, opr: Operand) -> usize {
 /* ---- Instructions -------------------------------------------------------- */
 
 /*
- * +--------+--------+--------+-------+------+--------+
- * | 63..48 | 47..32 | 31..16 | 12..9 |   8  |  7..0  |
- * +--------+--------+--------+-------+------+--------+
- * |   C    |    B   |    A   |  type | mark | opcode |
- * +--------+--------+--------+-------+------+--------+
+ * +--------+--------+--------+--------+-------+--------+
+ * | 63..48 | 47..32 | 31..16 | 15..12 | 11..8 |  7..0  |
+ * +--------+--------+--------+--------+-------+--------+
+ * |   C    |    B   |    A   |  type  |  mark | opcode |
+ * +--------+--------+--------+--------+-------+--------+
  *
  * NOTE: do not derive FromBytes. opcode and type must always be valid.
  */
 #[derive(Clone, Copy, PartialEq, Eq, Hash, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct Ins(u64);
+
+#[derive(EnumSetType)]
+#[enumset(repr="u64")]
+pub enum Mark {
+    Mark1 = 8,
+    Mark2 = 9,
+    Mark3 = 10,
+    Mark4 = 11
+}
 
 // everything here assumes little endian.
 // note that archs in the set (supported by cranelift) ∩  (supported by luajit) are all LE.
@@ -427,10 +436,9 @@ pub struct Ins(u64);
 impl Ins {
 
     pub const NOP_FX: Ins = Ins::NOP(Type::FX);
-    const MARK_BIT: u64 = 0x100;
 
     pub const fn new(op: Opcode, ty: Type) -> Self {
-        Self((op as u64) | ((ty as u64) << 9))
+        Self((op as u64) | ((ty as u64) << 12))
     }
 
     pub const fn opcode(self) -> Opcode {
@@ -442,19 +450,7 @@ impl Ins {
     }
 
     pub const fn type_(self) -> Type {
-        unsafe { transmute(((self.0 as u16) >> 9) as u8) }
-    }
-
-    pub const fn is_marked(self) -> bool {
-        self.0 & Self::MARK_BIT != 0
-    }
-
-    pub const fn mark(self) -> Self {
-        Self(self.0 | Self::MARK_BIT)
-    }
-
-    pub const fn unmark(self) -> Self {
-        Self(self.0 & !Self::MARK_BIT)
+        unsafe { transmute(((self.0 as u16) >> 12) as u8) }
     }
 
     pub const fn a(self) -> u16 {
@@ -487,6 +483,24 @@ impl Ins {
 
     pub const fn set_bc(self, bc: u32) -> Self {
         Self((self.0 & 0x00000000ffffffff) | ((bc as u64) << 32))
+    }
+
+    pub fn get_mark(self, mark: impl Into<EnumSet<Mark>>) -> EnumSet<Mark> {
+        unsafe { EnumSet::from_repr_unchecked(self.0 & mark.into().as_repr()) }
+    }
+
+    pub fn is_marked(self, mark: impl Into<EnumSet<Mark>>) -> bool {
+        !self.get_mark(mark).is_empty()
+    }
+
+    pub fn set_mark(mut self, mark: impl Into<EnumSet<Mark>>) -> Self {
+        self.0 |= mark.into().as_repr();
+        self
+    }
+
+    pub fn clear_mark(mut self, mark: impl Into<EnumSet<Mark>>) -> Self {
+        self.0 &= !mark.into().as_repr();
+        self
     }
 
     pub fn abc_mut(&mut self) -> &mut [u16; 3] {
@@ -559,6 +573,17 @@ impl Ins {
         }
     }
 
+    pub fn phis_mut(&mut self) -> &mut [PhiId] {
+        use Opcode::*;
+        let opcode = self.opcode();
+        let phis: &mut [PhiId; 4] = zerocopy::transmute_mut!(&mut self.0);
+        match opcode {
+            JMP => &mut phis[3..4],
+            PHI|RES => &mut phis[2..3],
+            _ => &mut []
+        }
+    }
+
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {
         use Opcode::*;
@@ -581,7 +606,6 @@ impl Ins {
 /* ---- IR ------------------------------------------------------------------ */
 
 pub struct Chunk {
-    pub reset: ResetSet,
     pub scl: SizeClass,
     pub check: Slot,
     pub slots: BumpRef<Slot>, // slot info in ccx.bump, one for each ret phi
@@ -613,6 +637,7 @@ pub struct Func {
     pub arg: PhiId, // one past last argument
     pub phis: IndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
+    pub reset: ResetSet,
 }
 
 #[derive(Default)]
@@ -646,6 +671,7 @@ impl Func {
             phis: Default::default(),
             ret: 0.into(),
             arg: 0.into(),
+            reset: ResetSet::default() | ResetId::GLOBAL,
         }
     }
 
@@ -662,10 +688,14 @@ impl Func {
         self.ret .. self.arg
     }
 
-    pub fn unmark(&self) {
+    fn clear_mark_(&self, marks: EnumSet<Mark>) {
         for (id,ins) in self.code.pairs() {
-            self.code.set(id, ins.unmark());
+            self.code.set(id, ins.clear_mark(marks));
         }
+    }
+
+    pub fn clear_mark(&self, mark: impl Into<EnumSet<Mark>>) {
+        self.clear_mark_(mark.into());
     }
 
 }
@@ -675,7 +705,6 @@ impl Chunk {
     pub fn new(scl: SizeClass) -> Self {
         Self {
             scl,
-            reset: ResetSet::default() | ResetId::GLOBAL,
             check: Default::default(),
             slots: BumpRef::zero(),
             dynslots: BumpRef::zero()

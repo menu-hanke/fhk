@@ -12,6 +12,7 @@ use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::IRef;
 use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, RESET, TAB};
+use crate::optimize::parse_optflags;
 use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_toplevel_def, parse_toplevel_expr, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
@@ -206,6 +207,10 @@ extern "C" fn fhk_dumpobjs(G: &mut fhk_Graph) {
     dump_objs(&mut G.host.buf, &G.intern, &G.objs, ObjRef::NIL);
 }
 
+unsafe extern "C" fn fhk_optimize(G: &mut fhk_Graph, flags: *const c_char, len: usize) {
+    G.flags = parse_optflags(unsafe { slice_from_raw_parts(flags as _, len) })
+}
+
 unsafe extern "C" fn fhk_compile(G: &mut fhk_Graph, image: *mut *mut fhk_Image) -> fhk_Result {
     let result = G.begin().unwrap().ccx.compile();
     match result {
@@ -285,6 +290,7 @@ define_api! {
     int32_t (*fhk_newquery)(fhk_Graph *, int32_t, int32_t *, size_t);
     int32_t (*fhk_newreset)(fhk_Graph *, int32_t *, size_t);
     void (*fhk_dumpobjs)(fhk_Graph *);
+    void (*fhk_optimize)(fhk_Graph *, const char *, size_t);
     int32_t (*fhk_compile)(fhk_Graph *, fhk_Image **);
     void *(*fhk_mcode)(fhk_Image *);
     fhk_Instance *(*fhk_newinstance)(fhk_Image *, fhk_Alloc *, void *, fhk_Instance *, uint64_t);

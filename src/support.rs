@@ -5,11 +5,11 @@ use core::mem::replace;
 use cranelift_codegen::ir::{InstBuilder, TrapCode};
 use enumset::EnumSetType;
 
+use crate::controlflow::BlockId;
 use crate::emit::{block2cl, signature, Ecx, Signature, NATIVE_CALLCONV};
 use crate::image::{fhk_vmexit, DupHeader, Instance};
 use crate::ir::Type;
 use crate::mem::Offset;
-use crate::schedule::BlockId;
 
 macro_rules! define_suppfuncs {
     ($(
