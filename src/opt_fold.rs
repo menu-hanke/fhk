@@ -125,6 +125,30 @@ fn foldfparith(op: Opcode, left: f64, right: f64) -> f64 {
     }
 }
 
+fn foldintcmp(op: Opcode, left: i64, right: i64) -> bool {
+    use Opcode::*;
+    match op {
+        EQ  => left == right,
+        NE  => left != right,
+        LT  => left < right,
+        LE  => left <= right,
+        ULT => (left as u64) < (right as u64),
+        ULE => (left as u64) <= (right as u64),
+        _   => unreachable!()
+    }
+}
+
+fn foldfpcmp(op: Opcode, left: f64, right: f64) -> bool {
+    use Opcode::*;
+    match op {
+        EQ  => left == right,
+        NE  => left != right,
+        LT  => left < right,
+        LE  => left <= right,
+        _   => unreachable!()
+    }
+}
+
 fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
     use Opcode::*;
     let opt = &mut *fcx.data;
@@ -150,10 +174,25 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             FoldStatus::Done(ins)
         },
 
+        // fold constant comparisons
+        EQ|NE|LT|LE|ULT|ULE if m!(const const) => {
+            let (left, right) = ins.decode_VV();
+            let left = code[left];
+            let right = code[right];
+            debug_assert!(left.type_() == right.type_());
+            debug_assert!(ins.type_() == Type::B1);
+            let value = if (Type::F32|Type::F64).contains(left.type_()) {
+                foldfpcmp(op, kfpvalue(fcx, left), kfpvalue(fcx, right))
+            } else {
+                foldintcmp(op, kintvalue(fcx, left), kintvalue(fcx, right))
+            };
+            FoldStatus::Done(Ins::KINT(Type::B1, value as _))
+        },
+
         // sort commutative operands:
         // * constants go to right
         // * non-constants are sorted by insid
-        ADD|MUL if m!(const _) || (ins.a() > ins.b() && !m!(_ const)) => {
+        ADD|MUL|EQ|NE if m!(const _) || (ins.a() > ins.b() && !m!(_ const)) => {
             ins.inputs_mut().swap(0, 1);
             FoldStatus::Again(ins)
         },
