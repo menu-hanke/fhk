@@ -11,6 +11,7 @@ use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
 use crate::index::{self, IndexOption, IndexSlice, IndexVec};
 use crate::ir::{FuncId, FuncKind, Ins, InsId, Mark, Opcode, IR};
 use crate::optimize::{Ocx, Pass};
+use crate::trace::trace;
 use crate::typestate::Absent;
 
 macro_rules! define_costs {
@@ -57,11 +58,20 @@ fn execcost(op: Opcode) -> u32 {
 
 const CALLER_CALLC: u32 = 0x80000000;
 
+#[derive(Default, Clone, Copy)]
+enum InlineState {
+    #[default]
+    Undetermined, // do not know if this function will be inlined or not
+    Yes,          // function will be inlined
+    No,           // function will not be inlined because the cost is too high
+    Working,      // working on this function right now
+}
+
 #[derive(Default, Clone)] // for resize
 struct FuncData {
     cost: u32,
     callers: u32,
-    inline: Option<bool>,
+    state: InlineState
 }
 
 enum Action {
@@ -104,10 +114,14 @@ fn visitcallers(ir: &IR, inline: &mut Inline, fid: FuncId) {
             let (_, _, f) = ins.decode_CALLC();
             let fd = &mut inline.func[f];
             debug_assert!(ir.funcs[f].reset.is_subset(&ir.funcs[fid].reset));
+            let callers = fd.callers;
             if op == Opcode::CALLC || ir.funcs[f].reset != ir.funcs[fid].reset {
                 fd.callers |= CALLER_CALLC;
             } else {
                 fd.callers += 1;
+            }
+            if callers == 0 {
+                visitcallers(ir, inline, f);
             }
         }
     }
@@ -235,23 +249,39 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
                 }
             },
             &Action::Phi(at) => {
-                let (call, mut phi) = code[at].decode_RES();
-                debug_assert!((Opcode::GOTO|Opcode::JMP).contains(code[call].opcode()));
-                phi += phi_base as isize;
-                code[at] = Ins::PHI(code[at].type_(), dest, phi);
+                if code[at].opcode() == Opcode::RES {
+                    let (call, mut phi) = code[at].decode_RES();
+                    debug_assert!((Opcode::GOTO|Opcode::JMP).contains(code[call].opcode()));
+                    phi += phi_base as isize;
+                    code[at] = Ins::PHI(code[at].type_(), dest, phi);
+                } else {
+                    // one RES may be dominated by multiple placements of the same call.
+                    // in that case this action is emitted multiple times.
+                    // it doesn't matter which call we patch it to, because all of them
+                    // dominate it.
+                    debug_assert!(code[at].opcode() == Opcode::PHI);
+                }
             }
         }
     }
     func.code.replace_inner(code);
 }
 
-fn visitinline(ccx: &mut Ocx, fid: FuncId) {
+fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     let fd = &mut ccx.data.inline.func[fid];
-    if !fd.inline.is_none() {
-        // already visited
-        return;
+    match fd.state {
+        InlineState::Undetermined => {
+            fd.state = InlineState::Working;
+        },
+        InlineState::Yes | InlineState::No => return fd.state,
+        InlineState::Working => {
+            // no inlining for recursive functions.
+            // (TODO?: there's room here for a heuristic to decide which function to disable
+            //         inlining for in a recursive call chain)
+            fd.state = InlineState::No;
+            return InlineState::No;
+        }
     }
-    fd.inline = Some(false); // stop recursion
     let base = ccx.tmp.end();
     let calls = ccx.tmp.align_for::<InsId>();
     let mut cost = 0;
@@ -267,15 +297,15 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) {
     let mut call = base.cast_up::<InsId>();
     while call < end {
         let (_, _, f) = ccx.ir.funcs[fid].code.at(ccx.tmp[call]).decode_CALLC();
-        visitinline(ccx, f);
-        match ccx.data.inline.func[f].inline {
-            Some(true) => {
+        match visitinline(ccx, f) {
+            InlineState::Yes => {
                 call = call.add_size(1);
             },
-            _ => {
+            InlineState::No => {
                 end = end.add_size(-1);
                 ccx.tmp[call] = ccx.tmp[end];
-            }
+            },
+            _ => unreachable!()
         }
     }
     let (start, end) = (base.cast_up::<InsId>(), call);
@@ -285,24 +315,38 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) {
         inlinecalls(ccx, fid, start..end, &mut cost);
     }
     ccx.tmp.truncate(base);
-    let func = &mut ccx.ir.funcs[fid];
-    if let FuncKind::Chunk(_) = func.kind {
-        // queries are always leaf functions, so don't bother checking this for queries.
-        if hasloop(func.code.inner_mut(), func.entry) {
-            cost += LOOP_COST;
-        }
-    }
     let fd = &mut ccx.data.inline.func[fid];
+    match fd.state {
+        InlineState::Working => {
+            let func = &mut ccx.ir.funcs[fid];
+            if let FuncKind::Chunk(_) = func.kind {
+                // queries are always leaf functions, so don't bother checking this for queries.
+                if hasloop(func.code.inner_mut(), func.entry) {
+                    cost += LOOP_COST;
+                }
+            }
+            // if all callers are CALLCI:
+            //   old cost: cost * callers
+            //   new cost: USE_COST * callers + (cost + FUNC_COST) * 1
+            // if some callers are CALLC:
+            //   callers = huge,
+            // and this effectively reduces to
+            //   cost <= USE_COST
+            let total = (cost as u64)*(fd.callers as u64);
+            let thres = (USE_COST as u64)*(fd.callers as u64) + (cost as u64) + (FUNC_COST as u64);
+            trace!(OPTIMIZE "inline: {:?} cost={} thres={} inline={}", fid, total, thres, total<=thres);
+            fd.state = match total <= thres {
+                true => InlineState::Yes,
+                false => InlineState::No
+            };
+        },
+        InlineState::No => {
+            trace!(OPTIMIZE "inline: {:?} blacklisted recursive function", fid);
+        },
+        _ => unreachable!()
+    }
     fd.cost = cost;
-    // if all callers are CALLCI:
-    //   old cost: cost * callers
-    //   new cost: USE_COST * callers + (cost + FUNC_COST) * 1
-    // if some callers are CALLC:
-    //   callers = huge,
-    // and this effectively reduces to
-    //   cost <= USE_COST
-    fd.inline = Some((cost as u64)*(fd.callers as u64) <= (USE_COST as u64)*(fd.callers as u64)
-        + (cost as u64) + (FUNC_COST as u64));
+    fd.state
 }
 
 fn sweepdead(
@@ -312,7 +356,7 @@ fn sweepdead(
 ) {
     for (f,(fd,w)) in zip(&ir.funcs.raw, zip(&fda.raw, &mut work.raw)) {
         *w = (!matches!((&f.kind, fd),
-            (FuncKind::Chunk(_), FuncData { callers: 0, .. } | FuncData { inline: Some(true), .. })
+            (FuncKind::Chunk(_), FuncData {state:InlineState::Yes|InlineState::Undetermined,..})
         )).then_some(0.into()).into();
     }
     let mut left = 0.into();
@@ -338,8 +382,12 @@ fn sweepdead(
         for func in &mut ir.funcs.raw {
             for ins in &mut func.code.inner_mut().raw {
                 match ins.opcode() {
-                    Opcode::CALLC|Opcode::CALLCI =>
-                        *ins = ins.set_c(zerocopy::transmute!(work[zerocopy::transmute!(ins.c())])),
+                    Opcode::CALLC|Opcode::CALLCI => {
+                        // at this point all ir functions are live, and live functions do
+                        // not call dead functions.
+                        debug_assert!(work[zerocopy::transmute!(ins.c())].is_some());
+                        *ins = ins.set_c(zerocopy::transmute!(work[zerocopy::transmute!(ins.c())]));
+                    },
                     Opcode::CINIT => match work[zerocopy::transmute!(ins.b())].unpack() {
                         Some(f) => *ins = ins.set_b(zerocopy::transmute!(f)),
                         None => *ins = Ins::NOP_FX
@@ -362,7 +410,9 @@ impl Pass for Inline {
         ccx.data.inline.func.clear();
         ccx.data.inline.func.raw.resize(ccx.ir.funcs.raw.len(), FuncData::default());
         for id in index::iter_span(ccx.ir.funcs.end()) {
-            visitcallers(&ccx.ir, &mut ccx.data.inline, id);
+            if let FuncKind::Query(_) = ccx.ir.funcs[id].kind {
+                visitcallers(&ccx.ir, &mut ccx.data.inline, id);
+            }
         }
         for id in index::iter_span(ccx.ir.funcs.end()) {
             if let FuncKind::Query(_) = ccx.ir.funcs[id].kind {
