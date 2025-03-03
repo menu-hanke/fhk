@@ -4,6 +4,7 @@
 // https://github.com/rust-lang/rust/tree/master/compiler/rustc_index
 
 use core::cell::UnsafeCell;
+use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::{Deref, DerefMut, Range};
@@ -175,6 +176,12 @@ impl<I: Index+InvalidValue> From<Option<I>> for IndexOption<I> {
 impl<I: Index+InvalidValue> Default for IndexOption<I> {
     fn default() -> Self {
         Self { raw: I::INVALID.into() }
+    }
+}
+
+impl<I: Index+InvalidValue+Debug> Debug for IndexOption<I> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.unpack().fmt(f)
     }
 }
 
