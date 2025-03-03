@@ -2663,9 +2663,14 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
 /* ---- Initializers -------------------------------------------------------- */
 
 fn emitcinit(lcx: &mut Lcx, tab: BumpRef<Tab>, chunk: FuncId) {
-    let tabcall = emittabcall(&lcx.data.func, lcx.data.bump[tab].func);
-    let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, tabcall, 0.into()));
-    let cinit = lcx.data.func.code.push(Ins::CINIT(size, chunk));
+    let cinit = match lcx.data.bump[tab].axes.is_empty() {
+        true => lcx.data.func.code.push(Ins::NOP(Type::FX)),
+        false => {
+            let tabcall = emittabcall(&lcx.data.func, lcx.data.bump[tab].func);
+            let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, tabcall, 0.into()));
+            lcx.data.func.code.push(Ins::CINIT(size, chunk))
+        }
+    };
     let ret = lcx.data.func.code.push(Ins::RET());
     lcx.data.func.code.set(INS_ENTRY, Ins::JMP(cinit, ret, 0.into()));
 }
