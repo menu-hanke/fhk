@@ -5,6 +5,7 @@ use core::iter::{repeat_n, zip};
 use core::mem::{replace, swap};
 
 use alloc::vec::Vec;
+use enumset::EnumSet;
 
 use crate::bitmap::BitMatrix;
 use crate::bump::{self, Bump, BumpRef};
@@ -12,7 +13,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
 use crate::index::{IndexOption, InvalidValue};
-use crate::ir::{self, Chunk, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
+use crate::ir::{self, Chunk, DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
 use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LOAD, MOD, NEW, QUERY, RESET, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
@@ -235,7 +236,8 @@ fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
         axes: []
     });
     let mut ret: PhiId = 1.into();
-    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)));
+    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)),
+        DebugSource::new(idx, EnumSet::empty()));
     let mut sig = func.build_signature().add_return(IRT_IDX);
     for &size in axes {
         let rank = match ctx.objs[ctx.objs[size].ann].op {
@@ -260,8 +262,9 @@ fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
     trace!(LOWER "TAB {:?} func: {:?}", idx, fid);
 }
 
-fn makeinitfunc(ir: &mut IR) {
-    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)));
+fn makeinitfunc(ir: &mut IR, obj: ObjRef, flags: EnumSet<DebugFlag>) {
+    let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)),
+        DebugSource::new(obj, flags | DebugFlag::INIT));
     func.build_signature().add_return(Type::FX).finish_returns().finish_args();
     ir.funcs.push(func);
 }
@@ -291,7 +294,8 @@ fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
     let scl = sizeclass(&ctx.objs, var.tab);
     // value:
     {
-        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
+        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
+            DebugSource::new(idx, DebugFlag::VALUE));
         let mut sig = func.build_signature();
         for &ty in decomposition__old(&ctx.objs, var.ann, &mut lower.tmp_ty) {
             sig = sig.add_return(ty);
@@ -300,15 +304,16 @@ fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
         ctx.ir.funcs.push(func);
     }
     // value.init:
-    makeinitfunc(&mut ctx.ir);
+    makeinitfunc(&mut ctx.ir, idx.erase(), DebugFlag::VALUE.into());
     // arm:
     {
-        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
+        let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
+            DebugSource::new(idx, EnumSet::empty()));
         maybeidxarg(func.build_signature().add_return(IRT_ARM).finish_returns(), scl).finish_args();
         ctx.ir.funcs.push(func);
     }
     // arm.init
-    makeinitfunc(&mut ctx.ir);
+    makeinitfunc(&mut ctx.ir, idx.erase(), EnumSet::empty());
     trace!(LOWER "VAR {:?} value: {:?}[{:?}] arm: {:?}[{:?}]", idx, base, base+1, base+2, base+3);
 }
 
@@ -412,7 +417,8 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         let scl = sizeclass(&ctx.objs, obj.tab);
         // value:
         {
-            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
+            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
+                DebugSource::new(idx, DebugFlag::VALUE));
             let mut sig = func.build_signature();
             for vset in &lower.bump[model].value {
                 for &ty in decomposition__old(
@@ -427,16 +433,17 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
             ctx.ir.funcs.push(func);
         }
         // value.init:
-        makeinitfunc(&mut ctx.ir);
+        makeinitfunc(&mut ctx.ir, idx.erase(), DebugFlag::VALUE.into());
         // avail
         {
-            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)));
+            let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
+                DebugSource::new(idx, EnumSet::empty()));
             maybeidxarg(func.build_signature().add_return(Type::B1).finish_returns(), scl)
                 .finish_args();
             ctx.ir.funcs.push(func);
         }
         // avail.init:
-        makeinitfunc(&mut ctx.ir);
+        makeinitfunc(&mut ctx.ir, idx.erase(), EnumSet::empty());
         trace!(LOWER "MOD {:?} value: {:?}[{:?}] avail: {:?}[{:?}]",
             idx, base, base+1, base+2, base+3);
     }
@@ -2953,7 +2960,8 @@ fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
                 let mut query = Query::new(obj.cast());
                 let putofs = lcx.perm.align_for::<Offset>();
                 query.offsets = putofs.end();
-                let mut func = Func::new(FuncKind::Query(query));
+                let mut func = Func::new(FuncKind::Query(query),
+                    DebugSource::new(obj, EnumSet::empty()));
                 let mut sig = func.build_signature();
                 let mut cursor = 0;
                 for &v in value {
@@ -3097,7 +3105,8 @@ impl Stage for Lower {
             tmp_ins: Default::default(),
             tmp_vty: Default::default(),
             tmp_ty: Default::default(),
-            func: Access::new(Func::new(FuncKind::User())),
+            func: Access::new(Func::new(FuncKind::User(),
+                DebugSource::new(ObjRef::NIL, EnumSet::empty()))),
             tab: BumpRef::zero()
         })
     }
@@ -3108,7 +3117,7 @@ impl Stage for Lower {
         ccx.freeze_graph(computereset);
         if trace!(LOWER) {
             let mut tmp = Default::default();
-            dump_ir(&mut tmp, &ccx.ir);
+            dump_ir(&mut tmp, &ccx.ir, &ccx.intern, &ccx.objs);
             trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
         }
         Ok(())

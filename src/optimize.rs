@@ -107,7 +107,7 @@ impl Stage for Optimize {
                     trace!(OPTIMIZE "IR size {} -> {}", size, newsize);
                     if trace!(OPTIMIZE) && !ocx.flags.is_empty() {
                         let mut tmp = Default::default();
-                        dump_ir(&mut tmp, &ocx.ir);
+                        dump_ir(&mut tmp, &ocx.ir, &ocx.intern, &ocx.objs);
                         trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
                     }
                     size = newsize;

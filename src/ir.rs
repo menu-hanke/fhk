@@ -648,6 +648,21 @@ pub enum FuncKind {
     Chunk(Chunk)
 }
 
+#[derive(EnumSetType)]
+#[enumset(repr="u8")]
+pub enum DebugFlag {
+    INIT,
+    VALUE
+}
+
+// +--------+-------+------+
+// |  31..2 |   1   |   0  |
+// +--------+-------+------+
+// | objref | value | init |
+// +--------+-------+------+
+#[derive(Clone, Copy, Default)]
+pub struct DebugSource(u32);
+
 pub struct Func {
     pub code: Code,
     pub entry: InsId,
@@ -656,19 +671,12 @@ pub struct Func {
     pub phis: IndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
     pub reset: ResetSet,
+    pub source: DebugSource
 }
 
 #[derive(Default)]
 pub struct IR {
     pub funcs: IndexVec<FuncId, Func>,
-}
-
-impl IR {
-
-    pub fn compact(&mut self) {
-        todo!()
-    }
-
 }
 
 impl Phi {
@@ -681,7 +689,7 @@ impl Phi {
 
 impl Func {
 
-    pub fn new(kind: FuncKind) -> Self {
+    pub fn new(kind: FuncKind, source: DebugSource) -> Self {
         Self {
             kind,
             entry: InsId::INVALID.into(),
@@ -690,6 +698,7 @@ impl Func {
             ret: 0.into(),
             arg: 0.into(),
             reset: ResetSet::default() | ResetId::GLOBAL,
+            source
         }
     }
 
@@ -738,6 +747,23 @@ impl Query {
             obj,
             offsets: BumpRef::zero()
         }
+    }
+
+}
+
+impl DebugSource {
+
+    pub fn new<T: ?Sized>(obj: ObjRef<T>, flags: impl Into<EnumSet<DebugFlag>>) -> Self {
+        let obj: u32 = zerocopy::transmute!(obj);
+        Self((obj<<2) | flags.into().as_repr() as u32)
+    }
+
+    pub fn obj(self) -> ObjRef {
+        zerocopy::transmute!(self.0>>2)
+    }
+
+    pub fn flags(self) -> EnumSet<DebugFlag> {
+        unsafe { EnumSet::from_repr_unchecked((self.0 & 3) as _) }
     }
 
 }

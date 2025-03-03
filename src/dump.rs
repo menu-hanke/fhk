@@ -11,21 +11,16 @@ use crate::controlflow::BlockId;
 use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
-use crate::ir::{Code, Func, FuncId, Ins, InsId, LangOp, Operand, PhiId, IR};
+use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, LangOp, Operand, PhiId, IR};
 use crate::lang::Lang;
 use crate::mem::{BreakpointId, Layout};
-use crate::obj::{FieldType, ObjRef, Objects};
+use crate::obj::{FieldType, ObjRef, ObjectRef, Objects, Operator, FUNC, MOD, TAB, VAR, VSET};
 use crate::parser::{stringify, SequenceType};
 use crate::trace::trace;
 
 /* ---- Objects ------------------------------------------------------------- */
 
-fn dump_field(
-    buf: &mut Bump,
-    intern: &Intern,
-    fty: FieldType,
-    value: u32
-) {
+fn dump_field(buf: &mut Bump, intern: &Intern, fty: FieldType, value: u32) {
     use FieldType::*;
     match fty {
         Lit  => write!(buf, "{}", value as i32).unwrap(),
@@ -41,12 +36,7 @@ fn dump_field(
     }
 }
 
-fn dump_obj(
-    buf: &mut Bump,
-    intern: &Intern,
-    objs: &Objects,
-    idx: ObjRef
-) {
+fn dump_obj(buf: &mut Bump, intern: &Intern, objs: &Objects, idx: ObjRef) {
     let obj = &objs[idx];
     let op = obj.operator();
     write!(buf, "{:?} {:-5}", idx, op.name()).unwrap();
@@ -77,12 +67,7 @@ fn dump_obj(
     buf.push(b'\n');
 }
 
-pub fn dump_objs(
-    buf: &mut Bump,
-    intern: &Intern,
-    objs: &Objects,
-    start: ObjRef
-) {
+pub fn dump_objs(buf: &mut Bump, intern: &Intern, objs: &Objects, start: ObjRef) {
     if start == objs.end() { return }
     let mut idx = start;
     loop {
@@ -92,7 +77,7 @@ pub fn dump_objs(
     }
 }
 
-pub fn trace_objs( sequences: &Intern, objs: &Objects, start: ObjRef) {
+pub fn trace_objs(sequences: &Intern, objs: &Objects, start: ObjRef) {
     if trace!() {
         let mut tmp = Default::default();
         dump_objs(&mut tmp, sequences, objs, start);
@@ -102,7 +87,49 @@ pub fn trace_objs( sequences: &Intern, objs: &Objects, start: ObjRef) {
 
 /* ---- IR ------------------------------------------------------------------ */
 
-fn dump_ins(buf: &mut Bump, id: InsId, ins: Ins, values: Option<&IndexSlice<InsId, InsValue>>) {
+fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugSource) {
+    let op = objs[src.obj()].operator();
+    write!(buf, "{}{:?}", op.name(), src.obj()).unwrap();
+    match objs.get(src.obj()) {
+        ObjectRef::VAR(&VAR { name, .. })
+                | ObjectRef::TAB(&TAB { name, .. })
+                | ObjectRef::FUNC(&FUNC { name, .. }) => {
+            buf.push(b'(');
+            stringify(buf, intern, intern.get_slice(name), SequenceType::Pattern);
+            buf.push(b')');
+        },
+        ObjectRef::MOD(MOD { value, .. }) => {
+            buf.push(b'(');
+            for (i, &vset) in value.iter().enumerate() {
+                if i>0 { buf.push(b','); }
+                let VSET { var, .. } = objs[vset];
+                let VAR { name, .. } = objs[var];
+                stringify(buf, intern, intern.get_slice(name), SequenceType::Pattern);
+            }
+            buf.push(b')');
+        },
+        _ => {}
+    }
+    let flags = src.flags();
+    if flags.contains(DebugFlag::VALUE) {
+        buf.write(".value");
+    } else if (Operator::VAR|Operator::MOD).contains(op) {
+        buf.write(".avail");
+    }
+    if flags.contains(DebugFlag::INIT) {
+        buf.write(".init");
+    }
+}
+
+fn dump_ins(
+    buf: &mut Bump,
+    id: InsId,
+    ins: Ins,
+    values: Option<&IndexSlice<InsId, InsValue>>,
+    funcs: &IndexSlice<FuncId, Func>,
+    intern: &Intern,
+    objs: &Objects
+) {
     let opcode = ins.opcode();
     write!(
         buf,
@@ -133,15 +160,27 @@ fn dump_ins(buf: &mut Bump, id: InsId, ins: Ins, values: Option<&IndexSlice<InsI
                 }
             },
             Operand::P  => write!(buf, " {:?}", {let p: PhiId = zerocopy::transmute!(raw as u16); p}),
-            Operand::F  => write!(buf, " {:?}", {let f: FuncId = zerocopy::transmute!(raw as u16); f})
+            Operand::F  => {
+                let fid: FuncId = zerocopy::transmute!(raw as u16);
+                write!(buf, " {:?}<", fid).unwrap();
+                dump_debugsource(buf, intern, objs, funcs[fid].source);
+                buf.push(b'>');
+                Ok(())
+            }
         }.unwrap()
     }
     buf.push(b'\n');
 }
 
-fn dump_code(buf: &mut Bump, code: &Code) {
-    for id in index::iter_span(code.end()) {
-        dump_ins(buf, id, code.at(id), None);
+fn dump_code(
+    buf: &mut Bump,
+    fid: FuncId,
+    funcs: &IndexSlice<FuncId, Func>,
+    intern: &Intern,
+    objs: &Objects
+) {
+    for (id, ins) in funcs[fid].code.pairs() {
+        dump_ins(buf, id, ins, None, funcs, intern, objs);
     }
 }
 
@@ -159,30 +198,36 @@ fn dump_phis(buf: &mut Bump, func: &Func) {
     buf.push(b'\n');
 }
 
-pub fn dump_ir(buf: &mut Bump, ir: &IR) {
+fn dump_funcheader(buf: &mut Bump, fid: FuncId, func: &Func, intern: &Intern, objs: &Objects) {
+    write!(buf, "---------- FUNC {}<", {let i: u16 = zerocopy::transmute!(fid); i}).unwrap();
+    dump_debugsource(buf, intern, objs, func.source);
+    buf.write("> ----------\n");
+    dump_phis(buf, func);
+}
+
+pub fn dump_ir(buf: &mut Bump, ir: &IR, intern: &Intern, objs: &Objects) {
     for (id, func) in ir.funcs.pairs() {
-        write!(
-            buf,
-            "---------- FUNC {} ----------\n",
-            {let i: u16 = zerocopy::transmute!(id); i}
-        ).unwrap();
+        dump_funcheader(buf, id, func, intern, objs);
         write!(buf, "ENTRY ->{:?}\n", func.entry).unwrap();
-        dump_phis(buf, func);
-        dump_code(buf, &func.code);
+        dump_code(buf, id, &ir.funcs, intern, objs);
     }
 }
 
 pub fn dump_schedule(
     buf: &mut Bump,
+    fid: FuncId,
     func: &Func,
     code: &IndexSlice<InsId, Ins>,
     values: &IndexSlice<InsId, InsValue>,
-    params: &BitMatrix<BlockId, PhiId>
+    params: &BitMatrix<BlockId, PhiId>,
+    funcs: &IndexSlice<FuncId, Func>,
+    intern: &Intern,
+    objs: &Objects
 ) {
-    dump_phis(buf, func);
+    dump_funcheader(buf, fid, func, intern, objs);
     let mut block: BlockId = 0.into();
     for (id, &ins) in code.pairs() {
-        dump_ins(buf, id, ins, Some(values));
+        dump_ins(buf, id, ins, Some(values), funcs, intern, objs);
         if ins.opcode().is_control() && id+1 != code.end() {
             block += 1;
             write!(buf, "->{}", {let b: u16 = zerocopy::transmute!(block); b}).unwrap();

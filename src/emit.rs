@@ -429,16 +429,6 @@ pub fn collectargs(emit: &Emit, dest: &mut Bump<InsValue>, mut arg: InsId) {
     }
 }
 
-fn trace_schedule(emit: &Emit, func: &Func, fid: FuncId) {
-    trace!(
-        "---------- FUNC {} ----------",
-        {let fid: u16 = zerocopy::transmute!(fid); fid}
-    );
-    let mut tmp = Default::default();
-    dump_schedule(&mut tmp, func, &emit.code, &emit.values, &emit.blockparams);
-    trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
-}
-
 fn emithead(emit: &mut Emit, func: &Func) {
     match func.kind {
         FuncKind::User() => { /* NOP */ },
@@ -554,7 +544,10 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
         &mut emit.blockparams
     );
     if trace!(SCHEDULE) {
-        trace_schedule(emit, func, fid);
+        let mut tmp = Default::default();
+        dump_schedule(&mut tmp, fid, func, &emit.code, &emit.values, &emit.blockparams,
+            &ecx.ir.funcs, &ecx.intern, &ecx.objs);
+        trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
     }
     // TODO: sink RIGHT HERE
     resetemit(emit);
