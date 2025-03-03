@@ -218,6 +218,14 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         //     FoldStatus::Old(ins.decode_V())
         // },
 
+        // eliminate constant IF
+        IF if m!(const) => {
+            let (cond, left, right) = ins.decode_IF();
+            let value = code[cond];
+            debug_assert!(value == Ins::KINT(Type::B1, 0) || value == Ins::KINT(Type::B1, 1));
+            FoldStatus::Done(Ins::GOTO(if value == Ins::KINT(Type::B1, 0) { right } else { left }))
+        },
+
         _ => FoldStatus::Done(ins)
     }
 }
