@@ -64,8 +64,10 @@ pub trait Pass: Sized {
     fn run(ccx: &mut Ocx);
 }
 
+// TODO: replace this with a sparse hash?
 fn irsize(ir: &IR) -> usize {
-    ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum()
+    let size: usize =ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum();
+    size + 37*ir.funcs.raw.len()
 }
 
 impl Stage for Optimize {
