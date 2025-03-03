@@ -6,7 +6,7 @@ use core::ops::Range;
 use alloc::vec::Vec;
 
 use crate::bump::BumpRef;
-use crate::compile::{self, Ccx};
+use crate::compile::Ccx;
 use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
 use crate::index::{self, IndexSlice, IndexVec};
 use crate::ir::{FuncId, FuncKind, Ins, InsId, Mark, Opcode, IR};
@@ -307,11 +307,11 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) {
 
 impl Pass for Inline {
 
-    fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
-        Ok(Default::default())
+    fn new(_: &mut Ccx<Absent>) -> Self {
+        Default::default()
     }
 
-    fn run(ccx: &mut Ocx) -> compile::Result {
+    fn run(ccx: &mut Ocx) {
         ccx.data.inline.func.clear();
         ccx.data.inline.func.raw.resize(ccx.ir.funcs.raw.len(), FuncData::default());
         for id in index::iter_span(ccx.ir.funcs.end()) {
@@ -322,7 +322,6 @@ impl Pass for Inline {
                 visitinline(ccx, id);
             }
         }
-        Ok(())
     }
 
 }

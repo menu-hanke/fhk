@@ -42,7 +42,9 @@ mod typing;
 /* ---- Optimizer ----------------------------------------------------------- */
 
 mod opt_fold;
+mod opt_goto;
 mod opt_inline;
+mod opt_phi;
 mod optimize;
 
 /* ---- Host support -------------------------------------------------------- */

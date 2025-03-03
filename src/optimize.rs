@@ -1,7 +1,6 @@
 //! Optimizer entry point.
 
 // TODO passes:
-// * eliminate constant phis
 // * conditional constant propagation
 // * remove unused parameters and return values
 // * merge identical functions
@@ -14,16 +13,22 @@ use enumset::{EnumSet, EnumSetType};
 use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::index;
-use crate::ir::FuncId;
+use crate::ir::{FuncId, IR};
 use crate::opt_fold::Fold;
+use crate::opt_goto::OptGoto;
 use crate::opt_inline::Inline;
+use crate::opt_phi::OptPhi;
 use crate::trace::trace;
 use crate::typestate::{Absent, R};
+
+const MAX_ITER: usize = 10; // TODO: make this configurable
 
 #[derive(EnumSetType)]
 pub enum OptFlag {
     FOLD,
-    INLINE
+    GOTO,
+    INLINE,
+    PHI
 }
 
 pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
@@ -32,7 +37,9 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
     for &f in flags {
         oflg.insert_all(match f {
             b'f' => FOLD.into(),
+            b'g' => GOTO.into(),
             b'i' => INLINE.into(),
+            b'p' => PHI.into(),
             b'a' => EnumSet::all(),
             _ => continue
         });
@@ -48,41 +55,62 @@ pub struct Optimize {
 pub type Ocx<'a> = Ccx<Optimize, R<'a>>;
 
 pub trait FuncPass: Sized {
-    fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self>;
-    fn run(ccx: &mut Ocx, fid: FuncId) -> compile::Result;
+    fn new(ccx: &mut Ccx<Absent>) -> Self;
+    fn run(ccx: &mut Ocx, fid: FuncId);
 }
 
 pub trait Pass: Sized {
-    fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self>;
-    fn run(ccx: &mut Ocx) -> compile::Result;
+    fn new(ccx: &mut Ccx<Absent>) -> Self;
+    fn run(ccx: &mut Ocx);
+}
+
+fn irsize(ir: &IR) -> usize {
+    ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum()
 }
 
 impl Stage for Optimize {
 
     fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Self {
-            fold: Fold::new(ccx)?,
-            inline: Inline::new(ccx)?
+            fold: Fold::new(ccx),
+            inline: Inline::new(ccx)
         })
     }
 
     fn run(ocx: &mut Ccx<Optimize>) -> compile::Result {
+        let mut size = irsize(&ocx.ir);
         ocx.freeze_graph(|ocx| {
-            if ocx.flags.contains(OptFlag::FOLD) {
+            for i in 0..MAX_ITER {
                 for fid in index::iter_span(ocx.ir.funcs.end()) {
-                    Fold::run(ocx, fid)?;
+                    if ocx.flags.contains(OptFlag::FOLD) {
+                        Fold::run(ocx, fid);
+                    }
+                    if ocx.flags.contains(OptFlag::PHI) {
+                        OptPhi::run(ocx, fid);
+                    }
+                    if ocx.flags.contains(OptFlag::GOTO) {
+                        OptGoto::run(ocx, fid);
+                    }
+                }
+                if ocx.flags.contains(OptFlag::INLINE) {
+                    Inline::run(ocx);
+                }
+                let newsize = irsize(&ocx.ir);
+                if size == newsize {
+                    trace!(OPTIMIZE "converged in {} iterations", i+1);
+                    break
+                } else {
+                    trace!(OPTIMIZE "IR size {} -> {}", size, newsize);
+                    if trace!(OPTIMIZE) && !ocx.flags.is_empty() {
+                        let mut tmp = Default::default();
+                        dump_ir(&mut tmp, &ocx.ir);
+                        trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
+                    }
+                    size = newsize;
                 }
             }
-            if ocx.flags.contains(OptFlag::INLINE) {
-                Inline::run(ocx)?;
-            }
-            if trace!(OPTIMIZE) && !ocx.flags.is_empty() {
-                let mut tmp = Default::default();
-                dump_ir(&mut tmp, &ocx.ir);
-                trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
-            }
-            Ok(())
-        })
+        });
+        Ok(())
     }
 
 }

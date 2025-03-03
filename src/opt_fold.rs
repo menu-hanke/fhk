@@ -8,7 +8,7 @@ use hashbrown::HashTable;
 use zerocopy::Unalign;
 
 use crate::bump::BumpRef;
-use crate::compile::{self, Ccx};
+use crate::compile::Ccx;
 use crate::hash::fxhash;
 use crate::index::{IndexOption, IndexVec};
 use crate::ir::{Func, FuncId, Ins, InsId, Opcode, Type};
@@ -29,7 +29,7 @@ enum FoldStatus {
     Done(Ins),
     Again(Ins),
     New(InsId),
-    Old(InsId)
+    // Old(InsId)
 }
 
 macro_rules! ipat {
@@ -175,9 +175,9 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         },
 
         // eliminate GOTOs
-        GOTO => {
-            FoldStatus::Old(ins.decode_V())
-        },
+        // GOTO => {
+        //     FoldStatus::Old(ins.decode_V())
+        // },
 
         _ => FoldStatus::Done(ins)
     }
@@ -195,12 +195,12 @@ fn visit(fcx: &mut Fcx, func: &Func, id: InsId) -> InsId {
         match fold(fcx, ins) {
             FoldStatus::Again(xins) => ins = xins,
             FoldStatus::New(id) => break id,
-            FoldStatus::Old(id) => {
-                // this cannot cause infinite recursion, because the frontend will never
-                // generate an infinite loop, so an instruction can never unconditionally
-                // loop back to itself.
-                break visit(fcx, func, id)
-            },
+            // FoldStatus::Old(id) => {
+            //     // this cannot cause infinite recursion, because the frontend will never
+            //     // generate an infinite loop, so an instruction can never unconditionally
+            //     // loop back to itself.
+            //     break visit(fcx, func, id)
+            // },
             FoldStatus::Done(ins) => {
                 if ins.opcode().is_control() {
                     fcx.data.fold.next.extend(ins.controls());
@@ -240,11 +240,11 @@ fn fixup(fold: &mut Fold) {
 
 impl FuncPass for Fold {
 
-    fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
-        Ok(Default::default())
+    fn new(_: &mut Ccx<Absent>) -> Self {
+        Default::default()
     }
 
-    fn run(ocx: &mut Ocx, fid: FuncId) -> compile::Result {
+    fn run(ocx: &mut Ocx, fid: FuncId) {
         ocx.freeze_ir(|fcx| {
             let ir = Access::borrow(&fcx.ir);
             let func = &ir.funcs[fid];
@@ -262,8 +262,6 @@ impl FuncPass for Fold {
         let func = &mut ocx.ir.funcs[fid];
         func.entry = ocx.data.fold.old_new[func.entry].unwrap();
         swap(func.code.inner_mut(), &mut ocx.data.fold.code);
-        // TODO: also eliminate dead phi ids, either in here or a separate pass
-        Ok(())
     }
 
 }

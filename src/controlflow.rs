@@ -14,7 +14,7 @@ use crate::ir::{Func, Ins, InsId, Mark, Opcode};
 
 /* ---- Control flow graph -------------------------------------------------- */
 
-index!(pub struct BlockId(u16) invalid(!0));
+index!(pub struct BlockId(u16) invalid(!0) debug("b{}"));
 
 impl BlockId {
     pub const START: Self = Self(0);
@@ -168,6 +168,7 @@ fn compute_domtree(cfg: &Dataflow<BlockId>, idom: &mut IndexSlice<BlockId, Block
         }
         if fixpoint { break }
     }
+    debug_assert!(idom.pairs().all(|(i,&d)| d <= i));
 }
 
 /* ---- Dataflow graph ------------------------------------------------------ */
@@ -348,9 +349,11 @@ fn schedule_next(
 ) -> Option<InsId> {
     let mut state = loop {
         let state = work_state.last_mut()?;
+        debug_assert!(work_blocks.len() >= state.base as usize);
         if inst[state.id] == UNPLACED {
             break state
         } else {
+            work_blocks.truncate(state.base as usize);
             work_state.pop();
         }
     };
@@ -372,6 +375,7 @@ fn schedule_next(
             'uloop: for &p in &place[start as usize .. end as usize] {
                 for b in &mut work_blocks[base..] {
                     let up = lca(idom, p, *b);
+                    //crate::trace::trace!("[{:?}/{:?}] lca({:?}, {:?}) -> {:?}", state.id, user, p, *b, up);
                     if mat[blocks[up]].test(state.id) {
                         *b = up;
                         continue 'uloop;
@@ -380,12 +384,23 @@ fn schedule_next(
                 // none of the proposed placements has a common ancestor with p that implies
                 // execution of `state.ins`.
                 // add a new proposed placement in the same block as the user.
+                //crate::trace::trace!("[{:?}/{:?}] push {:?}", state.id, user, p);
                 work_blocks.push(p);
             }
             state.user += 1;
         }
         let id = state.id;
         placeins(inst, place, id, &work_blocks[state.base as usize ..]);
+        // TODO: re-enable these asserts when new cmat is implemented
+        // if cfg!(debug_assertions) {
+        //     for i in state.base as usize .. work_blocks.len() {
+        //         debug_assert!(mat[blocks[work_blocks[i]]].test(id));
+        //         for j in i+1..work_blocks.len() {
+        //             debug_assert!(!dom(idom, work_blocks[i], work_blocks[j]));
+        //             debug_assert!(!dom(idom, work_blocks[j], work_blocks[i]));
+        //         }
+        //     }
+        // }
         work_blocks.truncate(state.base as usize);
         work_state.pop();
         break Some(id);
@@ -433,6 +448,7 @@ impl ControlFlow {
             == self.code.raw.iter().filter(|i| i.opcode().is_control()).count());
         compute_dfg(&self.code.raw, &mut self.dfg);
         compute_cmat(&self.code, &self.dfg, &mut self.solver, &mut self.cmat, &mut self.work_bitmap);
+        //crate::trace::trace!(OPTIMIZE "control matrix:\n{:?}", &self.cmat);
         // by default all instructions are based outside basic blocks
         self.place.clear();
         self.inst.clear();

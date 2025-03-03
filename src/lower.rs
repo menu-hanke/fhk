@@ -2012,7 +2012,7 @@ fn vgetrect(
         }
     };
     for i in 0..eds as isize {
-        lcx.data.func.code.set(out+i, Ins::MOVF(Type::PTR, data+i, stores+i));
+        lcx.data.func.code.set(out+i, Ins::MOVF(Type::PTR, data+i, stores+1+i));
     }
 }
 
