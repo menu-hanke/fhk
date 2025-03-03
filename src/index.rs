@@ -3,11 +3,14 @@
 // most of this is yoinked from rustc:
 // https://github.com/rust-lang/rust/tree/master/compiler/rustc_index
 
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
+use core::cmp::max;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::{Deref, DerefMut, Range};
+use core::ptr::NonNull;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -302,6 +305,132 @@ impl<'a, I: Index, T: Clone> Iterator for IndexValueVecIter<'a, I, T> {
                 Some((index.into(), v.clone()))
             },
             None => None
+        }
+    }
+}
+
+// this is its own type to avoid monomorphization because of I
+struct RawIndexSet {
+    ptr: NonNull<u16>,
+    size: usize,
+    version: u16
+}
+
+impl RawIndexSet {
+
+    #[cold]
+    fn reset(&mut self) {
+        unsafe { core::ptr::write_bytes(self.ptr.as_ptr(), 0, self.size); }
+        self.version = 1;
+    }
+
+    fn clear(&mut self) {
+        let (version, carry) = self.version.overflowing_add(1);
+        self.version = version;
+        if carry {
+            self.reset();
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        if index < self.size {
+            (unsafe { *self.ptr.as_ptr().add(index) }) == self.version
+        } else {
+            false
+        }
+    }
+
+    #[cold]
+    fn insert_grow(&mut self, index: usize) {
+        assert!(index >= self.size);
+        let mut newsize = max(self.size, 8);
+        while newsize <= index { newsize *= 2 }
+        let ptr = match self.size {
+            0 => unsafe {
+                alloc::alloc::alloc(
+                    Layout::from_size_align_unchecked(newsize*size_of::<u16>(), align_of::<u16>()))
+            },
+            n => unsafe {
+                alloc::alloc::realloc(
+                    self.ptr.as_ptr().cast(),
+                    Layout::from_size_align_unchecked(n*size_of::<u16>(), align_of::<u16>()),
+                    newsize*size_of::<u16>()
+                )
+            }
+        } as *mut u16;
+        let ptr = NonNull::new(ptr).unwrap();
+        unsafe { core::ptr::write_bytes(ptr.as_ptr().add(self.size), 0, newsize - self.size); }
+        unsafe { *ptr.as_ptr().add(index) = self.version }
+        self.ptr = ptr;
+        self.size = newsize;
+    }
+
+    fn insert(&mut self, index: usize) {
+        if index < self.size {
+            unsafe { *self.ptr.as_ptr().add(index) = self.version }
+        } else {
+            self.insert_grow(index);
+        }
+    }
+
+    fn test_and_set(&mut self, index: usize) -> bool {
+        if index < self.size {
+            (unsafe { core::ptr::replace(self.ptr.as_ptr().add(index), self.version) }) == self.version
+        } else {
+            self.insert_grow(index);
+            false
+        }
+    }
+
+    fn remove(&mut self, index: usize) {
+        if index < self.size {
+            unsafe { *self.ptr.as_ptr().add(index) = 0 }
+        }
+    }
+
+}
+
+impl Default for RawIndexSet {
+    fn default() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            size: 0,
+            version: 1
+        }
+    }
+}
+
+impl Drop for RawIndexSet {
+    fn drop(&mut self) {
+        if self.size != 0 {
+            unsafe {
+                alloc::alloc::dealloc(
+                    self.ptr.as_ptr().cast(),
+                    Layout::from_size_align_unchecked(self.size*size_of::<u16>(), align_of::<u16>())
+                );
+            }
+        }
+    }
+}
+
+pub struct IndexSet<I: Index> {
+    _marker: PhantomData<fn(&I)>,
+    raw: RawIndexSet
+}
+
+impl<I: Index> IndexSet<I> {
+    #[inline(always)] pub fn clear(&mut self) { self.raw.clear(); }
+    #[inline(always)] pub fn contains(&self, index: I) -> bool { self.raw.contains(index.into()) }
+    #[inline(always)] pub fn insert(&mut self, index: I) { self.raw.insert(index.into()); }
+    #[inline(always)] pub fn test_and_set(&mut self, index: I) -> bool { self.raw.test_and_set(index.into()) }
+    #[inline(always)] pub fn remove(&mut self, index: I) { self.raw.remove(index.into()); }
+}
+
+impl<I: Index> Default for IndexSet<I> {
+    fn default() -> Self {
+        Self {
+            _marker: PhantomData,
+            raw: Default::default()
         }
     }
 }

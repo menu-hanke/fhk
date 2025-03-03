@@ -541,7 +541,8 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
         func,
         &mut emit.code,
         &mut emit.values,
-        &mut emit.blockparams
+        &mut emit.blockparams,
+        &mut ecx.mark1
     );
     if trace!(SCHEDULE) {
         let mut tmp = Default::default();

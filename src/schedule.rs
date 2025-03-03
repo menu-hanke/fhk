@@ -6,7 +6,7 @@ use crate::bitmap::{BitMatrix, Bitmap};
 use crate::controlflow::{BlockId, ControlFlow, Schedule};
 use crate::dataflow::DataflowSystem;
 use crate::emit::InsValue;
-use crate::index::{self, IndexVec};
+use crate::index::{self, IndexSet, IndexVec};
 use crate::ir::{Func, Ins, InsId, Opcode, PhiId, Type};
 
 #[derive(Default)]
@@ -112,9 +112,10 @@ pub fn compute_schedule(
     func: &Func,
     code: &mut IndexVec<InsId, Ins>,
     values: &mut IndexVec<InsId, InsValue>,
-    blockparams: &mut BitMatrix<BlockId, PhiId>
+    blockparams: &mut BitMatrix<BlockId, PhiId>,
+    mark: &mut IndexSet<InsId>
 ) {
-    gcm.control.set_func(func);
+    gcm.control.set_func(func, mark);
     // TODO: use next() and:
     // * lift up loop invariants
     // * de-duplicate instructions that *don't* depend on CALLC(I) or L* instructions (lift up to lca)

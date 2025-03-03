@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
-use crate::index::{self, IndexOption, IndexSlice, IndexVec};
-use crate::ir::{FuncId, FuncKind, Ins, InsId, Mark, Opcode, IR};
+use crate::index::{self, IndexOption, IndexSet, IndexSlice, IndexVec};
+use crate::ir::{FuncId, FuncKind, Ins, InsId, Opcode, IR};
 use crate::optimize::{Ocx, Pass};
 use crate::trace::trace;
 use crate::typestate::Absent;
@@ -90,21 +90,23 @@ pub struct Inline {
 
 // mark 1: visited
 // mark 2: inside
-fn hasloop(code: &mut IndexSlice<InsId, Ins>, id: InsId) -> bool {
-    let ins = code[id];
-    let mark = ins.get_mark(Mark::Mark1 | Mark::Mark2);
-    if mark.is_empty() {
-        code[id] = ins.set_mark(Mark::Mark1 | Mark::Mark2);
-        for &c in ins.controls() {
-            if hasloop(code, c) {
-                return true;
-            }
-        }
-        code[id] = ins.set_mark(Mark::Mark1);
-        false
-    } else {
-        mark.contains(Mark::Mark2)
+fn hasloop(
+    code: &IndexSlice<InsId, Ins>,
+    visited: &mut IndexSet<InsId>,
+    inside: &mut IndexSet<InsId>,
+    id: InsId
+) -> bool {
+    if visited.test_and_set(id) {
+        return inside.contains(id);
     }
+    inside.insert(id);
+    for &c in code[id].controls() {
+        if hasloop(code, visited, inside, c) {
+            return true;
+        }
+    }
+    inside.remove(id);
+    false
 }
 
 fn visitcallers(ir: &IR, inline: &mut Inline, fid: FuncId) {
@@ -133,13 +135,14 @@ fn visitins(
     ctr: &ControlFlow,
     cursor: &mut InsId,
     bb: &mut IndexSlice<BlockId, InsId>,
+    iselim: &IndexSet<InsId>,
     id: InsId
 ) {
     if inst.is_placed(id) {
         return;
     }
     for &user in ctr.dfg.uses(id) {
-        visitins(actions, inst, ctr, cursor, bb, user);
+        visitins(actions, inst, ctr, cursor, bb, iselim, user);
     }
     let ins = ctr.code[id];
     let new = inst.get_mut(id);
@@ -148,7 +151,7 @@ fn visitins(
         for (j, &block) in blocks.iter().enumerate() {
             if ins.opcode().is_pinned() {
                 actions.push(Action::Fixup(*cursor, zerocopy::transmute!(block), bb[block]));
-            } else if ins.is_marked(Mark::Mark1) {
+            } else if iselim.contains(id) {
                 actions.push(Action::Inline(*cursor, bb[block]));
                 actions.extend(
                     ctr.dfg.uses(id)
@@ -168,13 +171,15 @@ fn visitins(
     }
 }
 
+// mark1: iselim
 fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &mut u32) {
     let inl = &mut ccx.data.inline;
     let func = &mut ccx.ir.funcs[fid];
-    inl.control.set_func(func);
+    inl.control.set_func(func, &mut ccx.mark1);
+    ccx.mark1.clear();
     for &call in &ccx.tmp[calls.clone()] {
         inl.control.queue(call);
-        inl.control.code[call] = inl.control.code[call].set_mark(Mark::Mark1);
+        ccx.mark1.insert(call);
     }
     inl.control.place_all();
     inl.inst.reset(&inl.control);
@@ -188,7 +193,7 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
         cursor += 1;
     }
     for id in index::iter_span(inl.control.code.end()) {
-        visitins(&mut inl.actions, &mut inl.inst, &inl.control, &mut cursor, bb_ctr, id);
+        visitins(&mut inl.actions, &mut inl.inst, &inl.control, &mut cursor, bb_ctr, &ccx.mark1, id);
     }
     for (bb, &ctr) in inl.control.blocks.pairs() {
         for &c in inl.control.code[ctr].controls() {
@@ -320,8 +325,10 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
         InlineState::Working => {
             let func = &mut ccx.ir.funcs[fid];
             if let FuncKind::Chunk(_) = func.kind {
+                ccx.mark1.clear();
+                ccx.mark2.clear();
                 // queries are always leaf functions, so don't bother checking this for queries.
-                if hasloop(func.code.inner_mut(), func.entry) {
+                if hasloop(func.code.inner_mut(), &mut ccx.mark1, &mut ccx.mark2, func.entry) {
                     cost += LOOP_COST;
                 }
             }

@@ -5,12 +5,11 @@ use core::iter::zip;
 use core::ops::Range;
 
 use alloc::vec::Vec;
-use enumset::EnumSet;
 
 use crate::bitmap::{BitMatrix, BitmapVec, Bitmap};
 use crate::dataflow::{Dataflow, DataflowSystem};
-use crate::index::{self, index, IndexSlice, IndexVec, InvalidValue};
-use crate::ir::{Func, Ins, InsId, Mark, Opcode};
+use crate::index::{self, index, IndexSet, IndexSlice, IndexVec, InvalidValue};
+use crate::ir::{Func, Ins, InsId, Opcode};
 
 /* ---- Control flow graph -------------------------------------------------- */
 
@@ -20,14 +19,12 @@ impl BlockId {
     pub const START: Self = Self(0);
 }
 
-fn visitdata(code: &mut IndexSlice<InsId, Ins>, mask: EnumSet<Mark>, id: InsId) {
-    let ins = code[id];
-    if ins.is_marked(mask) {
+fn visitdata(code: &IndexSlice<InsId, Ins>, visited: &mut IndexSet<InsId>, id: InsId) {
+    if visited.test_and_set(id) {
         return;
     }
-    code[id] = ins.set_mark(mask);
-    for &v in ins.inputs() {
-        visitdata(code, mask, v);
+    for &v in code[id].inputs() {
+        visitdata(code, visited, v);
     }
 }
 
@@ -35,39 +32,38 @@ fn visitdata(code: &mut IndexSlice<InsId, Ins>, mask: EnumSet<Mark>, id: InsId) 
 // visiting in preorder guarantees that the domtree algorithm terminates reasonably fast
 // (but it is correct for any ordering).
 fn visitcontrol(
-    code: &mut IndexSlice<InsId, Ins>,
+    code: &IndexSlice<InsId, Ins>,
     blocks: &mut IndexVec<BlockId, InsId>,
-    mask: EnumSet<Mark>,
+    visited: &mut IndexSet<InsId>,
     id: InsId
 ) {
-    let ins = code[id];
-    if ins.is_marked(mask) {
+    if visited.test_and_set(id) {
         return;
     }
-    code[id] = ins.set_mark(mask);
+    let ins = code[id];
     blocks.push(id);
     for &v in ins.inputs() {
-        visitdata(code, mask, v);
+        visitdata(code, visited, v);
     }
     for &c in ins.controls() {
-        visitcontrol(code, blocks, mask, c);
+        visitcontrol(code, blocks, visited, c);
     }
 }
 
 fn compute_blocks(
     code: &mut IndexSlice<InsId, Ins>,
     blocks: &mut IndexVec<BlockId, InsId>,
-    mark: Mark,
+    visited: &mut IndexSet<InsId>,
     entry: InsId
 ) {
+    visited.clear();
     blocks.clear();
-    visitcontrol(code, blocks, mark.into(), entry);
+    visitcontrol(code, blocks, visited, entry);
     // nuke all unreachable code.
     // this is a bit of a ghetto solution, but it makes the rest of the algorithm much simpler.
-    for ins in &mut code.raw {
-        *ins = match ins.is_marked(mark) {
-            true => ins.clear_mark(mark),
-            false => Ins::NOP_FX
+    for (id, ins) in code.pairs_mut() {
+        if !visited.contains(id) {
+            *ins = Ins::NOP_FX;
         }
     }
 }
@@ -441,9 +437,9 @@ pub struct Schedule {
 
 impl ControlFlow {
 
-    pub fn set_func(&mut self, func: &Func) {
+    pub fn set_func(&mut self, func: &Func, mark: &mut IndexSet<InsId>) {
         func.code.swap_inner(&mut self.code);
-        compute_blocks(&mut self.code, &mut self.blocks, Mark::Mark4, func.entry);
+        compute_blocks(&mut self.code, &mut self.blocks, mark, func.entry);
         debug_assert!(self.blocks.raw.len()
             == self.code.raw.iter().filter(|i| i.opcode().is_control()).count());
         compute_dfg(&self.code.raw, &mut self.dfg);

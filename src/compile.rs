@@ -10,8 +10,9 @@ use crate::emit::Emit;
 use crate::finalize::FinalizerBuilder;
 use crate::host::HostCtx;
 use crate::image::Image;
+use crate::index::IndexSet;
 use crate::intern::{Intern, IRef};
-use crate::ir::IR;
+use crate::ir::{InsId, IR};
 use crate::layout::ComputeLayout;
 use crate::lex::Token;
 use crate::link::Link;
@@ -92,7 +93,10 @@ pub struct Ccx<P=(), O=RW, I=RW> {
     // compilation result
     pub image: Option<Image>,
     // optimization flags
-    pub flags: EnumSet<OptFlag>
+    pub flags: EnumSet<OptFlag>,
+    // markers for algorithms
+    pub mark1: IndexSet<InsId>,
+    pub mark2: IndexSet<InsId>
 }
 
 pub struct CompileStage<'a, P, T: StageMarker> {
@@ -125,7 +129,9 @@ impl Ccx<Absent> {
             mcode: Default::default(),
             image: Default::default(),
             layout: Default::default(),
-            flags: EnumSet::all()
+            flags: EnumSet::all(),
+            mark1: Default::default(),
+            mark2: Default::default()
         }
     }
 

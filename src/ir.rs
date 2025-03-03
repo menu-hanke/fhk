@@ -420,7 +420,7 @@ const fn count_operands(opcode: Opcode, opr: Operand) -> usize {
  * +--------+--------+--------+--------+-------+--------+
  * | 63..48 | 47..32 | 31..16 | 15..12 | 11..8 |  7..0  |
  * +--------+--------+--------+--------+-------+--------+
- * |   C    |    B   |    A   |  type  |  mark | opcode |
+ * |   C    |    B   |    A   |  type  | ----- | opcode |
  * +--------+--------+--------+--------+-------+--------+
  *
  * NOTE: do not derive FromBytes. opcode and type must always be valid.
@@ -428,15 +428,6 @@ const fn count_operands(opcode: Opcode, opr: Operand) -> usize {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct Ins(u64);
-
-#[derive(EnumSetType)]
-#[enumset(repr="u64")]
-pub enum Mark {
-    Mark1 = 8,
-    Mark2 = 9,
-    Mark3 = 10,
-    Mark4 = 11
-}
 
 // everything here assumes little endian.
 // note that archs in the set (supported by cranelift) ∩  (supported by luajit) are all LE.
@@ -493,24 +484,6 @@ impl Ins {
 
     pub const fn set_bc(self, bc: u32) -> Self {
         Self((self.0 & 0x00000000ffffffff) | ((bc as u64) << 32))
-    }
-
-    pub fn get_mark(self, mark: impl Into<EnumSet<Mark>>) -> EnumSet<Mark> {
-        unsafe { EnumSet::from_repr_unchecked(self.0 & mark.into().as_repr()) }
-    }
-
-    pub fn is_marked(self, mark: impl Into<EnumSet<Mark>>) -> bool {
-        !self.get_mark(mark).is_empty()
-    }
-
-    pub fn set_mark(mut self, mark: impl Into<EnumSet<Mark>>) -> Self {
-        self.0 |= mark.into().as_repr();
-        self
-    }
-
-    pub fn clear_mark(mut self, mark: impl Into<EnumSet<Mark>>) -> Self {
-        self.0 &= !mark.into().as_repr();
-        self
     }
 
     pub fn abc_mut(&mut self) -> &mut [u16; 3] {
@@ -591,16 +564,6 @@ impl Ins {
             _ => None
         }
     }
-
-    // pub fn func_mut(&mut self) -> Option<&mut FuncId> {
-    //     use Opcode::*;
-    //     match self.opcode() {
-    //         CALLC|CALLCI => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[2])),
-    //         CINIT => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[1])),
-    //         CALL|TRET => { todo!(); /* TODO: nothing produces these yet. */ },
-    //         _ => None
-    //     }
-    // }
 
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {
@@ -713,16 +676,6 @@ impl Func {
 
     pub fn params(&self) -> Range<PhiId> {
         self.ret .. self.arg
-    }
-
-    fn clear_mark_(&self, marks: EnumSet<Mark>) {
-        for (id,ins) in self.code.pairs() {
-            self.code.set(id, ins.clear_mark(marks));
-        }
-    }
-
-    pub fn clear_mark(&self, mark: impl Into<EnumSet<Mark>>) {
-        self.clear_mark_(mark.into());
     }
 
 }
