@@ -41,8 +41,8 @@ define_costs! {
     ADD | SUB | MUL | DIV | UDIV | NEG | ADDP | EQ | NE | LT | LE | ULT | ULE
         | STORE | LOAD | BOX | IF => 1,
     // TODO: CALL cost should depend on called function
-    POW | ALLOC | CALL | CALLC | CALLCI | CINIT => 5,
-    LO | LOV | LOVV | LOVX | LOX | LOXX => 255
+    POW | ALLOC | CALL | CALLC | CALLCI => 5,
+    CINIT | LO | LOV | LOVV | LOVX | LOX | LOXX => 255
 }
 
 const LOOP_COST: u32 = 255;
