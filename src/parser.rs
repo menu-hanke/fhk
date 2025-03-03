@@ -8,8 +8,9 @@ use alloc::vec::Vec;
 use enumset::EnumSet;
 use hashbrown::hash_map::Entry;
 use logos::Logos;
+use zerocopy::Unalign;
 
-use crate::bump::Bump;
+use crate::bump::{Bump, BumpRef};
 use crate::compile::{self, Ccx, CompileError, Stage};
 use crate::err::ErrorMessage;
 use crate::hash::HashMap;
@@ -139,12 +140,12 @@ pub fn stringify(buf: &mut Bump, intern: &Intern, body: &[u8], sty: SequenceType
                 },
                 Token::Int => write!(buf, "{}", data as i32).unwrap(),
                 Token::Int64 => {
-                    let v = i64::from_ne_bytes(intern[zerocopy::transmute!(data)]);
-                    write!(buf, "{}", v).unwrap();
+                    let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(data);
+                    write!(buf, "{}", intern.bump()[data].get()).unwrap();
                 },
                 Token::Fp64 => {
-                    let v = f64::from_ne_bytes(intern[zerocopy::transmute!(data)]);
-                    write!(buf, "{}", v).unwrap();
+                    let data: BumpRef<Unalign<f64>> = zerocopy::transmute!(data);
+                    write!(buf, "{}", intern.bump()[data].get()).unwrap();
                 },
                 tk => {
                     buf.write(tk.str());
