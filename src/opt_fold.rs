@@ -204,8 +204,8 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             FoldStatus::Again(ins)
         },
 
-        // x+0 = x
-        ADD if m!(_ 0) => FoldStatus::New(ins.decode_V()),
+        // x+0 = x-0 = x
+        ADD|SUB if m!(_ 0) => FoldStatus::New(ins.decode_V()),
 
         // x*1 = x/1 = x
         MUL|DIV|UDIV if m!(_ 1) => FoldStatus::New(ins.decode_V()),
