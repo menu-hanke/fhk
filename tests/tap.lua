@@ -115,8 +115,8 @@ local function pcallfail(message, f, ...)
 	end
 end
 
-local function test_fail(T, expr, message)
-	local query = T.G:newquery("global")
+local function newquery(G, expr)
+	local query = G:newquery("global")
 	if type(expr) == "table" then
 		for _,e in ipairs(expr) do
 			query:add(e)
@@ -124,11 +124,17 @@ local function test_fail(T, expr, message)
 	else
 		query:add(expr)
 	end
+	return query
+end
+
+local function test_fail(T, expr, message)
+	local query = newquery(T.G, expr)
 	local inst = test_newinstance(T)
 	pcallfail(message, query.query, inst)
 end
 
-local function test_compilefail(T, message)
+local function test_compilefail(T, expr, message)
+	newquery(T.G, expr)
 	pcallfail(message, test_compile, T)
 end
 

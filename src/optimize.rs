@@ -21,7 +21,7 @@ use crate::opt_phi::OptPhi;
 use crate::trace::trace;
 use crate::typestate::{Absent, R};
 
-const MAX_ITER: usize = 10; // TODO: make this configurable
+const MAX_ITER: usize = 100; // TODO: make this configurable
 
 #[derive(EnumSetType)]
 pub enum OptFlag {

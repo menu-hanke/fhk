@@ -75,14 +75,14 @@ fn patch(
             Opcode::JMP => {
                 let (_, dest, phi) = ins.decode_JMP();
                 match new[phi].unpack() {
-                    Some(newphi) => ins.phis_mut()[0] = newphi,
+                    Some(newphi) => *ins.phi_mut().unwrap() = newphi,
                     None => *ins = Ins::GOTO(dest)
                 }
             },
             Opcode::PHI => {
                 let (_, phi) = ins.decode_PHI();
                 match new[phi].unpack() {
-                    Some(newphi) => ins.phis_mut()[0] = newphi,
+                    Some(newphi) => *ins.phi_mut().unwrap() = newphi,
                     None => *ins = ins.set_opcode(Opcode::MOV).set_a(zerocopy::transmute!(info[phi].write))
                 }
             },

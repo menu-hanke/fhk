@@ -573,16 +573,24 @@ impl Ins {
         }
     }
 
-    pub fn phis_mut(&mut self) -> &mut [PhiId] {
+    pub fn phi_mut(&mut self) -> Option<&mut PhiId> {
         use Opcode::*;
-        let opcode = self.opcode();
-        let phis: &mut [PhiId; 4] = zerocopy::transmute_mut!(&mut self.0);
-        match opcode {
-            JMP => &mut phis[3..4],
-            PHI|RES => &mut phis[2..3],
-            _ => &mut []
+        match self.opcode() {
+            JMP => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[2])),
+            PHI|RES => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[1])),
+            _ => None
         }
     }
+
+    // pub fn func_mut(&mut self) -> Option<&mut FuncId> {
+    //     use Opcode::*;
+    //     match self.opcode() {
+    //         CALLC|CALLCI => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[2])),
+    //         CINIT => Some(zerocopy::transmute_mut!(&mut self.abc_mut()[1])),
+    //         CALL|TRET => { todo!(); /* TODO: nothing produces these yet. */ },
+    //         _ => None
+    //     }
+    // }
 
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {

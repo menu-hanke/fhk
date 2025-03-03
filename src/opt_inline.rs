@@ -1,4 +1,4 @@
-//! Inlining.
+//! Inlining and dead function elimination.
 
 use core::iter::zip;
 use core::ops::Range;
@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
-use crate::index::{self, IndexSlice, IndexVec};
+use crate::index::{self, IndexOption, IndexSlice, IndexVec};
 use crate::ir::{FuncId, FuncKind, Ins, InsId, Mark, Opcode, IR};
 use crate::optimize::{Ocx, Pass};
 use crate::typestate::Absent;
@@ -226,7 +226,7 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
                             *v += ins_base as isize;
                         }
                         if ins.opcode() != Opcode::RES {
-                            for p in ins.phis_mut() {
+                            if let Some(p) = ins.phi_mut() {
                                 *p += phi_base as isize;
                             }
                         }
@@ -305,6 +305,52 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) {
         + (cost as u64) + (FUNC_COST as u64));
 }
 
+fn sweepdead(
+    ir: &mut IR,
+    fda: &IndexSlice<FuncId, FuncData>,
+    work: &mut IndexSlice<FuncId, IndexOption<FuncId>>
+) {
+    for (f,(fd,w)) in zip(&ir.funcs.raw, zip(&fda.raw, &mut work.raw)) {
+        *w = (!matches!((&f.kind, fd),
+            (FuncKind::Chunk(_), FuncData { callers: 0, .. } | FuncData { inline: Some(true), .. })
+        )).then_some(0.into()).into();
+    }
+    let mut left = 0.into();
+    let mut right = ir.funcs.end();
+    while left < right {
+        while left < right && work[left].is_some() {
+            work[left] = Some(left).into();
+            left += 1;
+        }
+        while left < right && work[right-1].is_none() {
+            ir.funcs.raw.pop();
+            right -= 1;
+        }
+        if left < right {
+            debug_assert!(work[left].is_none() && work[right-1].is_some());
+            ir.funcs.raw.swap_remove(left.into());
+            work[right-1] = Some(left).into();
+            right -= 1;
+            left += 1;
+        }
+    }
+    if right < work.end() {
+        for func in &mut ir.funcs.raw {
+            for ins in &mut func.code.inner_mut().raw {
+                match ins.opcode() {
+                    Opcode::CALLC|Opcode::CALLCI =>
+                        *ins = ins.set_c(zerocopy::transmute!(work[zerocopy::transmute!(ins.c())])),
+                    Opcode::CINIT => match work[zerocopy::transmute!(ins.b())].unpack() {
+                        Some(f) => *ins = ins.set_b(zerocopy::transmute!(f)),
+                        None => *ins = Ins::NOP_FX
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 impl Pass for Inline {
 
     fn new(_: &mut Ccx<Absent>) -> Self {
@@ -312,6 +358,7 @@ impl Pass for Inline {
     }
 
     fn run(ccx: &mut Ocx) {
+        debug_assert!(!ccx.ir.funcs.is_empty());
         ccx.data.inline.func.clear();
         ccx.data.inline.func.raw.resize(ccx.ir.funcs.raw.len(), FuncData::default());
         for id in index::iter_span(ccx.ir.funcs.end()) {
@@ -322,6 +369,10 @@ impl Pass for Inline {
                 visitinline(ccx, id);
             }
         }
+        let base = ccx.tmp.end();
+        let (_, work) = ccx.tmp.reserve_dst(ccx.ir.funcs.raw.len());
+        sweepdead(&mut ccx.ir, &ccx.data.inline.func, work);
+        ccx.tmp.truncate(base);
     }
 
 }

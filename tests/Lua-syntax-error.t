@@ -2,4 +2,4 @@
 
 model global a = call Lua["syntax error"]()
 
-### compilefail 'syntax error'
+### compilefail("a", "syntax error")
