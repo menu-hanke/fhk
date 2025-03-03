@@ -165,10 +165,10 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             let ty = ins.type_();
             debug_assert!(left.type_() == ty);
             debug_assert!(right.type_() == ty);
-            if (Type::F32|Type::F64).contains(ty) {
+            if ty.is_fp() {
                 ins = newkfp(fcx, ty, foldfparith(op, kfpvalue(fcx, left), kfpvalue(fcx, right)));
             } else {
-                debug_assert!((Type::I8|Type::I16|Type::I32|Type::I64).contains(ty));
+                debug_assert!(ty.is_int());
                 ins = newkint(fcx, ty, foldintarith(op, kintvalue(fcx, left), kintvalue(fcx, right)));
             }
             FoldStatus::Done(ins)
@@ -181,12 +181,19 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             let right = code[right];
             debug_assert!(left.type_() == right.type_());
             debug_assert!(ins.type_() == Type::B1);
-            let value = if (Type::F32|Type::F64).contains(left.type_()) {
+            let value = if left.type_().is_fp() {
                 foldfpcmp(op, kfpvalue(fcx, left), kfpvalue(fcx, right))
             } else {
+                debug_assert!(left.type_().is_int());
                 foldintcmp(op, kintvalue(fcx, left), kintvalue(fcx, right))
             };
             FoldStatus::Done(Ins::KINT(Type::B1, value as _))
+        },
+
+        // fold comparison against itself
+        // (note: you can only do this for integers because of nans)
+        EQ|NE|LT|LE|ULT|ULE if ins.a() == ins.b() && !code[ins.decode_V()].type_().is_fp() => {
+            FoldStatus::Done(Ins::KINT(Type::B1, (EQ|LE|ULE).contains(op) as _))
         },
 
         // sort commutative operands:
@@ -204,7 +211,19 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         MUL|DIV|UDIV if m!(_ 1) => FoldStatus::New(ins.decode_V()),
 
         // x*0 = 0
-        MUL if m!(_ 0) => FoldStatus::Done(Ins::KINT(ins.type_(), 0)),
+        MUL if m!(_ 0) && !ins.type_().is_fp() => FoldStatus::Done(Ins::KINT(ins.type_(), 0)),
+
+        // fold constant negation
+        NEG if m!(const) => {
+            let operand = code[ins.decode_V()];
+            let ty = ins.type_();
+            FoldStatus::Done(match ty {
+                Type::F32|Type::F64 => newkfp(fcx, ty, -kfpvalue(fcx, operand)),
+                Type::I8|Type::I16|Type::I32|Type::I64 => newkint(fcx, ty, -kintvalue(fcx, operand)),
+                Type::B1 => Ins::KINT(Type::B1, (operand == Ins::KINT(Type::B1, 0)) as _),
+                _ => unreachable!()
+            })
+        },
 
         // eliminate MOVs
         MOV => {

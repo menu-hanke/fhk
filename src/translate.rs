@@ -158,7 +158,7 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
     let type_ = ins.type_();
     let data = ins.bc();
     let k = match ins.opcode() {
-        Opcode::KINT => data as i64,
+        Opcode::KINT => data as i32 as i64,
         Opcode::KINT64 => {
             let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(data);
             ecx.intern.bump()[data].get()

@@ -101,6 +101,16 @@ impl Type {
         unsafe { core::mem::transmute(raw) }
     }
 
+    pub fn is_fp(self) -> bool {
+        use Type::*;
+        (F32|F64).contains(self)
+    }
+
+    pub fn is_int(self) -> bool {
+        use Type::*;
+        (I8|I16|I32|I64).contains(self)
+    }
+
 }
 
 /* ---- Opcodes ------------------------------------------------------------- */

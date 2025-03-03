@@ -7,6 +7,8 @@
 // * merge functions with identical callers
 // * outline instance-invariant code
 // * loop optimizations: code motion, eliminate useless loops, fusion
+// * load-store elimination and dead store elimination
+// * remove loops without side effects
 
 use enumset::{EnumSet, EnumSetType};
 
