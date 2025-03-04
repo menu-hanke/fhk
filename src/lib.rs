@@ -44,6 +44,7 @@ mod typing;
 mod opt_fold;
 mod opt_goto;
 mod opt_inline;
+mod opt_loop;
 mod opt_phi;
 mod optimize;
 

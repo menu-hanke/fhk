@@ -615,6 +615,62 @@ impl BumpPtr {
 
 }
 
+/* ---- Get-many-mut operation ---------------------------------------------- */
+
+pub struct GetManyMut<'a, const K: usize> {
+    reserved: [Range<u32>; K],
+    idx: usize,
+    buf: *mut [u8],
+    _marker: PhantomData<&'a mut ()>
+}
+
+impl<'a, const K: usize> GetManyMut<'a, K> {
+
+    fn reserve_range(&mut self, range: Range<u32>) {
+        let idx = self.idx;
+        assert!(idx < K);
+        assert!((range.end as usize) <= self.buf.len());
+        for &Range { start, end } in &self.reserved[..idx] {
+            assert!(range.end <= start || range.start >= end);
+        }
+        self.reserved[self.idx] = range;
+        self.idx += 1;
+    }
+
+    pub fn get_mut<T>(&mut self, ptr: BumpRef<T>) -> &'a mut T
+        where T: FromBytes + IntoBytes
+    {
+        let ofs = ptr.offset();
+        self.reserve_range(ofs as u32 .. (ofs + size_of::<T>()) as u32);
+        unsafe { &mut *(self.buf as *mut u8).add(ofs).cast() }
+    }
+
+    pub fn get_dst_mut<T>(&mut self, ptr: BumpRef<T>, num: usize) -> &'a mut T
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: FromBytes + IntoBytes,
+              T::Item: FromBytes + IntoBytes
+    {
+        let ofs = ptr.offset();
+        self.reserve_range(ofs as u32 .. (ofs + size_of_dst::<T>(num)) as u32);
+        let ptr = T::ptr_from_raw_parts(unsafe { (self.buf as *mut u8).add(ofs) as _ }, num) as *mut _;
+        unsafe { &mut *ptr }
+    }
+
+}
+
+impl BumpPtr {
+
+    pub fn get_many_mut<const K: usize>(&mut self) -> GetManyMut<'_, K> {
+        GetManyMut {
+            reserved: [const { Range { start: 0, end: 0 }}; K],
+            idx: 0,
+            buf: &mut self.0 as _,
+            _marker: PhantomData
+        }
+    }
+
+}
+
 /* ---- Operators ----------------------------------------------------------- */
 
 impl<T> core::ops::Index<BumpRef<T>> for BumpPtr

@@ -50,7 +50,7 @@ fn markpins(
     code: &IndexSlice<InsId, Ins>
 ) {
     for i in 0..npin {
-        let p: usize = code[bump[pin.add_size(i as _)]].controls()[0].into();
+        let p: usize = code[bump[pin.add_size(i as _)]].decode_C().into();
         bump[ctr.add_size(p as _)] |= PIN;
     }
 }
@@ -103,7 +103,7 @@ fn visitelim(
 
 fn patchpins(code: &mut IndexSlice<InsId, Ins>, pin: &[InsId]) {
     for &p in pin {
-        let mut c = code[p].controls()[0];
+        let mut c = code[p].decode_C();
         if code[c].opcode() == Opcode::NOP {
             while code[c].opcode() == Opcode::NOP {
                 c = zerocopy::transmute!(code[c].b());

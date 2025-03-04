@@ -11,8 +11,7 @@ use crate::controlflow::BlockId;
 use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
 use crate::intern::Intern;
-use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, LangOp, Operand, PhiId, IR};
-use crate::lang::Lang;
+use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, OperandData, PhiId, IR};
 use crate::mem::{BreakpointId, Layout};
 use crate::obj::{FieldType, ObjRef, ObjectRef, Objects, Operator, FUNC, MOD, TAB, VAR, VSET};
 use crate::parser::{stringify, SequenceType};
@@ -130,6 +129,7 @@ fn dump_ins(
     intern: &Intern,
     objs: &Objects
 ) {
+    use OperandData::*;
     let opcode = ins.opcode();
     write!(
         buf,
@@ -139,34 +139,24 @@ fn dump_ins(
         ins.type_().name(),
         opcode.name()
     ).unwrap();
-    let mut raw: u64 = zerocopy::transmute!(ins);
-    for &op in opcode.operands() {
-        raw >>= 16;
+    for op in ins.operands() {
+        buf.push(b' ');
         match op {
-            Operand::X  => write!(buf, " {}", raw as i16),
-            Operand::XX => { raw >>= 16; write!(buf, " {}", raw as i32) },
-            Operand::L  => {
-                let LangOp { lang, op } = zerocopy::transmute!(raw as u16);
-                // TODO: also put opname here (add an opname() in trait language?)
-                write!(buf, " {}.{}", Lang::from_u8(lang).name(), op)
-            },
-            Operand::V  => write!(buf, " {:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i}),
-            Operand::C  => {
+            C(c) => {
                 if let Some(values) = values {
-                    let block: u16 = zerocopy::transmute!(values.raw[raw as u16 as usize].block());
-                    write!(buf, " ->{}", block)
+                    let block: u16 = zerocopy::transmute!(values[c].block());
+                    write!(buf, "->{}", block)
                 } else {
-                    write!(buf, " ->{:?}", {let i: InsId = zerocopy::transmute!(raw as u16); i})
+                    write!(buf, "->{:?}", c)
                 }
             },
-            Operand::P  => write!(buf, " {:?}", {let p: PhiId = zerocopy::transmute!(raw as u16); p}),
-            Operand::F  => {
-                let fid: FuncId = zerocopy::transmute!(raw as u16);
-                write!(buf, " {:?}<", fid).unwrap();
-                dump_debugsource(buf, intern, objs, funcs[fid].source);
+            F(f) => {
+                write!(buf, "{:?}<", f).unwrap();
+                dump_debugsource(buf, intern, objs, funcs[f].source);
                 buf.push(b'>');
                 Ok(())
-            }
+            },
+            d => write!(buf, "{:?}", d)
         }.unwrap()
     }
     buf.push(b'\n');

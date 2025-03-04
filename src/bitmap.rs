@@ -78,6 +78,12 @@ fn union(bitmap: &mut [Word], other: &[Word]) {
     }
 }
 
+fn difference(bitmap: &mut [Word], other: &[Word]) {
+    for (a, &b) in bitmap.iter_mut().zip(other.iter()) {
+        *a &= !b;
+    }
+}
+
 fn is_subset(a: &[Word], b: &[Word]) -> bool {
     zip(a, b).all(|(&aw,&bw)| aw & bw == aw)
 }
@@ -117,6 +123,7 @@ impl<I: Index> Bitmap<I> {
     #[inline(always)] pub fn intersect(&mut self, other: &Bitmap<I>) { intersect(&mut self.raw, &other.raw) }
     #[inline(always)] pub fn is_subset(&self, other: &Bitmap<I>) -> bool { is_subset(&self.raw, &other.raw) }
     #[inline(always)] pub fn union(&mut self, other: &Bitmap<I>) { union(&mut self.raw, &other.raw) }
+    #[inline(always)] pub fn difference(&mut self, other: &Bitmap<I>) { difference(&mut self.raw, &other.raw) }
     #[inline(always)] pub fn popcount(&self) -> u32 { popcount(&self.raw) }
     #[inline(always)] pub fn popcount_leading(&self, end: I) -> u32 { popcount_leading(&self.raw, end.into()) }
     #[inline(always)] pub fn ffs(&self) -> Option<I> { ffs(&self.raw).map(Into::into) }

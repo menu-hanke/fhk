@@ -6,9 +6,8 @@
 // * merge identical functions
 // * merge functions with identical callers
 // * outline instance-invariant code
-// * loop optimizations: code motion, eliminate useless loops, fusion
+// * loop optimizations: code motion, fusion
 // * load-store elimination and dead store elimination
-// * remove loops without side effects
 
 use enumset::{EnumSet, EnumSetType};
 
@@ -19,6 +18,7 @@ use crate::ir::{FuncId, IR};
 use crate::opt_fold::Fold;
 use crate::opt_goto::OptGoto;
 use crate::opt_inline::Inline;
+use crate::opt_loop::OptLoop;
 use crate::opt_phi::OptPhi;
 use crate::trace::trace;
 use crate::typestate::{Absent, R};
@@ -30,6 +30,7 @@ pub enum OptFlag {
     FOLD,
     GOTO,
     INLINE,
+    LOOP,
     PHI
 }
 
@@ -41,17 +42,21 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
             b'f' => FOLD.into(),
             b'g' => GOTO.into(),
             b'i' => INLINE.into(),
+            b'l' => LOOP.into(),
             b'p' => PHI.into(),
             b'a' => EnumSet::all(),
             _ => continue
         });
+    }
+    if flags.get(0) == Some(&b'-') {
+        oflg = oflg.complement();
     }
     oflg
 }
 
 pub struct Optimize {
     pub fold: Fold,
-    pub inline: Inline
+    pub inline: Inline,
 }
 
 pub type Ocx<'a> = Ccx<Optimize, R<'a>>;
@@ -77,7 +82,7 @@ impl Stage for Optimize {
     fn new(ccx: &mut Ccx<Absent>) -> compile::Result<Self> {
         Ok(Self {
             fold: Fold::new(ccx),
-            inline: Inline::new(ccx)
+            inline: Inline::new(ccx),
         })
     }
 
@@ -88,6 +93,9 @@ impl Stage for Optimize {
                 for fid in index::iter_span(ocx.ir.funcs.end()) {
                     if ocx.flags.contains(OptFlag::FOLD) {
                         Fold::run(ocx, fid);
+                    }
+                    if ocx.flags.contains(OptFlag::LOOP) {
+                        OptLoop::run(ocx, fid);
                     }
                     if ocx.flags.contains(OptFlag::PHI) {
                         OptPhi::run(ocx, fid);

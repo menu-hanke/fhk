@@ -1,5 +1,6 @@
 //! Intermediate representation.
 
+use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::Range;
@@ -132,6 +133,13 @@ impl LangOp {
 
 }
 
+impl Debug for LangOp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // TODO: also put opname here (add an opname() in trait language?)
+        write!(f, " {}.{}", Lang::from_u8(self.lang).name(), self.op)
+    }
+}
+
 macro_rules! langop_constructor {
     ( $($(#[$($meta:tt)*])? $module:ident::$name:ident;)* ) => {
         impl LangOp {
@@ -149,7 +157,7 @@ foreach_lang!(langop_constructor);
 
 macro_rules! define_operands {
     ($(
-        $name:ident: $type:ty;
+        $name:ident: $type:ty $(,$debugprefix:literal)? $(,$debugsign:ty)?;
     )*) => {
 
         #[derive(EnumSetType)]
@@ -157,22 +165,55 @@ macro_rules! define_operands {
             $($name),*
         }
 
+        #[derive(Clone, Copy)]
+        pub enum OperandData {
+            $($name($type)),*
+        }
+
         mod mode_type {
             use super::*;
             $(pub type $name = $type;)*
+        }
+
+        impl Ins {
+            pub fn operands(&self) -> impl Iterator<Item=OperandData> + '_ {
+                let raw = self.0;
+                self.opcode().operands().iter().enumerate().map(move |(i,&o)| {
+                    let raw = if o == Operand::XX { raw>>32 } else { raw>>(16*(i+1)) };
+                    match o {
+                        $(Operand::$name => {
+                            let value: [$type; size_of::<Ins>()/size_of::<$type>()]
+                                = zerocopy::transmute!(raw);
+                            OperandData::$name(value[0])
+                        }),*
+                    }
+                })
+            }
+        }
+
+        impl Debug for OperandData {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                match *self {
+                    $(OperandData::$name(v) => {
+                        $( write!(f, $debugprefix)?; )?
+                        $( let v = v as $debugsign; )?
+                        v.fmt(f)
+                    }),*
+                }
+            }
         }
 
     };
 }
 
 define_operands! {
-    V:  InsId;  // value
-    C:  InsId;  // control
-    P:  PhiId;  // phi
-    F:  FuncId; // function
-    L:  LangOp; // language-specific opcode
-    X:  u16;    // 16-bit literal
-    XX: u32;    // 32-bit literal
+    V:  InsId;          // value
+    C:  InsId,  "->";   // control
+    P:  PhiId;          // phi
+    F:  FuncId;         // function
+    L:  LangOp;         // language-specific opcode
+    X:  u16,    i16;    // 16-bit literal
+    XX: u32,    i32;    // 32-bit literal
 }
 
 macro_rules! encode_at {
@@ -565,6 +606,15 @@ impl Ins {
         }
     }
 
+    // same as controls()[0], but without the bound check
+    // returns a garbage (but not uninitialized) value for non-C opcodes
+    // note: this becomes unsound if a `V V V` opcode is added.
+    pub fn decode_C(self) -> InsId {
+        debug_assert!(self.opcode().num_c() > 0);
+        let ofs = self.opcode().num_v();
+        unsafe { *(&self as *const Ins as *const InsId).add(1+ofs) }
+    }
+
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {
         use Opcode::*;
@@ -582,6 +632,14 @@ impl Ins {
     decode_fn!(pub fn decode_VV -> V V);
     decode_fn!(pub fn decode_CALLC -> V V F); // CALLC and CALLCI
 
+}
+
+impl Debug for Ins {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:-3} {:-6}", self.type_().name(), self.opcode().name())?;
+        for op in self.operands() { write!(f, " {:?}", op)?; }
+        Ok(())
+    }
 }
 
 /* ---- IR ------------------------------------------------------------------ */

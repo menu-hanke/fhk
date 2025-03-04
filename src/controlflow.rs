@@ -292,7 +292,7 @@ fn place_pinned(
         let op = ins.opcode();
         debug_assert!(!(op.is_control() && inst[id].len() != 1));
         if op.is_pinned() {
-            placeins1(inst, place, id, place[inst[ins.controls()[0]].start as usize]);
+            placeins1(inst, place, id, place[inst[ins.decode_C()].start as usize]);
         }
     }
 }
