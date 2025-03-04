@@ -46,6 +46,7 @@ mod opt_goto;
 mod opt_inline;
 mod opt_loop;
 mod opt_phi;
+mod opt_switch;
 mod optimize;
 
 /* ---- Host support -------------------------------------------------------- */

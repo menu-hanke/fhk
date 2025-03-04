@@ -642,6 +642,54 @@ impl Debug for Ins {
     }
 }
 
+/* ---- Instruction matching ------------------------------------------------ */
+
+// instruction matching mini-language:
+//   `_`                   matches anything
+//   `const`               matches constants
+//   number                matches small integer constants (KINT)
+//   (opcode [pattern]*)   matches instructions
+
+macro_rules! value_matches {
+    ($code:expr, $value:expr; _) => {
+        true
+    };
+    ($code:expr, $value:expr; const) => {
+        $code.raw[$value as usize].opcode().is_const()
+    };
+    ($code:expr, $value:expr; $kint:literal) => {
+        {
+            let ins = $code.raw[$value as usize];
+            ins.opcode() == Opcode::KINT && $kint == ins.bc() as _
+        }
+    };
+    ($code:expr, $value:expr; ($($t:tt)*)) => {
+        {
+            let ins = $code.raw[$value as usize];
+            $crate::ir::ins_matches!($code, ins; $($t)*)
+        }
+    };
+}
+
+macro_rules! ins_matches {
+    ($code:expr, $ins:expr; _ $a:tt $($b:tt $($c:tt)? )? ) => {
+        $crate::ir::value_matches!($code, $ins.a(); $a)
+            $( && $crate::ir::value_matches!($code, $ins.b(); $b)
+                $( && $crate::ir::value_matches!($code, $ins.c(); $c) )?)?
+    };
+    ($code:expr, $ins:expr; $opcode:tt $( $a:tt $($rest:tt)* )? ) => {
+        {
+            #[allow(unused_imports)]
+            use $crate::ir::Opcode::*;
+            let opcode: enumset::EnumSet<$crate::ir::Opcode> = $opcode.into();
+            opcode.contains($ins.opcode())
+                $( && $crate::ir::ins_matches!($code, $ins; _ $a $($rest)*) )?
+        }
+    };
+}
+
+pub(crate) use {ins_matches, value_matches};
+
 /* ---- IR ------------------------------------------------------------------ */
 
 pub struct Chunk {

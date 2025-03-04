@@ -20,6 +20,7 @@ use crate::opt_goto::OptGoto;
 use crate::opt_inline::Inline;
 use crate::opt_loop::OptLoop;
 use crate::opt_phi::OptPhi;
+use crate::opt_switch::OptSwitch;
 use crate::trace::trace;
 use crate::typestate::{Absent, R};
 
@@ -31,7 +32,8 @@ pub enum OptFlag {
     GOTO,
     INLINE,
     LOOP,
-    PHI
+    PHI,
+    SWITCH
 }
 
 pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
@@ -44,6 +46,7 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
             b'i' => INLINE.into(),
             b'l' => LOOP.into(),
             b'p' => PHI.into(),
+            b's' => SWITCH.into(),
             b'a' => EnumSet::all(),
             _ => continue
         });
@@ -71,9 +74,33 @@ pub trait Pass: Sized {
     fn run(ccx: &mut Ocx);
 }
 
+fn optimize(ocx: &mut Ocx) {
+    use OptFlag::*;
+    if ocx.flags.contains(INLINE) {
+        Inline::run(ocx);
+    }
+    for fid in index::iter_span(ocx.ir.funcs.end()) {
+        if ocx.flags.contains(FOLD) {
+            Fold::run(ocx, fid);
+        }
+        if ocx.flags.contains(SWITCH) {
+            OptSwitch::run(ocx, fid);
+        }
+        if ocx.flags.contains(LOOP) {
+            OptLoop::run(ocx, fid);
+        }
+        if ocx.flags.contains(PHI) {
+            OptPhi::run(ocx, fid);
+        }
+        if ocx.flags.contains(GOTO) {
+            OptGoto::run(ocx, fid);
+        }
+    }
+}
+
 // TODO: replace this with a sparse hash?
 fn irsize(ir: &IR) -> usize {
-    let size: usize =ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum();
+    let size: usize = ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum();
     size + 37*ir.funcs.raw.len()
 }
 
@@ -90,23 +117,7 @@ impl Stage for Optimize {
         let mut size = irsize(&ocx.ir);
         ocx.freeze_graph(|ocx| {
             for i in 0..MAX_ITER {
-                for fid in index::iter_span(ocx.ir.funcs.end()) {
-                    if ocx.flags.contains(OptFlag::FOLD) {
-                        Fold::run(ocx, fid);
-                    }
-                    if ocx.flags.contains(OptFlag::LOOP) {
-                        OptLoop::run(ocx, fid);
-                    }
-                    if ocx.flags.contains(OptFlag::PHI) {
-                        OptPhi::run(ocx, fid);
-                    }
-                    if ocx.flags.contains(OptFlag::GOTO) {
-                        OptGoto::run(ocx, fid);
-                    }
-                }
-                if ocx.flags.contains(OptFlag::INLINE) {
-                    Inline::run(ocx);
-                }
+                optimize(ocx);
                 let newsize = irsize(&ocx.ir);
                 if size == newsize {
                     trace!(OPTIMIZE "converged in {} iterations", i+1);

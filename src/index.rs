@@ -149,7 +149,7 @@ impl<I: Index, T> DerefMut for IndexVec<I, T> {
     }
 }
 
-#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[derive(Clone, Copy, Eq, PartialEq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct IndexOption<I: Index+InvalidValue> {
     pub raw: I

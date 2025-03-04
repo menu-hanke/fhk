@@ -11,7 +11,7 @@ use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::hash::fxhash;
 use crate::index::{IndexOption, IndexVec};
-use crate::ir::{Func, FuncId, Ins, InsId, Opcode, Type};
+use crate::ir::{ins_matches, Func, FuncId, Ins, InsId, Opcode, Type};
 use crate::optimize::{FuncPass, Ocx, Optimize};
 use crate::typestate::{Absent, Access, R};
 
@@ -30,27 +30,6 @@ enum FoldStatus {
     Again(Ins),
     New(InsId),
     // Old(InsId)
-}
-
-macro_rules! ipat {
-    ($code:expr, $value:expr; _) => {
-        true
-    };
-    ($code:expr, $value:expr; const) => {
-        $code.raw[$value as usize].opcode().is_const()
-    };
-    ($code:expr, $value:expr; $kint:literal) => {
-        {
-            let ins = $code.raw[$value as usize];
-            ins.opcode() == Opcode::KINT && $kint == ins.bc() as _
-        }
-    }
-}
-
-macro_rules! imatch {
-    ($code:expr, $ins:expr; $a:tt $($b:tt $($c:tt)? )? ) => {
-        ipat!($code, $ins.a(); $a) $( && ipat!($code, $ins.b(); $b) $( && ipat!($code, $ins.c(); $c) )?)?
-    };
 }
 
 fn kintvalue(fcx: &Fcx, ins: Ins) -> i64 {
@@ -153,7 +132,7 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
     use Opcode::*;
     let opt = &mut *fcx.data;
     let code = &opt.fold.code;
-    macro_rules! m { ($($p:tt)*) => { imatch!(code, ins; $($p)*) }; }
+    macro_rules! m { ($($p:tt)*) => { ins_matches!(code, ins; _ $($p)*) }; }
     let op = ins.opcode();
     match op {
 
