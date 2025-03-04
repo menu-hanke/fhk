@@ -245,6 +245,11 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             FoldStatus::Done(Ins::GOTO(if value == Ins::KINT(Type::B1, 0) { right } else { left }))
         },
 
+        // eliminate IF if both branches are the same
+        IF if ins.b() == ins.c() => {
+            FoldStatus::Done(Ins::GOTO(zerocopy::transmute!(ins.b())))
+        },
+
         _ => FoldStatus::Done(ins)
     }
 }
