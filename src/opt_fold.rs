@@ -192,6 +192,17 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         // x*0 = 0
         MUL if m!(_ 0) && !ins.type_().is_fp() => FoldStatus::Done(Ins::KINT(ins.type_(), 0)),
 
+        // POW identities valid for all x, including nan,±inf,0:
+        //   1^x = x^0 = 1
+        //   x^1 = x
+        POW if m!(1) || m!(_ 0) => FoldStatus::Done(Ins::KINT(ins.type_(), 1)),
+        POW if m!(_ 1) => FoldStatus::New(ins.decode_V()),
+
+        // x^2 = x*x
+        // TODO: more generally, fold x^n = x*x*...*x (this requires a small refactoring because
+        // we need to produce multiple instructions)
+        POW if m!(_ 2) => FoldStatus::Again(Ins::MUL(ins.type_(), ins.decode_V(), ins.decode_V())),
+
         // fold constant negation
         NEG if m!(const) => {
             let operand = code[ins.decode_V()];
