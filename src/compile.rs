@@ -114,7 +114,7 @@ impl Ccx<Absent> {
         debug_assert!(global_str == IRef::small_from_end_size(6, 6));
         intern.write(&(Token::Ident as u8));
         intern.write(global_str.as_bytes()); // must be unaligned
-        let global_seq = intern.intern_consume_from(BumpRef::from_offset(6));
+        let global_seq = intern.intern_consume_from(BumpRef::from_ptr(6));
         debug_assert!(global_seq == Self::SEQ_GLOBAL);
         Self {
             host,

@@ -110,7 +110,7 @@ impl MCode {
 
     #[cfg(target_arch="x86_64")]
     pub fn align_code(&mut self) {
-        let mut need = (-(self.code.end().offset() as isize) as usize) & (FUNC_ALIGN as usize - 1);
+        let mut need = (-(self.code.end().ptr() as isize) as usize) & (FUNC_ALIGN as usize - 1);
         loop {
             // NOP encodings yoinked from cranelift
             match need {

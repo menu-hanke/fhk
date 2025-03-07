@@ -22,7 +22,7 @@ fn scan(bump: &mut Bump<InsId>, ctr: BumpRef<ControlInfo>, code: &IndexSlice<Ins
             bump.push(id);
         } else if ins.opcode().is_control() {
             let idx: usize = id.into();
-            bump[ctr.add_size(idx as _)] = Default::default();
+            bump[ctr.offset(idx as _)] = Default::default();
         }
     }
 }
@@ -50,8 +50,8 @@ fn markpins(
     code: &IndexSlice<InsId, Ins>
 ) {
     for i in 0..npin {
-        let p: usize = code[bump[pin.add_size(i as _)]].decode_C().into();
-        bump[ctr.add_size(p as _)] |= PIN;
+        let p: usize = code[bump[pin.offset(i as _)]].decode_C().into();
+        bump[ctr.offset(p as _)] |= PIN;
     }
 }
 
@@ -127,7 +127,7 @@ impl FuncPass for OptGoto {
         let (ctr_ptr, _) = ccx.tmp.reserve_dst::<IndexSlice<InsId, ControlInfo>>(ncode);
         let pins_base = ccx.tmp.end().cast_up::<InsId>();
         scan(ccx.tmp.align_for(), ctr_ptr.cast(), code);
-        let npin = ccx.tmp.end().cast::<InsId>().size_index() - pins_base.size_index();
+        let npin = ccx.tmp.end().cast::<InsId>().index() - pins_base.index();
         visitpred(ccx.tmp.get_dst_mut(ctr_ptr, ncode), code, func.entry);
         markpins(&mut ccx.tmp, ctr_ptr.cast(), pins_base, npin, code);
         visitelim(ccx.tmp.get_dst_mut(ctr_ptr, ncode), code, func.entry);

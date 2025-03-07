@@ -536,7 +536,7 @@ fn emitres(ecx: &mut Ecx, id: InsId) -> InsValue {
     let emit = &*ecx.data;
     let (call, idx, _) = emit.code[id].decode_LOVX();
     let res: BumpRef<InsValue> = zerocopy::transmute!(emit.values[call].raw);
-    emit.bump[res.add_size(idx as _)]
+    emit.bump[res.offset(idx as _)]
 }
 
 /* ---- Runtime ------------------------------------------------------------- */

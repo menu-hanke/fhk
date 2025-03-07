@@ -90,7 +90,7 @@ impl<T: ?Sized> IRef<T> {
 impl<T: ?Sized + Aligned> IRef<T> {
 
     pub fn to_bump_sized(self, size: usize) -> BumpRef<T> {
-        BumpRef::from_offset(self.0.end() as usize - size)
+        BumpRef::from_ptr(self.0.end() as usize - size)
     }
 
     // pub fn to_bump_small_unchecked(self) -> BumpRef<T> {
@@ -197,7 +197,7 @@ fn writebigsize(data: &mut Bump<u8>, mut len: usize) -> u32 {
 }
 
 fn newref(bump: &mut Bump<u8>, len: usize) -> RawRef {
-    let end = bump.end().offset() as _;
+    let end = bump.end().ptr() as _;
     let size = if len <= RawRef::MAX_SMALL as _ {
         len as _
     } else {
@@ -268,7 +268,7 @@ impl Intern {
         IRef(match unsafe { entry(&mut self.tab, bytes, &bytes[start..end], 1) } {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
-                self.bump.write_range::<u8>(BumpRef::from_offset(start)..BumpRef::from_offset(end));
+                self.bump.write_range::<u8>(BumpRef::from_ptr(start)..BumpRef::from_ptr(end));
                 *e.insert(newref(&mut self.bump, end-start)).get()
             }
         }, PhantomData)
@@ -281,14 +281,14 @@ impl Intern {
     pub fn get<T>(&self, r: IRef<T>) -> &T
         where T: ?Sized + Aligned + bump::Get
     {
-        &self.bump[BumpRef::from_offset(refrange(self.bump.as_slice(), r.0).start)]
+        &self.bump[BumpRef::from_ptr(refrange(self.bump.as_slice(), r.0).start)]
     }
 
     pub fn get_slice<T>(&self, r: IRef<[T]>) -> &[T]
         where T: bump::FromBytes + bump::Immutable
     {
         let Range { start, end } = refrange(self.bump.as_slice(), r.0);
-        &self.bump[BumpRef::from_offset(start)..BumpRef::from_offset(end)]
+        &self.bump[BumpRef::from_ptr(start)..BumpRef::from_ptr(end)]
     }
 
     pub fn bump(&self) -> &Bump {
@@ -311,7 +311,7 @@ impl Intern {
     // monomorphization
     pub fn write_ref(&mut self, r: IRef<[u8]>) {
         let Range { start, end } = self.get_range(r);
-        self.bump.write_range::<u8>(BumpRef::from_offset(start)..BumpRef::from_offset(end));
+        self.bump.write_range::<u8>(BumpRef::from_ptr(start)..BumpRef::from_ptr(end));
     }
 
     pub fn reserve_dst<T>(&mut self, len: usize) -> &mut T
@@ -334,7 +334,7 @@ impl Intern {
                 IRef(*e.get(), PhantomData)
             },
             Entry::Vacant(e) => {
-                let len = self.bump.end().offset() - cursor.offset();
+                let len = self.bump.end().ptr() - cursor.ptr();
                 let r = newref(&mut self.bump, len);
                 self.base = cursor;
                 IRef(*e.insert(r).get(), PhantomData)

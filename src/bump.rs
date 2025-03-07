@@ -111,28 +111,16 @@ impl<T: ?Sized> BumpRef<T> {
         Self(0, PhantomData)
     }
 
-    pub fn from_align_index(idx: u32) -> Self {
-        Self(idx, PhantomData)
-    }
-
-    pub fn align_index(self) -> usize {
-        self.0 as _
-    }
-
-    pub fn add_align(self, offset: isize) -> Self {
-        Self::from_align_index((self.0 as isize + offset) as _)
-    }
-
 }
 
 impl<T: Aligned> BumpRef<T> {
 
-    pub fn size_index(self) -> usize {
-        self.align_index() * T::ALIGN / size_of::<T>()
+    pub fn index(self) -> usize {
+        (self.0 as usize) * T::ALIGN / size_of::<T>()
     }
 
-    pub fn add_size(self, offset: isize) -> Self {
-        self.add_align(offset * ((size_of::<T>() / T::ALIGN) as isize))
+    pub fn offset(self, offset: isize) -> Self {
+        Self(((self.0 as isize) + offset * ((size_of::<T>() / T::ALIGN) as isize)) as _, PhantomData)
     }
 
 }
@@ -148,11 +136,11 @@ impl<T: ?Sized + Aligned> BumpRef<T> {
         BumpRef((self.0 * T::ALIGN as u32 + U::ALIGN as u32 - 1) / U::ALIGN as u32, PhantomData)
     }
 
-    pub fn from_offset(ofs: usize) -> Self {
+    pub fn from_ptr(ofs: usize) -> Self {
         Self((ofs/T::ALIGN) as u32, PhantomData)
     }
 
-    pub fn offset(self) -> usize {
+    pub fn ptr(self) -> usize {
         self.0 as usize * T::ALIGN
     }
 
@@ -411,11 +399,11 @@ impl<W: Aligned> Bump<W> {
         where T: FromBytes + IntoBytes
     {
         let Range { start, end } = range;
-        let len = end.size_index() - start.size_index();
+        let len = end.index() - start.index();
         let (ptr, data) = self.reserve_dst::<[T]>(len);
         let data = data as *mut [T] as *mut T;
         unsafe {
-            let src = self.ptr.as_ptr().cast::<T>().add(start.size_index());
+            let src = self.ptr.as_ptr().cast::<T>().add(start.index());
             core::ptr::copy_nonoverlapping(src, data, len);
         }
         ptr.cast()
@@ -485,7 +473,7 @@ impl Bump {
     }
 
     pub fn truncate<T: ?Sized + Aligned>(&mut self, end: BumpRef<T>) {
-        let len = end.offset() as u32;
+        let len = end.ptr() as u32;
         assert!(len <= self.len);
         self.len = len;
     }
@@ -525,7 +513,7 @@ impl<T> Get for T
     where T: FromBytes + Immutable
 {
     fn get(BumpPtr(buf): &BumpPtr, ptr: BumpRef<Self>) -> &Self {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         assert!(ofs + size_of::<T>() <= buf.len());
         unsafe { &*buf.as_ptr().add(ofs).cast() }
     }
@@ -535,7 +523,7 @@ impl<T> GetMut for T
     where T: FromBytes + IntoBytes
 {
     fn get_mut(BumpPtr(buf): &mut BumpPtr, ptr: BumpRef<Self>) -> &mut Self {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         assert!(ofs + size_of::<T>() <= buf.len());
         unsafe { &mut *buf.as_mut_ptr().add(ofs).cast() }
     }
@@ -568,7 +556,7 @@ impl BumpPtr {
               T::Head: FromBytes + Immutable,
               T::Item: FromBytes + Immutable
     {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         let buf = &self.0;
         assert!(ofs + size_of_dst::<T>(num) <= buf.len());
         let ptr = T::ptr_from_raw_parts(unsafe { buf.as_ptr().add(ofs).cast() }, num);
@@ -580,7 +568,7 @@ impl BumpPtr {
               T::Head: FromBytes + IntoBytes,
               T::Item: FromBytes + IntoBytes
     {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         let buf = &mut self.0;
         assert!(ofs + size_of_dst::<T>(num) <= buf.len());
         let ptr = T::ptr_from_raw_parts(unsafe { buf.as_mut_ptr().add(ofs) as _ }, num) as *mut _;
@@ -640,7 +628,7 @@ impl<'a, const K: usize> GetManyMut<'a, K> {
     pub fn get_mut<T>(&mut self, ptr: BumpRef<T>) -> &'a mut T
         where T: FromBytes + IntoBytes
     {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         self.reserve_range(ofs as u32 .. (ofs + size_of::<T>()) as u32);
         unsafe { &mut *(self.buf as *mut u8).add(ofs).cast() }
     }
@@ -650,7 +638,7 @@ impl<'a, const K: usize> GetManyMut<'a, K> {
               T::Head: FromBytes + IntoBytes,
               T::Item: FromBytes + IntoBytes
     {
-        let ofs = ptr.offset();
+        let ofs = ptr.ptr();
         self.reserve_range(ofs as u32 .. (ofs + size_of_dst::<T>(num)) as u32);
         let ptr = T::ptr_from_raw_parts(unsafe { (self.buf as *mut u8).add(ofs) as _ }, num) as *mut _;
         unsafe { &mut *ptr }
@@ -696,7 +684,7 @@ impl<T> core::ops::Index<Range<BumpRef<T>>> for BumpPtr
     type Output = [T];
     fn index(&self, index: Range<BumpRef<T>>) -> &[T] {
         assert_type_alignment::<T>();
-        let mem: &[u8] = &self.as_slice()[index.start.offset()..index.end.offset()];
+        let mem: &[u8] = &self.as_slice()[index.start.ptr()..index.end.ptr()];
         unsafe { transmute_slice(mem) }
     }
 }
@@ -706,7 +694,7 @@ impl<T> core::ops::IndexMut<Range<BumpRef<T>>> for BumpPtr
 {
     fn index_mut(&mut self, index: Range<BumpRef<T>>) -> &mut [T] {
         assert_type_alignment::<T>();
-        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.offset()..index.end.offset()];
+        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.ptr()..index.end.ptr()];
         unsafe { transmute_slice_mut(mem) }
     }
 }
@@ -717,7 +705,7 @@ impl<T> core::ops::Index<RangeFrom<BumpRef<T>>> for BumpPtr
     type Output = [T];
     fn index(&self, index: RangeFrom<BumpRef<T>>) -> &[T] {
         assert_type_alignment::<T>();
-        let mem: &[u8] = &self.as_slice()[index.start.offset()..];
+        let mem: &[u8] = &self.as_slice()[index.start.ptr()..];
         unsafe { transmute_slice(mem) }
     }
 }
@@ -727,7 +715,7 @@ impl<T> core::ops::IndexMut<RangeFrom<BumpRef<T>>> for BumpPtr
 {
     fn index_mut(&mut self, index: RangeFrom<BumpRef<T>>) -> &mut [T] {
         assert_type_alignment::<T>();
-        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.offset()..];
+        let mem: &mut [u8] = &mut self.as_mut_slice()[index.start.ptr()..];
         unsafe { transmute_slice_mut(mem) }
     }
 }
@@ -850,10 +838,7 @@ macro_rules! vla_struct {
     };
 }
 
-use logos::Source;
 pub(crate) use vla_struct;
-
-use crate::index::{self, IndexSlice};
 
 /* ---- Containers ---------------------------------------------------------- */
 
@@ -942,8 +927,8 @@ impl<T> BumpVec<T> {
         let (newdata, _) = bump.reserve_dst::<[T]>(cap as _);
         let have = self.len();
         if have > 0 {
-            let (old, new) = bump.as_mut_slice::<u8>().split_at_mut(newdata.offset());
-            let base = self.base().offset();
+            let (old, new) = bump.as_mut_slice::<u8>().split_at_mut(newdata.ptr());
+            let base = self.base().ptr();
             let havebytes = have as usize * size_of::<T>();
             new[..havebytes].copy_from_slice(&old[base..base+havebytes]);
         }
@@ -971,7 +956,7 @@ impl<T> BumpVec<T> {
             self.grow(bump, idx + 1);
         }
         self.raw.data.len = idx+1;
-        bump[self.base().add_size(idx as _)] = value;
+        bump[self.base().offset(idx as _)] = value;
     }
 
     pub fn truncate(&mut self, len: u32) {

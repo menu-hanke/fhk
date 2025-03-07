@@ -48,13 +48,13 @@ fn eliminate(
     start: usize,
 ) {
     for i in 0..start {
-        bump[new.add_size(i as _)] = Some(i.into()).into();
+        bump[new.offset(i as _)] = Some(i.into()).into();
     }
     let mut cursor: PhiId = start.into();
     for i in start..phis.end().into() {
-        let PhiInfo { read, write } = bump[info.add_size(i as _)];
+        let PhiInfo { read, write } = bump[info.offset(i as _)];
         phis[cursor] = phis[i.into()];
-        bump[new.add_size(i as _)] = if read == 0 || write < MANY_VALUES {
+        bump[new.offset(i as _)] = if read == 0 || write < MANY_VALUES {
             None
         } else {
             let v = Some(cursor);

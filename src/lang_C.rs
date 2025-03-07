@@ -280,7 +280,7 @@ fn dumpstruct(pcx: &mut Pcx, ps: &mut ParseState, layout: AllocLayout, base: u32
         let Field { ofs, data, tag } = ps.fields.as_slice(&pcx.tmp)[i as usize];
         if tag == TAG_OUTPUT_SCALAR {
             let o: &mut ScalarOutput = zerocopy::transmute_mut!(
-                &mut pcx.tmp[ps.outputs.add_size(data as _)]
+                &mut pcx.tmp[ps.outputs.offset(data as _)]
             );
             debug_assert!(o.ofs == 0);
             o.ofs = offset + ofs;
@@ -351,7 +351,7 @@ fn parse_out(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     Ok(match dim {
         0 => {
             let o: &mut ScalarOutput = zerocopy::transmute_mut!(
-                &mut pcx.tmp[ps.outputs.add_size(idx as _)]);
+                &mut pcx.tmp[ps.outputs.offset(idx as _)]);
             o.tag = Output::SCALAR;
             o.pri = ctype.primitive() as _;
             let indir = ctype.indir();
@@ -520,7 +520,7 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
             todo!()
         }
         let o: &mut ReturnOutput = zerocopy::transmute_mut!(
-            &mut pcx.tmp[ps.outputs.add_size(idx as _)]);
+            &mut pcx.tmp[ps.outputs.offset(idx as _)]);
         o.tag = Output::RETURN;
         o.pri = ret.primitive() as _;
         ps.need.clear(idx);
@@ -546,7 +546,7 @@ fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALLX> {
         let args = pcx.perm.write(ps.args.as_slice(&pcx.tmp));
         let stores = pcx.perm.write(ps.stores.as_slice(&pcx.tmp));
         let inputs = pcx.perm.write(ps.inputs_ctype.as_slice(&pcx.tmp));
-        let outputs = pcx.perm.write(&pcx.tmp[ps.outputs..ps.outputs.add_size(ps.n as _)]);
+        let outputs = pcx.perm.write(&pcx.tmp[ps.outputs..ps.outputs.offset(ps.n as _)]);
         pcx.perm.write(&Call {
             func,
             args: args.cast(),
@@ -579,14 +579,14 @@ struct LowerState {
 fn lower_value(lower: &LowerState, tmp: &BumpPtr, func: &Func, value: Value) -> InsId {
     match value.unpack() {
         (idx, TAG_INPUT) => {
-            tmp[lower.inputs.add_size(idx as _)]
+            tmp[lower.inputs.offset(idx as _)]
         },
         (ofs, TAG_OFFSET) => {
             let ofs = func.code.push(Ins::KINT(Type::I64, ofs as _));
             func.code.push(Ins::ADDP(lower.alloc, ofs))
         },
         (idx, _ /* TAG_OUTPUT_TENSOR */) => {
-            tmp[lower.outputs.add_size(idx as _)]
+            tmp[lower.outputs.offset(idx as _)]
         }
     }
 }
@@ -614,7 +614,7 @@ fn lower_call(
     let inputs_conv = {
         let (iref, iptr) = lcx.tmp.reserve_dst::<[InsId]>(inputs.len());
         for ((&iexpr, &ctype), (&input, ip)) in zip(
-            zip(&callx.inputs, &lcx.perm[call.inputs..call.inputs.add_size(inputs.len() as _)]),
+            zip(&callx.inputs, &lcx.perm[call.inputs..call.inputs.offset(inputs.len() as _)]),
             zip(inputs, iptr)
         ) {
             if ctype != CType::VOID_PTR {
@@ -655,7 +655,7 @@ fn lower_call(
     let outputs = {
         let (outputs, optr) = lcx.tmp.reserve_dst::<[InsId]>(call.nout as _);
         let mut cursor = outbase;
-        for (o, op) in zip(&lcx.perm[call.outputs..call.outputs.add_size(call.nout as _)], optr) {
+        for (o, op) in zip(&lcx.perm[call.outputs..call.outputs.offset(call.nout as _)], optr) {
             match o.tag {
                 Output::SCALAR => {
                     let o: &ScalarOutput = zerocopy::transmute_ref!(o);
@@ -706,14 +706,14 @@ fn lower_call(
         alloc
     };
     let mut args = func.code.push(Ins::NOP(Type::LSV));
-    for store in &lcx.perm[call.stores..call.stores.add_size(call.nstore as _)] {
+    for store in &lcx.perm[call.stores..call.stores.offset(call.nstore as _)] {
         let value = lower_value(&lower, &lcx.tmp, func, store.value);
         let ofs = func.code.push(Ins::KINT(Type::I64, store.ofs as _));
         let ptr = func.code.push(Ins::ADDP(alloc, ofs));
         let fx = func.code.push(Ins::STORE(ptr, value));
         args = func.code.push(Ins::MOVF(Type::FX, args, fx));
     }
-    for &arg in lcx.perm[call.args..call.args.add_size(call.narg as _)].iter().rev() {
+    for &arg in lcx.perm[call.args..call.args.offset(call.narg as _)].iter().rev() {
         let value = lower_value(&lower, &lcx.tmp, func, arg);
         args = func.code.push(Ins::CARG(args, value));
     }

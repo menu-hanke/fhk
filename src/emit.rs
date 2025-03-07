@@ -496,7 +496,7 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
 }
 
 fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
-    let loc = mcode.code.end().offset() as MCodeOffset;
+    let loc = mcode.code.end().ptr() as MCodeOffset;
     mcode.code.write(buf);
     mcode.align_code();
     if trace!(MCODE) {

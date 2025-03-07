@@ -491,7 +491,7 @@ pub struct Objects {
 }
 
 fn fixupn(bump: &mut Bump<u32>, start: ObjRef) {
-    bump[start.raw].n = (bump.end().align_index() - start.raw.align_index()) as _;
+    bump[start.raw].n = (bump.end().index() - start.raw.cast::<u32>().index()) as _;
 }
 
 fn pushobj<T>(bump: &mut Bump<u32>, obj: T) -> ObjRef<T>
@@ -552,13 +552,15 @@ impl Objects {
     pub fn get_raw(&self, idx: ObjRef) -> &[u32] {
         let o = self.bump[idx.raw];
         checkvalidobj(o);
-        &self.bump.as_slice()[idx.raw.align_index() .. idx.raw.align_index() + o.n as usize]
+        let raw = idx.raw.cast();
+        &self.bump[raw..raw.offset(o.n as _)]
     }
 
     pub fn get_raw_mut(&mut self, idx: ObjRef) -> &mut [u32] {
         let o = self.bump[idx.raw];
         checkvalidobj(o);
-        &mut self.bump.as_mut_slice()[idx.raw.align_index() .. idx.raw.align_index() + o.n as usize]
+        let raw = idx.raw.cast();
+        &mut self.bump[raw..raw.offset(o.n as _)]
     }
 
     pub fn end(&self) -> ObjRef {
@@ -678,9 +680,9 @@ impl Objects {
     pub fn next(&self, idx: ObjRef) -> Option<ObjRef> {
         let o = self.bump[idx.raw];
         checkvalidobj(o);
-        let raw = idx.raw.add_align(o.n as _);
-        if raw.align_index() < self.bump.end().align_index() {
-            Some(ObjRef { raw })
+        let raw = idx.raw.cast::<u32>().offset(o.n as _);
+        if raw < self.bump.end() {
+            Some(ObjRef { raw: raw.cast() })
         } else {
             None
         }
@@ -705,8 +707,8 @@ fn entry<'lookup, 'data>(
 ) -> Entry<'lookup, ObjRef> {
     lookup.entry(
         fxhash(key),
-        |idx| lookupkey(data, idx.raw.align_index()) == key,
-        |idx| fxhash(lookupkey(data, idx.raw.align_index()))
+        |idx| lookupkey(data, idx.raw.cast::<u32>().index()) == key,
+        |idx| fxhash(lookupkey(data, idx.raw.cast::<u32>().index()))
     )
 }
 

@@ -304,10 +304,10 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
         let (_, _, f) = ccx.ir.funcs[fid].code.at(ccx.tmp[call]).decode_CALLC();
         match visitinline(ccx, f) {
             InlineState::Yes => {
-                call = call.add_size(1);
+                call = call.offset(1);
             },
             InlineState::No => {
-                end = end.add_size(-1);
+                end = end.offset(-1);
                 ccx.tmp[call] = ccx.tmp[end];
             },
             _ => unreachable!()
@@ -316,7 +316,7 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     let (start, end) = (base.cast_up::<InsId>(), call);
     // perform inline
     if end > start {
-        cost -= (end.size_index()-start.size_index()) as u32 * execcost(Opcode::CALLC);
+        cost -= (end.index()-start.index()) as u32 * execcost(Opcode::CALLC);
         inlinecalls(ccx, fid, start..end, &mut cost);
     }
     ccx.tmp.truncate(base);

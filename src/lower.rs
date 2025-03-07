@@ -403,9 +403,9 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         lower.bump[var].n = vn+1;
         lower.bump[
             var.cast::<Var<()>>()
-                .add_size(1)
+                .offset(1)
                 .cast::<BumpRef<VSet>>()
-                .add_size(vn as _)
+                .offset(vn as _)
         ] = ptr;
         // note: for var definitions we don't actually need the last dimension sizes (at least for
         // PREFIX models), but they are included here for simpler codegen when forwarding to the
@@ -1510,7 +1510,7 @@ fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<IdxS
                 for (i, &v) in fidx.iter().enumerate() {
                     if nil && v.is_nil() {
                         debug_assert!(span == 0);
-                        let top = buf.end().add_size(-1);
+                        let top = buf.end().offset(-1);
                         buf[top].idx.span += 1;
                         continue
                     }
@@ -1600,14 +1600,14 @@ fn vgetidxvalue(lcx: &mut Lcx, ctr: &mut InsId, base: BumpRef<IdxStruct>) {
             if first_vsplat > lcx.tmp[i].oaxis {
                 // first group is rectangular, so it only needs to be iterated once.
                 // don't emitvalue here, use emititer later instead.
-                i = i.add_size(1);
+                i = i.offset(1);
                 continue;
             }
         }
         if !expr.is_nil() {
             lcx.tmp[i].value = Some(emitvalue(lcx, ctr, expr)).into();
         }
-        i = i.add_size(1);
+        i = i.offset(1);
     }
 }
 
@@ -1714,7 +1714,7 @@ fn emitvgetidx(lcx: &mut Lcx, mut ctr: ControlFlow, vget: &VGET) -> InsId {
                 lcx.data.func.code.push(Ins::ADD(IRT_IDX, baseflat, j))
             }
         };
-        i = i.add_size(1);
+        i = i.offset(1);
     }
     lcx.tmp.truncate(base);
     flat
@@ -1736,13 +1736,13 @@ fn vgetshape(
     let mut prefix: IndexOption<InsId> = None.into();
     while idx > base {
         let mut tail = idx;
-        idx = idx.add_size(-1);
-        while idx > base && lcx.tmp[idx].oaxis == lcx.tmp[tail.add_size(-1)].oaxis {
-            idx = idx.add_size(-1);
+        idx = idx.offset(-1);
+        while idx > base && lcx.tmp[idx].oaxis == lcx.tmp[tail.offset(-1)].oaxis {
+            idx = idx.offset(-1);
         }
         let mut len: IndexOption<InsId> = None.into();
         while tail > idx {
-            tail = tail.add_size(-1);
+            tail = tail.offset(-1);
             // rectangularity should be checked earlier (TODO)
             debug_assert!((lcx.tmp[tail].flags & IdxStruct::SCALAR_VALUE != 0) || prefix.is_none());
             let num = match lcx.tmp[tail] {
@@ -1778,7 +1778,7 @@ fn vgetshape(
                     let mut innerloop: Option<(/*init:*/ InsId, /*start:*/ Ins, /*out:*/ InsId)>
                         = None;
                     while tail > idx {
-                        tail = tail.add_size(-1);
+                        tail = tail.offset(-1);
                         let [nextflat] = areserve(&lcx.data.func);
                         let j = match lcx.tmp[tail] {
                             IdxStruct { flags, value, idx: IdxExpr  { axis, span, ..}, .. }
@@ -1934,7 +1934,7 @@ fn vgetrect(
     let mut idx = idx_end;
     let mut inner: Option<(/*init:*/ InsId, /*value:*/ InsId)> = None;
     while idx > idx_base {
-        idx = idx.add_size(-1);
+        idx = idx.offset(-1);
         let [nextflat] = areserve(&lcx.data.func);
         let j = match lcx.tmp[idx] {
             IdxStruct { flags, value, idx: IdxExpr { axis, span, .. }, .. }
@@ -1945,8 +1945,8 @@ fn vgetrect(
             },
             IdxStruct { value, idx: IdxExpr { expr, mut span, mut axis, .. }, .. } => {
                 if expr.is_nil() {
-                    while idx > idx_base && lcx.tmp[idx.add_size(-1)].idx.expr.is_nil() {
-                        idx = idx.add_size(-1);
+                    while idx > idx_base && lcx.tmp[idx.offset(-1)].idx.expr.is_nil() {
+                        idx = idx.offset(-1);
                         span += lcx.tmp[idx].idx.span;
                         axis = lcx.tmp[idx].idx.axis;
                     }
@@ -2447,7 +2447,7 @@ fn emitvgetcheck(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET, fail: InsId) {
                 }
             }
         };
-        i = i.add_size(1);
+        i = i.offset(1);
     }
     let inline = isdisjointidx(&bump[lcx.data.tab], &bump[bump[var].tab], &vget.idx);
     match loop_ {

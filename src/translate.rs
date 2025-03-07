@@ -61,12 +61,12 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
                 },
                 FuncKind::Query(Query { offsets, .. }) => {
                     let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
-                    let ofs = ecx.perm[offsets.add_size(phi as _)];
+                    let ofs = ecx.perm[offsets.offset(phi as _)];
                     emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
                 },
                 FuncKind::Chunk(Chunk { scl, slots, .. }) => {
                     let vmctx = emit.fb.vmctx();
-                    let slot = ecx.perm[slots.add_size(phi as _)];
+                    let slot = ecx.perm[slots.offset(phi as _)];
                     storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
                 }
             }
@@ -422,7 +422,7 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
             debug_assert!(ecx.ir.funcs[chunk].phis.at(phi).type_ == ty);
             let vmctx = emit.fb.vmctx();
             let phi: usize = phi.into();
-            loadslot(emit, vmctx, emit.values[idx].value(), scl, ecx.perm[slots.add_size(phi as _)], ty)
+            loadslot(emit, vmctx, emit.values[idx].value(), scl, ecx.perm[slots.offset(phi as _)], ty)
         },
         _ => unreachable!()
     };
