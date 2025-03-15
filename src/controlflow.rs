@@ -4,11 +4,12 @@ use core::cmp::Ordering;
 use core::iter::zip;
 use core::ops::Range;
 
+use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
 
 use crate::bitmap::{BitMatrix, BitmapVec, Bitmap};
-use crate::dataflow::{Dataflow, DataflowSystem};
-use crate::index::{self, index, IndexSet, IndexSlice, IndexVec, InvalidValue};
+use crate::graph::{Graph, GraphPtr};
+use crate::index::{self, index, Index, IndexSet, IndexSlice, IndexVec, InvalidValue};
 use crate::ir::{Func, Ins, InsId, Opcode};
 
 /* ---- Control flow graph -------------------------------------------------- */
@@ -98,7 +99,7 @@ fn placeins(
 
 fn compute_cfg(
     code: &IndexSlice<InsId, Ins>,
-    cfg: &mut Dataflow<BlockId>,
+    cfg: &mut Graph<BlockId>,
     blocks: &IndexSlice<BlockId, InsId>,
     inst: &mut IndexVec<InsId, Range<u16>>,
     place: &mut Vec<BlockId>
@@ -106,17 +107,15 @@ fn compute_cfg(
     for (block, &ctr) in blocks.pairs() {
         placeins1(inst, place, ctr, block);
     }
-    cfg.clear();
-    for &ctr in &blocks.raw {
-        cfg.push();
-        cfg.raw_inputs().extend(
+    for (block, &ctr) in blocks.pairs() {
+        cfg.add_inputs_iter(
+            block,
             code[ctr]
             .controls()
             .iter()
             .map(|&id| place[inst[id].start as usize])
         );
     }
-    cfg.compute_uses();
 }
 
 fn lca(idom: &IndexSlice<BlockId, BlockId>, mut a: BlockId, mut b: BlockId) -> BlockId {
@@ -141,25 +140,21 @@ pub fn dom(idom: &IndexSlice<BlockId, BlockId>, a: BlockId, mut b: BlockId) -> b
 
 // "A Simple, Fast Dominance Algorithm", KD Cooper
 // [https://www.cs.tufts.edu/comp/150FP/archive/keith-cooper/dom14.pdf]
-fn compute_domtree(cfg: &Dataflow<BlockId>, idom: &mut IndexSlice<BlockId, BlockId>) {
-    idom.raw.fill(BlockId::INVALID.into());
-    idom[BlockId::START] = BlockId::START;
+fn compute_domtree(cfg: &GraphPtr<BlockId>, idom: &mut IndexSlice<BlockId, BlockId>) {
+    for (id, dom) in idom.pairs_mut() {
+        *dom = cfg.uses(id).get(0).cloned().unwrap_or(BlockId::START);
+    }
     loop {
         let mut fixpoint = true;
         for id in index::iter_range(1.into()..idom.end()) {
-            let mut new_idom = BlockId::INVALID.into();
-            for &pred in cfg.uses(id) {
-                if idom[pred] != BlockId::INVALID.into() {
-                    if new_idom == BlockId::INVALID.into() {
-                        new_idom = pred;
-                    } else {
-                        new_idom = lca(idom, pred, new_idom);
-                    }
+            if let &[mut new_idom, ref rest@..] = cfg.uses(id) {
+                for &p in rest {
+                    new_idom = lca(idom, p, new_idom);
                 }
-            }
-            if idom[id] != new_idom {
-                idom[id] = new_idom;
-                fixpoint = false;
+                if idom[id] != new_idom {
+                    idom[id] = new_idom;
+                    fixpoint = false;
+                }
             }
         }
         if fixpoint { break }
@@ -167,15 +162,56 @@ fn compute_domtree(cfg: &Dataflow<BlockId>, idom: &mut IndexSlice<BlockId, Block
     debug_assert!(idom.pairs().all(|(i,&d)| d <= i));
 }
 
-/* ---- Dataflow graph ------------------------------------------------------ */
+/* ---- Dataflow systems ---------------------------------------------------- */
 
-fn compute_dfg(code: &[Ins], dfg: &mut Dataflow<InsId>) {
-    dfg.clear();
-    for &ins in code {
-        dfg.push();
-        dfg.raw_inputs().extend_from_slice(ins.inputs_and_controls());
+pub struct DataflowSystem<I: Index> {
+    worklist: VecDeque<I>,
+    queued: BitmapVec<I>
+}
+
+impl<I: Index> Default for DataflowSystem<I> {
+    fn default() -> Self {
+        Self {
+            worklist: Default::default(),
+            queued: Default::default()
+        }
     }
-    dfg.compute_uses();
+}
+
+impl<I: Index> DataflowSystem<I> {
+
+    pub fn resize(&mut self, end: I) {
+        self.worklist.clear();
+        self.queued.resize(end);
+        self.queued.clear_all();
+    }
+
+    pub fn queue(&mut self, node: I) {
+        if !self.queued.test_and_set(node) {
+            self.worklist.push_back(node);
+        }
+    }
+
+    pub fn queue_all(&mut self, end: I) {
+        for idx in index::iter_span(end) {
+            self.queue(idx);
+        }
+    }
+
+    pub fn queue_nodes(&mut self, nodes: &[I]) {
+        for &idx in nodes {
+            self.queue(idx);
+        }
+    }
+
+    pub fn poll(&mut self) -> Option<I> {
+        let idx = self.worklist.pop_front();
+        if let Some(i) = idx {
+            self.queued.clear(i);
+        }
+        idx
+    }
+
 }
 
 /* ---- Control matrices ---------------------------------------------------- */
@@ -243,12 +279,12 @@ fn addintersect(mat: &mut BitMatrix<InsId>, i: InsId, js: &[InsId], work: &mut B
 
 fn compute_cmat(
     code: &IndexSlice<InsId, Ins>,
-    dfg: &Dataflow<InsId>,
+    dfg: &GraphPtr<InsId>,
     solver: &mut DataflowSystem<InsId>,
     mat: &mut ControlMatrix,
     work: &mut BitmapVec
 ) {
-    let end = dfg.end();
+    let end = code.end();
     mat.resize(end, end);
     mat.clear_all();
     for i in index::iter_span(end) {
@@ -336,7 +372,7 @@ struct WorkIns {
 fn schedule_next(
     work_state: &mut Vec<WorkIns>,
     work_blocks: &mut Vec<BlockId>,
-    dfg: &Dataflow<InsId>,
+    dfg: &GraphPtr<InsId>,
     idom: &IndexSlice<BlockId, BlockId>,
     blocks: &IndexSlice<BlockId, InsId>,
     mat: &ControlMatrix,
@@ -409,8 +445,8 @@ fn schedule_next(
 // note that it does *not* determine the ordering among instructions in a basic block.
 #[derive(Default)]
 pub struct ControlFlow {
-    pub dfg: Dataflow<InsId>,
-    pub cfg: Dataflow<BlockId>,
+    pub dfg: Graph<InsId>,
+    pub cfg: Graph<BlockId>,
     pub idom: IndexVec<BlockId, BlockId>,
     pub code: IndexVec<InsId, Ins>,
     pub blocks: IndexVec<BlockId, InsId>,
@@ -440,9 +476,13 @@ impl ControlFlow {
     pub fn set_func(&mut self, func: &Func, mark: &mut IndexSet<InsId>) {
         func.code.swap_inner(&mut self.code);
         compute_blocks(&mut self.code, &mut self.blocks, mark, func.entry);
+        self.cfg.clear(self.blocks.end());
         debug_assert!(self.blocks.raw.len()
             == self.code.raw.iter().filter(|i| i.opcode().is_control()).count());
-        compute_dfg(&self.code.raw, &mut self.dfg);
+        self.dfg.clear(self.code.end());
+        for (id, ins) in self.code.pairs() {
+            self.dfg.add_inputs(id, ins.inputs_and_controls());
+        }
         compute_cmat(&self.code, &self.dfg, &mut self.solver, &mut self.cmat, &mut self.work_bitmap);
         //crate::trace::trace!(OPTIMIZE "control matrix:\n{:?}", &self.cmat);
         // by default all instructions are based outside basic blocks

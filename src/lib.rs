@@ -10,12 +10,12 @@ mod compile;
 mod concat;
 mod controlflow;
 mod data;
-mod dataflow;
 mod dl;
 mod dump;
 mod emit;
 mod err;
 mod finalize;
+mod graph;
 mod hash;
 mod image;
 mod index;
@@ -38,15 +38,13 @@ mod translate;
 mod typeinfer;
 mod typestate;
 mod typing;
+mod zerocopy_union;
 
 /* ---- Optimizer ----------------------------------------------------------- */
 
+mod opt_control;
 mod opt_fold;
-mod opt_goto;
 mod opt_inline;
-mod opt_loop;
-mod opt_phi;
-mod opt_switch;
 mod optimize;
 
 /* ---- Host support -------------------------------------------------------- */

@@ -88,6 +88,10 @@ impl<I: Index> Dataflow<I> {
         }
     }
 
+    pub fn remove_input(&mut self, node: I, input: I) {
+        todo!()
+    }
+
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.inputs.clear();

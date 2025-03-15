@@ -240,6 +240,8 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             FoldStatus::Done(Ins::GOTO(zerocopy::transmute!(ins.b())))
         },
 
+        // TODO: canonicalize IF (NE) tru fal -> IF (EQ) fal tru
+
         _ => FoldStatus::Done(ins)
     }
 }

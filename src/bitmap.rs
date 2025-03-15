@@ -176,6 +176,24 @@ impl<I: Index> Bitmap<I> {
 
 }
 
+impl<I: Index> core::ops::BitAndAssign<&Bitmap<I>> for Bitmap<I> {
+    fn bitand_assign(&mut self, rhs: &Bitmap<I>) {
+        self.intersect(rhs);
+    }
+}
+
+impl<I: Index> core::ops::BitOrAssign<&Bitmap<I>> for Bitmap<I> {
+    fn bitor_assign(&mut self, rhs: &Bitmap<I>) {
+        self.union(rhs);
+    }
+}
+
+impl<I: Index> core::ops::BitOrAssign<I> for Bitmap<I> {
+    fn bitor_assign(&mut self, rhs: I) {
+        self.set(rhs);
+    }
+}
+
 pub struct BitmapIterOnes<'a> {
     _phantom: PhantomData<&'a [Word]>,
     bitmap: *const Word,
@@ -253,6 +271,32 @@ macro_rules! bitmap_array {
 
 pub(crate) use bitmap_array;
 
+impl<const W: usize, I: Index> BitmapArray<W, I> {
+
+    pub fn zeros() -> Self {
+        Self { _marker: PhantomData, raw: [0; W] }
+    }
+
+    pub fn ones() -> Self {
+        Self { _marker: PhantomData, raw: [!0; W] }
+    }
+}
+
+// if more generality is needed, these can be implemented for every power-of-two bitmap array
+impl<I: Index> BitmapArray<1, I> {
+
+    pub fn bloom_set(&mut self, idx: I) {
+        let idx: usize = idx.into();
+        self.raw[0] |= 1 << (idx & MASK);
+    }
+
+    pub fn bloom_test(&self, idx: I) -> bool {
+        let idx: usize = idx.into();
+        self.raw[0] & (1 << (idx & MASK)) != 0
+    }
+
+}
+
 impl<const W: usize, I: Index> Deref for BitmapArray<W, I> {
     type Target = Bitmap<I>;
     fn deref(&self) -> &Bitmap<I> {
@@ -274,6 +318,27 @@ impl<const W: usize, I: Index> core::ops::BitOr<I> for BitmapArray<W, I> {
     }
 }
 
+impl<const W: usize, I: Index> core::ops::BitOrAssign<I> for BitmapArray<W, I> {
+    fn bitor_assign(&mut self, rhs: I) {
+        *self = *self | rhs;
+    }
+}
+
+impl<const W: usize, I: Index> core::ops::BitOrAssign<BitmapArray<W, I>> for BitmapArray<W, I> {
+    fn bitor_assign(&mut self, rhs: BitmapArray<W, I>) {
+        let this: &mut Bitmap<I> = self;
+        let rhs: &Bitmap<I> = &rhs;
+        *this |= rhs;
+    }
+}
+
+impl<const W: usize, I: Index> core::ops::BitAndAssign<BitmapArray<W, I>> for BitmapArray<W, I> {
+    fn bitand_assign(&mut self, rhs: BitmapArray<W, I>) {
+        let this: &mut Bitmap<I> = self;
+        *this &= &rhs;
+    }
+}
+
 impl<'a, const W: usize, I: Index> TryFrom<&'a Bitmap<I>> for BitmapArray<W, I> {
     type Error = <[Word; W] as TryFrom<&'a [Word]>>::Error;
     fn try_from(value: &'a Bitmap<I>) -> Result<Self, Self::Error> {
@@ -285,7 +350,7 @@ impl<'a, const W: usize, I: Index> TryFrom<&'a Bitmap<I>> for BitmapArray<W, I> 
 }
 
 impl<const W: usize, I: Index> Default for BitmapArray<W, I> {
-    fn default() -> Self { Self { _marker: PhantomData, raw: [0; W] } }
+    fn default() -> Self { Self::zeros() }
 }
 
 impl<const W: usize, I: Index> Debug for BitmapArray<W, I> {

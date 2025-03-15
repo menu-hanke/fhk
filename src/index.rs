@@ -15,7 +15,7 @@ use core::ptr::NonNull;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-pub trait Index : From<usize> + Into<usize> + Clone + Copy
+pub trait Index : From<usize> + Into<usize> + Clone + Copy + PartialEq + Eq
     + zerocopy::FromBytes + zerocopy::IntoBytes + zerocopy::Immutable { }
 pub trait InvalidValue { const INVALID: usize; }
 impl Index for usize {}
@@ -77,7 +77,7 @@ impl<I: Index, T> core::ops::IndexMut<I> for IndexSlice<I, T> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct IndexArray<I: Index, T, const N: usize> {
     _marker: PhantomData<fn(&I)>,

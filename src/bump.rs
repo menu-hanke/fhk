@@ -10,6 +10,8 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, Range, RangeFrom};
 use core::ptr::NonNull;
 
+use crate::index::{self, IndexSlice};
+
 const MAX_ALIGN: usize = 16;
 
 // need repr(C) to transmute between Bump<W1> and Bump<W2>
@@ -107,20 +109,8 @@ unsafe impl<T> Immutable for T where T: ?Sized + zerocopy::Immutable {}
 
 impl<T: ?Sized> BumpRef<T> {
 
-    pub fn zero() -> Self {
+    pub const fn zero() -> Self {
         Self(0, PhantomData)
-    }
-
-}
-
-impl<T: Aligned> BumpRef<T> {
-
-    pub fn index(self) -> usize {
-        (self.0 as usize) * T::ALIGN / size_of::<T>()
-    }
-
-    pub fn offset(self, offset: isize) -> Self {
-        Self(((self.0 as isize) + offset * ((size_of::<T>() / T::ALIGN) as isize)) as _, PhantomData)
     }
 
 }
@@ -142,6 +132,46 @@ impl<T: ?Sized + Aligned> BumpRef<T> {
 
     pub fn ptr(self) -> usize {
         self.0 as usize * T::ALIGN
+    }
+
+}
+
+// convenience methods for slices.
+// these don't really do anything, they just reduce the need to manually write types.
+impl<T: ?Sized + Aligned> BumpRef<T>
+    where T: PackedSliceDst
+{
+
+    pub fn base(self) -> BumpRef<T::Item> {
+        if size_of::<T::Head>() > 0 {
+            BumpRef::from_ptr(self.ptr() + size_of::<T::Head>())
+        } else {
+            self.cast()
+        }
+    }
+
+    pub fn elem<I>(self, idx: I) -> BumpRef<T::Item>
+        where I: index::Index,
+              T: core::ops::Index<I>
+    {
+        self.base().add(idx)
+    }
+
+}
+
+impl<T: Aligned> BumpRef<T> {
+
+    pub fn index(self) -> usize {
+        (self.0 as usize) * T::ALIGN / size_of::<T>()
+    }
+
+    pub fn offset(self, offset: isize) -> Self {
+        Self(((self.0 as isize) + offset * ((size_of::<T>() / T::ALIGN) as isize)) as _, PhantomData)
+    }
+
+    pub fn add(self, idx: impl index::Index) -> Self {
+        let idx: usize = idx.into();
+        self.offset(idx as _)
     }
 
 }
@@ -283,6 +313,10 @@ impl<W> Bump<W> {
         // note: don't need to grow here even if len goes out of bounds,
         // since all writes check for grow anyway.
         self.len = (self.len + align as u32 - 1) & !(align as u32 - 1);
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
     }
 
     #[cold]
@@ -478,10 +512,6 @@ impl Bump {
         self.len = len;
     }
 
-    pub fn clear(&mut self) {
-        self.len = 0;
-    }
-
     pub fn null_terminate(&mut self) {
         if self.as_slice().last() != Some(&0) {
             self.push(0u8);
@@ -551,6 +581,20 @@ impl BumpPtr {
         T::get_mut(self, ptr)
     }
 
+    pub fn get_mut_split<T>(&mut self, ptr: BumpRef<T>) -> (&mut Self, &mut T)
+        where T: FromBytes + IntoBytes
+    {
+        let ofs = ptr.ptr();
+        assert!(ofs + size_of::<T>() <= self.0.len());
+        let buf = self.0.as_mut_ptr();
+        unsafe {
+            (
+                core::mem::transmute(core::slice::from_raw_parts_mut(buf, ofs)),
+                &mut *buf.add(ofs).cast()
+            )
+        }
+    }
+
     pub fn get_dst<T>(&self, ptr: BumpRef<T>, num: usize) -> &T
         where T: ?Sized + Aligned + PackedSliceDst,
               T::Head: FromBytes + Immutable,
@@ -573,6 +617,22 @@ impl BumpPtr {
         assert!(ofs + size_of_dst::<T>(num) <= buf.len());
         let ptr = T::ptr_from_raw_parts(unsafe { buf.as_mut_ptr().add(ofs) as _ }, num) as *mut _;
         unsafe { &mut *ptr }
+    }
+
+    pub fn get_dst_mut_split<T>(&mut self, ptr: BumpRef<T>, num: usize) -> (&mut Self, &mut T)
+        where T: ?Sized + Aligned + PackedSliceDst,
+              T::Head: FromBytes + IntoBytes,
+              T::Item: FromBytes + IntoBytes
+    {
+        let ofs = ptr.ptr();
+        assert!(ofs + size_of_dst::<T>(num) <= self.0.len());
+        let buf = self.0.as_mut_ptr();
+        unsafe {
+            (
+                core::mem::transmute(core::slice::from_raw_parts_mut(buf, ofs)),
+                &mut *(T::ptr_from_raw_parts(buf.add(ofs) as _, num) as *mut _)
+            )
+        }
     }
 
     pub fn as_slice<T>(&self) -> &[T]
@@ -599,62 +659,6 @@ impl BumpPtr {
     unsafe fn from_mut_slice_unchecked(mem: &mut [u8]) -> &mut Self {
         debug_assert!(mem.as_ptr() as usize % MAX_ALIGN == 0);
         unsafe { core::mem::transmute(mem) }
-    }
-
-}
-
-/* ---- Get-many-mut operation ---------------------------------------------- */
-
-pub struct GetManyMut<'a, const K: usize> {
-    reserved: [Range<u32>; K],
-    idx: usize,
-    buf: *mut [u8],
-    _marker: PhantomData<&'a mut ()>
-}
-
-impl<'a, const K: usize> GetManyMut<'a, K> {
-
-    fn reserve_range(&mut self, range: Range<u32>) {
-        let idx = self.idx;
-        assert!(idx < K);
-        assert!((range.end as usize) <= self.buf.len());
-        for &Range { start, end } in &self.reserved[..idx] {
-            assert!(range.end <= start || range.start >= end);
-        }
-        self.reserved[self.idx] = range;
-        self.idx += 1;
-    }
-
-    pub fn get_mut<T>(&mut self, ptr: BumpRef<T>) -> &'a mut T
-        where T: FromBytes + IntoBytes
-    {
-        let ofs = ptr.ptr();
-        self.reserve_range(ofs as u32 .. (ofs + size_of::<T>()) as u32);
-        unsafe { &mut *(self.buf as *mut u8).add(ofs).cast() }
-    }
-
-    pub fn get_dst_mut<T>(&mut self, ptr: BumpRef<T>, num: usize) -> &'a mut T
-        where T: ?Sized + Aligned + PackedSliceDst,
-              T::Head: FromBytes + IntoBytes,
-              T::Item: FromBytes + IntoBytes
-    {
-        let ofs = ptr.ptr();
-        self.reserve_range(ofs as u32 .. (ofs + size_of_dst::<T>(num)) as u32);
-        let ptr = T::ptr_from_raw_parts(unsafe { (self.buf as *mut u8).add(ofs) as _ }, num) as *mut _;
-        unsafe { &mut *ptr }
-    }
-
-}
-
-impl BumpPtr {
-
-    pub fn get_many_mut<const K: usize>(&mut self) -> GetManyMut<'_, K> {
-        GetManyMut {
-            reserved: [const { Range { start: 0, end: 0 }}; K],
-            idx: 0,
-            buf: &mut self.0 as _,
-            _marker: PhantomData
-        }
     }
 
 }

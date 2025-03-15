@@ -3,8 +3,7 @@
 // TODO: remove this file and merge stuff into controlflow.rs
 
 use crate::bitmap::{BitMatrix, Bitmap};
-use crate::controlflow::{BlockId, ControlFlow, Schedule};
-use crate::dataflow::DataflowSystem;
+use crate::controlflow::{BlockId, ControlFlow, DataflowSystem, Schedule};
 use crate::emit::InsValue;
 use crate::index::{self, IndexSet, IndexVec};
 use crate::ir::{Func, Ins, InsId, Opcode, PhiId, Type};

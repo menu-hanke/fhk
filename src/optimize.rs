@@ -12,15 +12,13 @@
 use enumset::{EnumSet, EnumSetType};
 
 use crate::compile::{self, Ccx, Stage};
+use crate::controlflow::ControlFlow;
 use crate::dump::dump_ir;
-use crate::index;
-use crate::ir::{FuncId, IR};
+use crate::index::IndexSet;
+use crate::{index, opt_control};
+use crate::ir::{FuncId, PhiId, IR};
 use crate::opt_fold::Fold;
-use crate::opt_goto::OptGoto;
 use crate::opt_inline::Inline;
-use crate::opt_loop::OptLoop;
-use crate::opt_phi::OptPhi;
-use crate::opt_switch::OptSwitch;
 use crate::trace::trace;
 use crate::typestate::{Absent, R};
 
@@ -28,6 +26,7 @@ const MAX_ITER: usize = 100; // TODO: make this configurable
 
 #[derive(EnumSetType)]
 pub enum OptFlag {
+    CCP,
     FOLD,
     GOTO,
     INLINE,
@@ -41,6 +40,7 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
     let mut oflg: EnumSet<OptFlag> = EnumSet::empty();
     for &f in flags {
         oflg.insert_all(match f {
+            b'c' => CCP.into(),
             b'f' => FOLD.into(),
             b'g' => GOTO.into(),
             b'i' => INLINE.into(),
@@ -57,9 +57,12 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
     oflg
 }
 
+// TODO: remove *Pass traits and derive default here
 pub struct Optimize {
     pub fold: Fold,
     pub inline: Inline,
+    pub cf: ControlFlow, // TODO: make opt_inline use this
+    pub phi_mark: IndexSet<PhiId>
 }
 
 pub type Ocx<'a> = Ccx<Optimize, R<'a>>;
@@ -80,20 +83,11 @@ fn optimize(ocx: &mut Ocx) {
         Inline::run(ocx);
     }
     for fid in index::iter_span(ocx.ir.funcs.end()) {
+        if !(ocx.flags & (SWITCH|LOOP|PHI|CCP|GOTO)).is_empty() {
+            opt_control::run(ocx, fid);
+        }
         if ocx.flags.contains(FOLD) {
             Fold::run(ocx, fid);
-        }
-        if ocx.flags.contains(SWITCH) {
-            OptSwitch::run(ocx, fid);
-        }
-        if ocx.flags.contains(LOOP) {
-            OptLoop::run(ocx, fid);
-        }
-        if ocx.flags.contains(PHI) {
-            OptPhi::run(ocx, fid);
-        }
-        if ocx.flags.contains(GOTO) {
-            OptGoto::run(ocx, fid);
         }
     }
 }
@@ -110,6 +104,8 @@ impl Stage for Optimize {
         Ok(Self {
             fold: Fold::new(ccx),
             inline: Inline::new(ccx),
+            cf: Default::default(),
+            phi_mark: Default::default()
         })
     }
 
