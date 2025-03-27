@@ -82,7 +82,7 @@ foreach_lang!(define_lang_mods);
 
 /* -------------------------------------------------------------------------- */
 
-const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
+pub const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
     match option_env!("FHK_GITHASH") { Some(v) => v.as_bytes(), None => b"(unknown version)" },
     #[cfg(feature="host-Lua")] b" Lua",
     b" [",

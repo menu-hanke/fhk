@@ -17,6 +17,7 @@ use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_top
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
 
 use crate::image::fhk_vmcall_native as fhk_vmcall;
+use crate::FHK_VERSION_STRING;
 
 type lua_State = c_void;
 
@@ -26,6 +27,7 @@ unsafe extern "C-unwind" {
     fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int);
     fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void);
     fn lua_pushinteger(L: *mut lua_State, n: isize);
+    fn lua_pushstring(L: *mut lua_State, s: *const c_char);
 }
 
 type fhk_Graph = Ccx<Parser>;
@@ -304,6 +306,7 @@ unsafe extern "C-unwind" fn luaopen_fhk(L: *mut lua_State) -> c_int {
         luaL_loadbuffer(L, HOST_APIDEF.as_ptr(), HOST_APIDEF.len(), c"fhk:hostapi".as_ptr());
         lua_call(L, 0, 0);
         luaL_loadbuffer(L, HOST_LUA.as_ptr(), HOST_LUA.len(), c"fhk".as_ptr());
+        lua_pushstring(L, FHK_VERSION_STRING.as_ptr() as _);
         luaL_loadbuffer(L, TENSOR_LUA.as_ptr(), TENSOR_LUA.len(), c"fhk:tensor".as_ptr());
         lua_call(L, 0, 1);
         lua_pushlightuserdata(L, HOST_API.as_ptr() as _);
@@ -312,7 +315,7 @@ unsafe extern "C-unwind" fn luaopen_fhk(L: *mut lua_State) -> c_int {
         lua_pushlightuserdata(L, Operator::FIELDS.0.as_ptr() as _);
         lua_pushlightuserdata(L, Operator::FIELDS.1.as_ptr() as _);
         lua_pushinteger(L, Operator::NAME_OFS.len() as isize - 1);
-        lua_call(L, 7, 1);
+        lua_call(L, 8, 1);
     }
     1
 }

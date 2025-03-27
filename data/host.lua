@@ -2,7 +2,7 @@ local ffi = require "ffi"
 local buffer = require "string.buffer"
 require "table.clear"
 require "table.new"
-local tensor, API, OP_NAMEPTR, OP_NAMEOFS, OP_FDESC, OP_FOFS, OP_NUM = ...
+local version, tensor, API, OP_NAMEPTR, OP_NAMEOFS, OP_FDESC, OP_FOFS, OP_NUM = ...
 local API = ffi.cast("fhk_Api *", API)
 
 ---- String buffer management --------------------------------------------------
@@ -576,6 +576,7 @@ local function newgraph()
 end
 
 return {
+	version  = version,
 	newgraph = newgraph,
 	refs     = obj_refs,
 	istensor = tensor.istensor
