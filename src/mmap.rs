@@ -19,8 +19,13 @@ pub struct Mmap {
 
 impl Mmap {
 
+    const EMPTY: Self = Mmap { base: core::ptr::dangling_mut(), size: 0 };
+
     pub fn new(size: usize, prot: EnumSet<Prot>) -> Option<Self> {
-        target::map(size, prot)
+        match size {
+            0 => Some(Self::EMPTY),
+            _ => target::map(size, prot)
+        }
     }
 
     pub fn protect(&self, range: Range<usize>, prot: EnumSet<Prot>) {
@@ -43,8 +48,10 @@ impl Mmap {
 impl Drop for Mmap {
 
     fn drop(&mut self) {
-        unsafe {
-            target::unmap(self)
+        if self.size != 0 {
+            unsafe {
+                target::unmap(self)
+            }
         }
     }
 

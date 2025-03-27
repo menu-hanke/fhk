@@ -115,7 +115,7 @@ impl Stage for Optimize {
             for i in 0..MAX_ITER {
                 optimize(ocx);
                 let newsize = irsize(&ocx.ir);
-                if size == newsize {
+                if size == newsize || newsize == 0 {
                     trace!(OPTIMIZE "converged in {} iterations", i+1);
                     break
                 } else {
