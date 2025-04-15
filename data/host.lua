@@ -515,12 +515,25 @@ local function image_newinstance(image, alloc, udata, prev, mask)
 	return API.fhk_newinstance(image, alloc, udata or nil, prev or nil, mask or -1ull)
 end
 
+-- TODO index parameter
+-- TODO remove query __call and always use this
+local function instance_exec(instance, query, res)
+	return query(instance, res)
+end
+
 local image_mt = {
 	newinstance = image_newinstance
 }
 image_mt.__index = image_mt
 
 ffi.metatype("fhk_Image", image_mt)
+
+local instance_mt = {
+	exec = instance_exec
+}
+instance_mt.__index = instance_mt
+
+ffi.metatype("fhk_Instance", instance_mt)
 
 ---- Compilation ---------------------------------------------------------------
 
