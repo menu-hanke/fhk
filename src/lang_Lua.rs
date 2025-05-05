@@ -401,17 +401,17 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
                             // TODO: handle constants (constant scalars) here specially. they don't
                             // need a memory write, just put the value in the table and hardcode
                             // it in the generated lua code.
-                            lib.lua_settop(L, -2);
-                            lib.lua_createtable(L, 0, 0);
+                            lib.lua_settop(L, -2);  // pop nil
+                            lib.lua_createtable(L, 0, 0);  // input = {}
                             let (_, tref, _) = func.code.at(value).decode_LOVV();
                             let tobj: ObjRef = zerocopy::transmute!(func.code.at(tref).bc());
                             pushctype(&ccx.objs, lib, L, ctidx, tobj);
-                            lib.lua_setfield(L, -2, c"ctype".as_ptr());
+                            lib.lua_setfield(L, -2, c"ctype".as_ptr()); // input.ctype = ...
                             n_in += 1;
-                            lib.lua_rawseti(L, -3, n_in as _);
+                            lib.lua_rawseti(L, -3, n_in as _); // inputs[n_in] = input
                             lib.lua_pushnumber(L, n_in as _);
                         }
-                        lib.lua_rawseti(L, -3, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
+                        lib.lua_rawseti(L, -2, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
                         args = next;
                     }
                     lib.lua_settop(L, -2);
