@@ -395,6 +395,7 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
                     lib.lua_createtable(L, 0, 0); // insid -> input idx
                     let mut n_in = 0;
                     while func.code.at(args).opcode() != Opcode::NOP {
+                        n_in += 1;
                         let (next, value) = func.code.at(args).decode_CARG();
                         lib.lua_rawgeti(L, -1, {let idx: u16 = zerocopy::transmute!(value); idx as _});
                         if lib.lua_type(L, -1) == LUA_TNIL {
@@ -402,16 +403,16 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
                             // need a memory write, just put the value in the table and hardcode
                             // it in the generated lua code.
                             lib.lua_settop(L, -2);  // pop nil
+                            lib.lua_pushnumber(L, n_in as _);
+                            // lookup[ins] = n_in
+                            lib.lua_rawseti(L, -2, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
                             lib.lua_createtable(L, 0, 0);  // input = {}
                             let (_, tref, _) = func.code.at(value).decode_LOVV();
                             let tobj: ObjRef = zerocopy::transmute!(func.code.at(tref).bc());
                             pushctype(&ccx.objs, lib, L, ctidx, tobj);
                             lib.lua_setfield(L, -2, c"ctype".as_ptr()); // input.ctype = ...
-                            n_in += 1;
-                            lib.lua_rawseti(L, -3, n_in as _); // inputs[n_in] = input
-                            lib.lua_pushnumber(L, n_in as _);
-                        }
-                        lib.lua_rawseti(L, -2, {let idx: u16 = zerocopy::transmute!(value); idx as _ });
+                        } // else: dupe index is on stack
+                        lib.lua_rawseti(L, -3, n_in as _); // inputs[n_in] = input
                         args = next;
                     }
                     lib.lua_settop(L, -2);

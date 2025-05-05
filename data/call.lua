@@ -83,7 +83,7 @@ local function codegen(funcs, base)
 			end
 		end
 		buf:put(")\nreturn J[swap(base)]()\nend")
-		J[i] = load(buf)(unpack(upvalues))
+		J[i] = load(buf, f.load)(unpack(upvalues))
 		buf:reset()
 	end
 	return J
