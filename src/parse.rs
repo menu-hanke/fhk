@@ -295,36 +295,45 @@ const PRIORITY: &'static [(u8, u8)] = &[
 
 const UNARY_PRIORITY: u8 = 8;
 
+fn parse_maybesuffix(pcx: &mut Pcx, expr: ObjRef<EXPR>) -> compile::Result<ObjRef<EXPR>> {
+    if check(pcx, Token::LBracket)? {
+        // TODO: emit IDX
+        todo!()
+    }
+    Ok(expr)
+}
+
 fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     match pcx.data.token {
         Token::Scope | Token::Ident => {
             let name = parse_name(pcx)?;
-            match pcx.data.token {
-                Token::LParen => parse_call(pcx, name),
+            let expr = match pcx.data.token {
+                Token::LParen => parse_call(pcx, name)?,
                 Token::Dot => {
                     next(pcx)?;
                     let tab = reftab(pcx, name);
                     let name = parse_name(pcx)?;
                     let var = refvar(pcx, tab, name);
                     let vget = parse_vget(pcx, var)?;
-                    Ok(vget.cast())
+                    vget.cast()
                 },
                 _ => match pcx.data.bindings.iter().find(|b| b.name == name) {
-                    Some(v) => Ok(v.value),
+                    Some(v) => v.value,
                     None => {
                         let tab = implicittab(pcx)?;
                         let var = refvar(pcx, tab, name);
                         let vget = parse_vget(pcx, var)?;
-                        Ok(vget.cast())
+                        vget.cast()
                     }
                 }
-            }
+            };
+            parse_maybesuffix(pcx, expr)
         },
         Token::LParen => {
             next(pcx)?;
             let node = parse_expr(pcx)?;
             consume(pcx, Token::RParen)?;
-            Ok(node)
+            parse_maybesuffix(pcx,node)
         },
         Token::LBracket => {
             next(pcx)?;
@@ -348,7 +357,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             consume(pcx, Token::RBracket)?;
             let cat = pcx.objs.push_args::<CAT>(CAT::new(ObjRef::NIL), &pcx.tmp[base.cast_up()..]);
             pcx.tmp.truncate(base);
-            Ok(cat.cast())
+            parse_maybesuffix(pcx, cat.cast())
         },
         Token::Let => {
             next(pcx)?;
