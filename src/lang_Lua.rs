@@ -363,11 +363,6 @@ unsafe fn pushctype(objs: &Objects, lib: &LuaLib, L: *mut lua_State, tab: c_int,
                 lib.lua_pushnumber(L, ty as _);
                 lib.lua_call(L, 1, 1);
             },
-            ObjectRef::TTEN(&TTEN { elem, dim: 1, .. }) if objs[elem].op == Obj::TPRI => {
-                lib.lua_getfield(L, STACK_TENSORLIB, c"vector_ctype".as_ptr());
-                pushctype(objs, lib, L, tab, elem);
-                lib.lua_call(L, 1, 1);
-            },
             ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
                 lib.lua_getfield(L, STACK_TENSORLIB, c"tensor_ctype".as_ptr());
                 pushctype(objs, lib, L, tab, elem);

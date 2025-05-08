@@ -1,7 +1,5 @@
 local ffi = require "ffi"
 local buffer = require "string.buffer"
-require "table.new"
-local type, typeof = type, ffi.typeof
 
 -- it's logically an uint32_t, but signed generates slightly better code
 local IDX_CTYPE = "int32_t"
@@ -23,18 +21,18 @@ local PRI_B1  = 10
 local PRI_PTR = 11
 local PRI_STR = 12
 local PRI_CT = {
-	[PRI_F64] = typeof("double"),
-	[PRI_F32] = typeof("float"),
-	[PRI_I64] = typeof("int64_t"),
-	[PRI_I32] = typeof("int32_t"),
-	[PRI_I16] = typeof("int16_t"),
-	[PRI_I8]  = typeof("int8_t"),
-	[PRI_U64] = typeof("uint64_t"),
-	[PRI_U32] = typeof("uint32_t"),
-	[PRI_U16] = typeof("uint16_t"),
-	[PRI_U8]  = typeof("uint8_t"),
-	[PRI_B1]  = typeof("bool"),
-	[PRI_PTR] = typeof("void *"),
+	[PRI_F64] = ffi.typeof("double"),
+	[PRI_F32] = ffi.typeof("float"),
+	[PRI_I64] = ffi.typeof("int64_t"),
+	[PRI_I32] = ffi.typeof("int32_t"),
+	[PRI_I16] = ffi.typeof("int16_t"),
+	[PRI_I8]  = ffi.typeof("int8_t"),
+	[PRI_U64] = ffi.typeof("uint64_t"),
+	[PRI_U32] = ffi.typeof("uint32_t"),
+	[PRI_U16] = ffi.typeof("uint16_t"),
+	[PRI_U8]  = ffi.typeof("uint8_t"),
+	[PRI_B1]  = ffi.typeof("bool"),
+	[PRI_PTR] = ffi.typeof("void *"),
 	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
 }
 
@@ -42,98 +40,55 @@ local function scalar_ctype(pri)
 	return PRI_CT[pri]
 end
 
----- Vectors -------------------------------------------------------------------
-
-local VEC_CTYPES = {}
-
-local function puttab(buf, tab)
-	buf:put("[")
-	for i=1, #tab do
-		local v = tab[i]
-		buf:put(" ")
-		if type(v) == "table" then
-			puttab(buf, v)
-		else
-			buf:put(tostring(v))
-		end
-	end
-	buf:put(" ]")
-end
-
-local function vec_totab(vec)
-	local t = table.new(vec.n, 0)
-	for i=0, vec.n-1 do
-		t[i+1] = vec.e[i]
-	end
-	return t
-end
-
-local function vec__tostring(vec)
-	local buf = buffer.new()
-	puttab(buf, vec_totab(vec))
-	return tostring(buf)
-end
-
-local vec_mt = {
-	__index = function(self, i) return self.e[i] end,
-	__newindex = function(self, i, e) self.e[i] = e end,
-	__len = function(self) return self.n end,
-	__ipairs = function(self) return array_inext, self, -1 end,
-	__tostring = vec__tostring
-}
-
-local function vector_ctype(e)
-	e = typeof(e)
-	local ctid = tonumber(e)
-	local ct = VEC_CTYPES[ctid]
-	if ct then return ct end
-	ct = ffi.metatype(typeof("struct { $ *e; int32_t n; }", e), vec_mt)
-	VEC_CTYPES[ctid] = ct
-	return ct
-end
-
 ---- Tensors -------------------------------------------------------------------
+-- tensor ctype representation:
+-- * 1-D tensor:
+--   struct {
+--     elem *e;
+--     int32_t n;
+--   }
+-- * N-D tensor:
+--   struct {
+--     elem *e;
+--     int32_t n[N];
+--   }
+-- * N-D tensor of M-D tensors (non-rectangular)
+--   struct {
+--     elem **e;
+--     int32_t *n1[M];
+--     int32_t n[N];
+--   }
+-- * general case: N-D tensor of N1-D tensors of ... of NK-D tensors (non-rectangular):
+--   struct {
+--     elem *(K)* e;
+--     int32_t *(K-1)* nK[NK];
+--     ...
+--     int32_t *n1[N1];
+--     int32_t n[N];
+--   }
 
--- ctid -> {e,n}
-local METADATA = {}
-
--- ctid(e) | (n<<8)  ->  ct
-local CTYPES = {}
-
-local function metadata(t)
-	return METADATA[tonumber(t)]
+local function xmetadata(x)
+	return x["fhk$e"], x["fhk$n"]
 end
 
-local function putrep(buf, s, n)
-	for _=1, n do buf:put(s) end
+local function metadata(x)
+	local ok, e, n = pcall(xmetadata, x)
+	if ok then return e, n end
 end
 
-local function putflatrepr(e, buf, indir)
-	local meta = metadata(e)
-	if meta then
-		putflatrepr(meta.e, buf, indir+1)
-		buf:put(IDX_CTYPE, " ")
-		putrep(buf, "*", indir)
-		buf:putf("n%d[%d];\n", indir, meta.n)
-	else
-		buf:put("$ ")
-		putrep(buf, "*", indir)
-		buf:put("e;\n")
-	end
-end
-
+-- TODO: also handle nil indices (slicing) on N-D tensors
 local function makegetter(e, n)
 	local buf = buffer.new()
 	buf:put("return function(self")
 	for i=1, n do buf:putf(", i%d", i) end
 	buf:put(")\n")
-	local meta = metadata(e)
-	if meta then
+	local ee, en = metadata(e)
+	if ee then
 		if n > 1 then
 			error("TODO")
 		end
 		buf:put("local r = self['fhk$e']()\nr.e = self.e[i1]\n")
-		for i=0, meta.n-1 do
+		for i=0, en-1 do
 			buf:putf("r.n[%d] = self.n1[%d][i1]\n", i, i)
 		end
 		buf:put("return r\n")
@@ -148,7 +103,6 @@ local function makegetter(e, n)
 end
 
 local function maketotab(e, n)
-	local meta = metadata(e)
 	local buf = buffer.new()
 	buf:put("return function(self)\nlocal tab0 = {}\n")
 	for i=0, n-1 do
@@ -160,7 +114,7 @@ local function maketotab(e, n)
 				buf:putf("i%d", i)
 			end
 			buf:put(")")
-			if meta then
+			if metadata(e) then
 				buf:put(":totable()")
 			end
 			buf:put("\n")
@@ -184,34 +138,84 @@ local function makeshape(n)
 	return load(buf)()
 end
 
+local function puttab(buf, tab)
+	buf:put("[")
+	for i=1, #tab do
+		local v = tab[i]
+		buf:put(" ")
+		if type(v) == "table" then
+			puttab(buf, v)
+		else
+			buf:put(tostring(v))
+		end
+	end
+	buf:put(" ]")
+end
+
 local function tensor__tostring(tensor)
 	local buf = buffer.new()
 	puttab(buf, tensor:totable())
 	return tostring(buf)
 end
 
+local function vector__newindex(self, i, v)
+	self.e[i] = v
+end
+
 local function newmetatype(e, n)
 	local shape = makeshape(n)
-	local mt = {
+	local get = makegetter(e, n)
+	local index = ffi.metatype("struct {}", {
 		__index = {
 			["fhk$e"] = e,
-			get       = makegetter(e, n),
+			["fhk$n"] = n,
+			get       = get,
 			totable   = maketotab(e, n),
 			shape     = shape
-		},
+		}
+	})
+	local indexfunc = load([[
+		local index = ...
+		local get, type = index.get, type
+		return function(self, key)
+			if type(key) == "number" then
+				return get(self, key)
+			else
+				return index[key]
+			end
+		end
+	]])(index)
+	local mt = {
+		__index    = indexfunc,
 		__len      = shape,
-		__tostring = tensor__tostring,
+		__tostring = tensor__tostring
 	}
+	if n == 1 and not metadata(e) then
+		-- TODO: add ipairs, too
+		mt.__newindex = vector__newindex
+	end
 	return mt
 end
+
+local function putflatrepr(e, buf, i)
+	local ee, en = metadata(e)
+	if ee then
+		putflatrepr(ee, buf, i+1)
+		buf:put(IDX_CTYPE, " ", string.rep("*", i), "n", i, "[", en, "];\n")
+	else
+		buf:put("$ ", string.rep("*", i), " e;\n");
+	end
+end
+
+-- ctid(e) | (n<<8)  ->  ct
+local CTYPES = {}
 
 local function ctkey(e, n)
 	return bit.lshift(tonumber(e), 8) + n
 end
 
--- struct layout here must match query memory layout.
 local function tensor_ctype(e, n)
-	e = typeof(e)
+	e = ffi.typeof(e)
 	if (not n) or n == 0 then return e end
 	local ctk = ctkey(e, n)
 	local ct = CTYPES[ctk]
@@ -219,31 +223,25 @@ local function tensor_ctype(e, n)
 	local buf = buffer.new()
 	buf:put("struct {\n")
 	putflatrepr(e, buf, 1)
-	buf:putf("%s n[%d];\n}", IDX_CTYPE, n)
+	buf:put(IDX_CTYPE, " n[", n, "];\n}")
 	local inner = e
 	while true do
-		local meta = metadata(inner)
-		if meta then inner = meta.e else break end
+		local ee = metadata(inner)
+		if ee then inner = ee else break end
 	end
-	ct = typeof(tostring(buf), inner)
-	METADATA[tonumber(ct)] = {e=e, n=n}
+	ct = ffi.typeof(tostring(buf), inner)
 	CTYPES[ctk] = ct
 	return ffi.metatype(ct, newmetatype(e, n))
 end
 
-local function istensorx(x)
-	return x["fhk$e"]
-end
-
 local function istensor(x)
-	return type(x) == "cdata" and pcall(istensorx, typeof(x))
+	return metadata(x) ~= nil
 end
 
 --------------------------------------------------------------------------------
 
 return {
 	scalar_ctype = scalar_ctype,
-	vector_ctype = vector_ctype,
 	tensor_ctype = tensor_ctype,
 	istensor     = istensor
 }
