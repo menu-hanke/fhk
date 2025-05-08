@@ -59,6 +59,13 @@ fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: IRef<[u8]>) -> ObjRef<VAR> {
     newundef(pcx, id.erase()).cast()
 }
 
+fn newanonvar(pcx: &mut Pcx, tab: ObjRef<TAB>, ann: ObjRef/*TY*/, value: ObjRef<EXPR>) -> ObjRef<VAR> {
+    let var = pcx.objs.push(VAR::new(IRef::EMPTY, tab, ann));
+    let vset = pcx.objs.push_args::<VSET>(VSET::new(0, var, value), &[]);
+    pcx.objs.push_args::<MOD>(MOD::new(IRef::EMPTY, tab, ObjRef::NIL.cast()), &[vset]);
+    var
+}
+
 fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
     if pcx.data.token == Token::OpThis {
         match pcx.objs[pcx.data.this].op {
@@ -481,7 +488,7 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     Ok(())
 }
 
-fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::Result {
+fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<VAR>>) -> compile::Result {
     let base = pcx.tmp.end();
     // note: vset.value = annotation
     loop {
@@ -518,6 +525,8 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<EXPR>>) -> compile::
         true  => Some(parse_expr(pcx)?),
         false => None
     };
+    let blockguard = blockguard
+        .map(|v| pcx.objs.push_args::<VGET>(VGET::new(0, ObjRef::B1.erase(), v), &[]).cast());
     let guard = match (blockguard, guard) {
         (Some(g), None) | (None, Some(g)) => g,
         (Some(b), Some(g)) => pcx.objs.push(BINOP::new(BinOp::AND as _, ObjRef::NIL, b, g)).cast(),
@@ -554,7 +563,10 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     pcx.data.tab = tab;
     debug_assert!(pcx.data.bindings.is_empty());
     let blockguard = match check(pcx, Token::Where)? {
-        true => Some(parse_expr(pcx)?),
+        true => {
+            let value = parse_expr(pcx)?;
+            Some(newanonvar(pcx, tab, ObjRef::B1.erase(), value))
+        },
         false => None
     };
     if check(pcx, Token::LBracket)? {
