@@ -216,60 +216,50 @@ impl<I: Index> DataflowSystem<I> {
 
 /* ---- Control matrices ---------------------------------------------------- */
 
-// the entry (i,j) tells you:
+// (i,j) is true if the execution of the block `i` implies the execution of the instruction `j`
+// at some point in the program, either before, in, or after `i`.
+// or, in other words, (i,j) is true if the block `i` is a legal placement for an instruction
+// `j` with observable side-effects.
+// note that fhk only guarantees that a model is not called unless its `where` conditions are
+// satisfied, meaning it's valid (although inefficient) to execute the instruction `j`
+// multiple times, as long as all executions are in legal blocks.
+// side-effect-free instructions can be lifted anywhere, as long as it doesn't cause side-effectful
+// instructions to be lifted into illegal blocks.
 //
-//   IF control flow goes through node i, does it necessarily ALSO go through node j?
+// the control matrix C is the solution to the dataflow system:
+//   C(i,j) = 1 if `i` uses `j`,
+//   ∩ (C(i') : i' ∈ pred(i)) ⊂  C(i),
+//   ∩ (C(i') : i' ∈ succ(i)) ⊂  C(i)
 //
-// this sounds a lot like a dominance tree, but it's not the same thing at all.
-// it's also not a postdominance tree. it's also not a union of the two.
-// the reason this needs to exist is because CSE across "basic blocks" (which the ir doesn't
-// have anyway, but imagine for a second it did) causes wonky "control flows".
-// example:
-//                 3. IF
-//                /     \
-//             4. IF  5. use 1
-//            /  \    6. use 2
-//      7. use 1  6. use 1
-//      8. use 2
-//
-// here:
-//   * execution of 3 implies execution of 1
-//   * execution 1 implies execution of 3, IF these are all the uses of 1. if there's other uses
-//     of 1 not shown in the picture, then 1 does not imply 3.
-//   * 3 does not imply 2, but 2 may or may not imply 3, again depending on its other uses.
-//
-// note that this has nothing to do with the order of computations, only whether control flow
-// must pass through the instruction or not.
-//
-// it is the solution to the following system:
-//
-//   C(i,i) = 1   for all i
-//   C(i,j) = 1   where i ≠ j, if (at least) one of the following is true:
-//                * (1) C(k,j) = 1 for all k ∈ uses(i)
-//                * (2) op(i) ≠ IF, and C(k,j) = 1 for some k ∈ inputs(i)
-//                * (3) op(i) ≠ IF, and C(cond(i),j) = 1, or C(tru(i),j) = C(fal(i),j) = 1
-//   C(i,j) = 0   otherwise,
-//
-// or in a more dataflow-y form:
-//
-//   C(i) = {i} ∪  (∩  C(j) : j ∈ uses(i)) ∪  (∪  C(j) : j ∈ inputs(i))               IF op(i) ≠ IF
-//   C(i) = {i} ∪  (∩  C(j) : j ∈ uses(i)) ∪  C(cond(i)) ∪  (C(tru(i)) ∩  C(fal(i)))  IF op(i) = IF
-//
-// note that data and control are treated uniformly here: inputs(i) contains data inputs and
-// successors, while uses(i) contains data uses and precedessors.
-pub type ControlMatrix = BitMatrix<InsId>;
+// TODO: if all of `i`'s incoming edges imply `j`, but `i`'s immediate dominator doesn't, then
+//       this should pull some tricks to avoid recomputing `j` at/after `i`, either by inserting a
+//       phi at `i` or by modifying the control flow.
 
-// set r(i) = r(i) ∪  (∩ r(j) : js)
-fn addintersect(mat: &mut BitMatrix<InsId>, i: InsId, js: &[InsId], work: &mut Bitmap<InsId>) {
-    match js.len() {
-        0 => {},
-        1 => {
-            let [ri, rj] = mat.get_rows_mut([i, js[0]]);
+fn markins(code: &IndexSlice<InsId, Ins>, bitmap: &mut Bitmap<InsId>, id: InsId) {
+    if bitmap.test_and_set(id) {
+        return;
+    }
+    for &input in code[id].inputs() {
+        markins(code, bitmap, input)
+    }
+}
+
+// set mat[i] = mat[i] ∪  (∩ mat[j] : j ∈ js)
+fn addintersect(
+    mat: &mut BitMatrix<BlockId, InsId>,
+    i: BlockId,
+    js: &[BlockId],
+    work: &mut Bitmap<InsId>
+) {
+    match js {
+        &[] => {},
+        &[j] => {
+            let [ri, rj] = mat.get_rows_mut([i, j]);
             ri.union(rj);
         },
-        _ => {
-            work.copy_from(&mat[js[0]]);
-            for &j in &js[1..] {
+        &[first, ref rest@..] => {
+            work.copy_from(&mat[first]);
+            for &j in rest {
                 work.intersect(&mat[j]);
             }
             mat[i].union(work);
@@ -279,41 +269,45 @@ fn addintersect(mat: &mut BitMatrix<InsId>, i: InsId, js: &[InsId], work: &mut B
 
 fn compute_cmat(
     code: &IndexSlice<InsId, Ins>,
-    dfg: &GraphPtr<InsId>,
-    solver: &mut DataflowSystem<InsId>,
-    mat: &mut ControlMatrix,
-    work: &mut BitmapVec
+    blocks: &IndexSlice<BlockId, InsId>,
+    cfg: &GraphPtr<BlockId>,
+    inst: &IndexSlice<InsId, Range<u16>>,
+    place: &[BlockId],
+    mat: &mut BitMatrix<BlockId, InsId>,
+    work: &mut BitmapVec,
+    work_blocks: &mut Vec<BlockId>
 ) {
-    let end = code.end();
-    mat.resize(end, end);
+    mat.resize(blocks.end(), code.end());
     mat.clear_all();
-    for i in index::iter_span(end) {
-        mat[i].set(i);
-    }
-    work.resize(end.into());
+    work.resize(code.end().into());
     let work: &mut Bitmap<InsId> = work.cast_mut();
-    solver.resize(end);
-    solver.queue_all(end);
-    while let Some(i) = solver.poll() {
-        let pop = mat[i].popcount();
-        let inputs = dfg.inputs(i);
-        let uses = dfg.uses(i);
-        addintersect(mat, i, uses, work);
-        match code[i].opcode() {
-            Opcode::IF => {
-                let [ri, rcond] = mat.get_rows_mut([i, inputs[0]]);
-                ri.union(rcond);
-                addintersect(mat, i, &inputs[1..], work);
-            },
-            _ => for &j in inputs {
-                let [ri, rj] = mat.get_rows_mut([i, j]);
-                ri.union(rj);
-            }
+    for (i, &j) in blocks.pairs() {
+        markins(code, &mut mat[i], j);
+    }
+    for (i, &ins) in code.pairs() {
+        if ins.opcode().is_pinned() {
+            markins(code, &mut mat[place[inst[i].start as usize]], i);
         }
-        if mat[i].popcount() != pop {
-            solver.queue_nodes(inputs);
-            solver.queue_nodes(uses);
+    }
+    loop {
+        let mut fixpoint = true;
+        for (i, &j) in blocks.pairs() {
+            let pop = mat[i].popcount();
+            work_blocks.extend(
+                code[j]
+                .controls()
+                .iter()
+                .filter_map(|&c| match code[c].opcode() {
+                    Opcode::UB => None,
+                    _ => Some(place[inst[c].start as usize])
+                })
+            );
+            addintersect(mat, i, &work_blocks, work);
+            addintersect(mat, i, cfg.uses(i), work);
+            work_blocks.clear();
+            fixpoint &= mat[i].popcount() == pop;
         }
+        if fixpoint { break }
     }
 }
 
@@ -374,8 +368,7 @@ fn schedule_next(
     work_blocks: &mut Vec<BlockId>,
     dfg: &GraphPtr<InsId>,
     idom: &IndexSlice<BlockId, BlockId>,
-    blocks: &IndexSlice<BlockId, InsId>,
-    mat: &ControlMatrix,
+    mat: &BitMatrix<BlockId, InsId>,
     inst: &mut IndexVec<InsId, Range<u16>>,
     place: &mut Vec<BlockId>
 ) -> Option<InsId> {
@@ -407,8 +400,8 @@ fn schedule_next(
             'uloop: for &p in &place[start as usize .. end as usize] {
                 for b in &mut work_blocks[base..] {
                     let up = lca(idom, p, *b);
-                    //crate::trace::trace!("[{:?}/{:?}] lca({:?}, {:?}) -> {:?}", state.id, user, p, *b, up);
-                    if mat[blocks[up]].test(state.id) {
+                    // crate::trace::trace!("[{:?}/{:?}] lca({:?}, {:?}) -> {:?}", state.id, user, p, *b, up);
+                    if mat[up].test(state.id) {
                         *b = up;
                         continue 'uloop;
                     }
@@ -416,23 +409,22 @@ fn schedule_next(
                 // none of the proposed placements has a common ancestor with p that implies
                 // execution of `state.ins`.
                 // add a new proposed placement in the same block as the user.
-                //crate::trace::trace!("[{:?}/{:?}] push {:?}", state.id, user, p);
+                // crate::trace::trace!("[{:?}/{:?}] push {:?}", state.id, user, p);
                 work_blocks.push(p);
             }
             state.user += 1;
         }
         let id = state.id;
         placeins(inst, place, id, &work_blocks[state.base as usize ..]);
-        // TODO: re-enable these asserts when new cmat is implemented
-        // if cfg!(debug_assertions) {
-        //     for i in state.base as usize .. work_blocks.len() {
-        //         debug_assert!(mat[blocks[work_blocks[i]]].test(id));
-        //         for j in i+1..work_blocks.len() {
-        //             debug_assert!(!dom(idom, work_blocks[i], work_blocks[j]));
-        //             debug_assert!(!dom(idom, work_blocks[j], work_blocks[i]));
-        //         }
-        //     }
-        // }
+        if cfg!(debug_assertions) {
+            for i in state.base as usize .. work_blocks.len() {
+                debug_assert!(mat[work_blocks[i]].test(id));
+                for j in i+1..work_blocks.len() {
+                    debug_assert!(!dom(idom, work_blocks[i], work_blocks[j]));
+                    debug_assert!(!dom(idom, work_blocks[j], work_blocks[i]));
+                }
+            }
+        }
         work_blocks.truncate(state.base as usize);
         work_state.pop();
         break Some(id);
@@ -450,8 +442,7 @@ pub struct ControlFlow {
     pub idom: IndexVec<BlockId, BlockId>,
     pub code: IndexVec<InsId, Ins>,
     pub blocks: IndexVec<BlockId, InsId>,
-    solver: DataflowSystem<InsId>,
-    cmat: ControlMatrix,
+    cmat: BitMatrix<BlockId, InsId>,
     pub work_bitmap: BitmapVec,
     inst: IndexVec<InsId, Range<u16>>,
     place: Vec<BlockId>,
@@ -483,8 +474,6 @@ impl ControlFlow {
         for (id, ins) in self.code.pairs() {
             self.dfg.add_inputs(id, ins.inputs_and_controls());
         }
-        compute_cmat(&self.code, &self.dfg, &mut self.solver, &mut self.cmat, &mut self.work_bitmap);
-        //crate::trace::trace!(OPTIMIZE "control matrix:\n{:?}", &self.cmat);
         // by default all instructions are based outside basic blocks
         self.place.clear();
         self.inst.clear();
@@ -494,6 +483,17 @@ impl ControlFlow {
         self.idom.raw.resize(self.blocks.raw.len(), BlockId::INVALID.into());
         compute_domtree(&self.cfg, &mut self.idom);
         place_pinned(&self.code, &mut self.inst, &mut self.place);
+        compute_cmat(
+            &self.code,
+            &self.blocks,
+            &self.cfg,
+            &self.inst,
+            &self.place,
+            &mut self.cmat,
+            &mut self.work_bitmap,
+            &mut self.work_blocks
+        );
+        // crate::trace::trace!(OPTIMIZE "control matrix:\n{:?}", &self.cmat);
     }
 
     pub fn queue(&mut self, id: InsId) {
@@ -524,7 +524,6 @@ impl ControlFlow {
             &mut self.work_blocks,
             &self.dfg,
             &mut self.idom,
-            &self.blocks,
             &self.cmat,
             &mut self.inst,
             &mut self.place
