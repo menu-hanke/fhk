@@ -32,7 +32,8 @@ pub enum OptFlag {
     INLINE,
     LOOP,
     PHI,
-    SWITCH
+    SWITCH,
+    IFCHAIN
 }
 
 pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
@@ -47,6 +48,7 @@ pub fn parse_optflags(flags: &[u8]) -> EnumSet<OptFlag> {
             b'l' => LOOP.into(),
             b'p' => PHI.into(),
             b's' => SWITCH.into(),
+            b'n' => IFCHAIN.into(),
             b'a' => EnumSet::all(),
             _ => continue
         });

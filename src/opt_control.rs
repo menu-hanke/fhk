@@ -49,6 +49,41 @@ zerocopy_union! {
     }
 }
 
+/* ---- IFCHAIN ------------------------------------------------------------- */
+
+// if an IF jumps to another IF and...
+// (1) the target IF has the same condition; AND
+// (2) the target IF has no pins
+// then forward the corresponding arm from the target IF.
+
+fn ifchain_run(
+    code: &mut IndexSlice<InsId, Ins>,
+    dfg: &mut Graph<InsId>,
+    blocks: &IndexSlice<BlockId, BlockData>,
+    ctr_data: &IndexSlice<InsId, InsData>
+) {
+    // blocks is in topo order, visit in reverse order so that the last IF in the chain is
+    // visited first.
+    for &BlockData { ctr, .. } in blocks.raw.iter().rev() {
+        let ins = code[ctr];
+        if ins.opcode() != Opcode::IF { continue }
+        let cond = ins.decode_V();
+        for (i, &target) in ins.controls().iter().enumerate() {
+            let tins = code[target];
+            if tins.opcode() == Opcode::IF
+                && tins.decode_V() == cond
+                    && blocks[ctr_data[target].block().unwrap()].pin == 0
+            {
+                code[ctr].controls_mut()[i] = tins.controls()[i];
+                // TODO: here (and other places where replace_input is used), it should
+                // reconstruct the input list instead. this may cause problems if both
+                // inputs are the same (although this will only happen when fold is not enabled)
+                dfg.replace_input(ctr, target, tins.controls()[i]);
+            }
+        }
+    }
+}
+
 /* ---- SWITCH -------------------------------------------------------------- */
 
 // if an IF...
@@ -771,6 +806,9 @@ pub fn run(ocx: &mut Ocx, fid: FuncId) {
     let (data, phi_data) = data.get_dst_mut_split(phi_ptr, func.phis.end().into());
     let ins_data = data.get_dst_mut(insdata_ptr, code.raw.len());
     scandata(code, blocks, &ocx.mark1, ins_data, &mut opt.cf.dfg);
+    if ocx.flags.contains(OptFlag::IFCHAIN) {
+        ifchain_run(code, &mut opt.cf.dfg, blocks, ins_data);
+    }
     if ocx.flags.contains(OptFlag::SWITCH) {
         switch_run(code, blocks, &mut ocx.mark1, &mut ocx.mark2, &mut opt.cf.dfg);
     }
