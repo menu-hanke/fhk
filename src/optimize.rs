@@ -9,7 +9,10 @@
 // * loop optimizations: code motion, fusion
 // * load-store elimination and dead store elimination
 
+use core::hash::Hasher;
+
 use enumset::{EnumSet, EnumSetType};
+use rustc_hash::FxHasher;
 
 use crate::compile::{self, Ccx, Stage};
 use crate::controlflow::ControlFlow;
@@ -95,9 +98,14 @@ fn optimize(ocx: &mut Ocx) {
 }
 
 // TODO: replace this with a sparse hash?
-fn irsize(ir: &IR) -> usize {
-    let size: usize = ir.funcs.raw.iter().map(|f| { let size: usize = f.code.end().into(); size }).sum();
-    size + 37*ir.funcs.raw.len()
+fn irhash(ir: &mut IR) -> u64 {
+    let mut hash = FxHasher::default();
+    for func in &mut ir.funcs.raw {
+        for &ins in &func.code.inner_mut().raw {
+            hash.write_u64(zerocopy::transmute!(ins));
+        }
+    }
+    hash.finish()
 }
 
 impl Stage for Optimize {
@@ -112,22 +120,21 @@ impl Stage for Optimize {
     }
 
     fn run(ocx: &mut Ccx<Optimize>) -> compile::Result {
-        let mut size = irsize(&ocx.ir);
+        let mut hash = irhash(&mut ocx.ir);
         ocx.freeze_graph(|ocx| {
             for i in 0..MAX_ITER {
                 optimize(ocx);
-                let newsize = irsize(&ocx.ir);
-                if size == newsize || newsize == 0 {
+                let newhash = irhash(&mut ocx.ir);
+                if hash == newhash || newhash == 0 {
                     trace!(OPTIMIZE "converged in {} iterations", i+1);
                     break
                 } else {
-                    trace!(OPTIMIZE "IR size {} -> {}", size, newsize);
                     if trace!(OPTIMIZE) && !ocx.flags.is_empty() {
                         let mut tmp = Default::default();
                         dump_ir(&mut tmp, &ocx.ir, &ocx.intern, &ocx.objs);
                         trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
                     }
-                    size = newsize;
+                    hash = newhash;
                 }
             }
         });
