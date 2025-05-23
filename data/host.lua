@@ -471,6 +471,7 @@ end
 local function compilequery(query, image)
 	local ct = queryctype(query)
 	local mcode = ffi.cast("const uint8_t *", image) + query.obj.mcode
+	query.ctype = ct
 	query.query = queryfunc(ct, mcode)
 end
 
