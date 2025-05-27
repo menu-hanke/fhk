@@ -281,6 +281,7 @@ impl<'a> CompileError<PcxData<'a>> for DefinitionError {
             DefinitionErrorType::Redefinition => "redefinition of"
         });
         pcx.host.buf.write(nsname(self.ns));
+        pcx.host.buf.write(b": ");
         stringify(
             &mut pcx.host.buf,
             &pcx.intern,
