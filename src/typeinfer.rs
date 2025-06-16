@@ -1,6 +1,7 @@
 //! Type inference.
 
 use core::cmp::min;
+use core::fmt::Debug;
 use core::hash::Hasher;
 use core::iter::zip;
 
@@ -73,11 +74,27 @@ impl Type {
 
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 enum TypeRepr {
     Var(TypeVar),
     Pri(EnumSet<Primitive>),
     Con(u8, TypeVar),
+}
+
+impl Debug for TypeRepr {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        use TypeRepr::*;
+        match *self {
+            Var(v) => v.fmt(f),
+            Pri(p) => p.fmt(f),
+            Con(Constructor::TENSOR, base) => write!(f, "{:?}[{:?}]", base, base+1),
+            Con(Constructor::PAIR, base) => write!(f, "({:?}, {:?})", base, base+1),
+            // Con(Constructor::FUNC, base) => write!(f, "{:?} -> {:?}", base, base+1),
+            Con(Constructor::NEXT, base) => write!(f, "{:?}+1", base),
+            Con(Constructor::UNIT, _) => f.write_str("()"),
+            _ => unreachable!()
+        }
+    }
 }
 
 enum Constraint {
@@ -952,15 +969,17 @@ fn visitall(tcx: &mut Tcx) {
     tcx.data.ann.insert_unique_unchecked(ObjRef::TRUE.erase(), Type::var(b1));
     tcx.data.ann.insert_unique_unchecked(ObjRef::FALSE.erase(), Type::var(b1));
     let objs = Access::borrow(&tcx.objs);
-    for (_, o) in objs.pairs() {
+    for (idx, o) in objs.pairs() {
         match o {
             ObjectRef::TAB(&TAB { shape, .. }) => {
+                trace!(TYPE "tab {:?}", idx);
                 tcx.data.tab = ObjRef::GLOBAL;
                 let ty = shapetype(tcx, &objs[shape].fields);
                 let ety = exprtype(tcx, shape.cast());
                 unifyvar(&mut tcx.data.sub, ety, ty);
             },
             ObjectRef::MOD(&MOD { tab, guard, ref value, .. }) => {
+                trace!(TYPE "mod {:?}", idx);
                 tcx.data.tab = tab;
                 if !guard.is_nil() {
                     let ety = exprtype(tcx, guard);
@@ -975,6 +994,7 @@ fn visitall(tcx: &mut Tcx) {
             },
             ObjectRef::FUNC(_) => todo!(),
             ObjectRef::QUERY(&QUERY { tab, ref value, .. }) => {
+                trace!(TYPE "query {:?}", idx);
                 tcx.data.tab = tab;
                 for &v in value {
                     exprtype(tcx, v);
@@ -991,9 +1011,14 @@ fn canondim(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
     ty = match ty.unpack() {
         Var(i) if i == tv => Type::UNIT,
         Var(i) => canondim(sub, i),
-        Con(Constructor::UNIT | Constructor::NEXT, _) => return ty,
+        Con(Constructor::NEXT, prev) => {
+            canondim(sub, prev);
+            return ty;
+        },
+        Con(Constructor::UNIT, _) => return ty,
         _ => unreachable!()
     };
+    trace!(TYPE "canon dim {:?} = {:?}", tv, ty.unpack());
     sub[tv] = ty;
     ty
 }
@@ -1045,6 +1070,7 @@ fn canonty(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
         },
         _ => return ty
     };
+    trace!(TYPE "canon {:?} = {:?}", tv, ty.unpack());
     sub[tv] = ty;
     ty
 }
@@ -1068,6 +1094,7 @@ fn annotate(ccx: &mut Ccx<TypeInfer>) {
             if op != Obj::VAR {
                 ann = canonty(&mut ccx.data.sub, zerocopy::transmute!(ann));
             }
+            trace!(TYPE "ann {:?}: {:?}", idx, ann.unpack());
             let ann = typeobj(ccx, ann);
             let ofs = match op {
                 Obj::VAR => obj_index_of!(VAR, ann),
