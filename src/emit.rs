@@ -18,7 +18,7 @@ use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
-use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, Opcode, PhiId, Query, Type, IR};
+use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
 use crate::mem::{CursorA, SizeClass, Slot};
@@ -418,15 +418,6 @@ pub fn storeslot(
         value = emit.fb.ins().bor(value, old);
     }
     emit.fb.ins().store(MEM_VMCTX, value, ptr, 0);
-}
-
-pub fn collectargs(emit: &Emit, dest: &mut Bump<InsValue>, mut arg: InsId) {
-    while emit.code[arg].opcode() != Opcode::NOP {
-        debug_assert!(emit.code[arg].opcode() == Opcode::CARG);
-        let (ap, v) = emit.code[arg].decode_CARG();
-        dest.push(emit.values[v]);
-        arg = ap;
-    }
 }
 
 fn emithead(emit: &mut Emit, func: &Func) {

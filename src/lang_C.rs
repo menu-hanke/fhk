@@ -1,18 +1,21 @@
 //! C language support.
 
 use core::cmp::{max, Ordering};
+use core::ffi::CStr;
 use core::iter::{repeat_n, zip};
 
+use alloc::vec::Vec;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature};
 use enumset::EnumSetType;
 
 use crate::bitmap::BitmapWord;
 use crate::bump::{BumpPtr, BumpRef, BumpVec};
 use crate::compile::{self, Ccx};
-use crate::emit::{cast_values, collectargs, irt2cl, Ecx, InsValue, NATIVE_CALLCONV};
+use crate::dl::{self, LibBox};
+use crate::emit::{cast_values, irt2cl, Ecx, InsValue, NATIVE_CALLCONV};
 use crate::index::InvalidValue;
 use crate::intern::IRef;
-use crate::ir::{Func, Ins, InsId, LangOp, Type};
+use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::CLcx;
@@ -21,9 +24,8 @@ use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
 use crate::typing::{Primitive, IRT_IDX};
 
-const LOP_CFUNC: u8 = 0;
-const LOP_CCALL: u8 = 1;
-const LOP_CRES:  u8 = 2;
+const LOP_CSYM: u8 = 0;
+const LOP_CRES: u8 = 1;
 
 #[derive(Default)]
 pub struct C;
@@ -113,29 +115,6 @@ impl CType {
 
 }
 
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C)]
-struct CFunc {
-    what: u8,
-    ret: CType,
-    _pad: [u8; 2],
-    args: IRef<[CType]>,
-}
-
-impl CFunc {
-    // values for `what`:
-    const PTR: u8 = 0;  // indirect call, first arg is function pointer
-    const SYM: u8 = 1;  // call symbol (SymCall)
-}
-
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C)]
-struct CDynFunc {
-    func: CFunc,
-    lib: IRef<[u8]>,
-    sym: IRef<[u8]>,
-}
-
 // value = scalar(input) | struct
 // struct = field*
 // field = value | output
@@ -208,10 +187,16 @@ impl Output {
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
+struct Sym {
+    lib: IRef<[u8]>,
+    sym: IRef<[u8]>,
+}
+
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+#[repr(C)]
 struct Call {
-    func: IRef<CFunc>,
     args: BumpRef<Value>,
-    inputs: BumpRef<CType>,
+    inputs_ctype: BumpRef<CType>,
     outputs: BumpRef<Output>,
     stores: BumpRef<Store>,
     narg: u16,
@@ -219,7 +204,8 @@ struct Call {
     nstore: u16,
     size: u16,
     align: u16,
-    _pad: u16
+    ret: CType,
+    _pad: u8
 }
 
 /* ---- Parsing ------------------------------------------------------------- */
@@ -233,7 +219,7 @@ struct Field {
 }
 
 enum CExpr {
-    Input(u16, CType),        // value : ctype
+    Input(u16),               // input idx
     ScalarOutput(u16, CType), // out : ctype
     _TensorOutput(u16),        // out[...] : ctype (TODO)
     Ptr(u16),                 // :struct { ... } *
@@ -249,7 +235,6 @@ struct AllocLayout {
 struct ParseState {
     need: BitmapWord,
     n: u16,
-    sig: BumpVec<CType>,
     args: BumpVec<Value>,
     inputs: BumpVec<ObjRef<EXPR>>,
     inputs_ctype: BumpVec<CType>,
@@ -257,7 +242,6 @@ struct ParseState {
     alloc: AllocLayout,
     stores: BumpVec<Store>,
     fields: BumpVec<Field>,
-    sym: Option<(IRef<[u8]>, IRef<[u8]>)>,
     ret: CType
 }
 
@@ -388,7 +372,7 @@ fn parse_in(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     consume(pcx, Token::Colon)?;
     let ann = parse_ctype(pcx)?;
     ps.inputs_ctype.push(&mut pcx.tmp, ann);
-    Ok(CExpr::Input(idx as _, ann))
+    Ok(CExpr::Input(idx as _))
 }
 
 fn parse_struct(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
@@ -398,8 +382,9 @@ fn parse_struct(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     let mut fieldbase = start;
     while pcx.data.token != Token::RCurly {
         match parse_cexpr(pcx, ps)? {
-            CExpr::Input(idx, ctype) => {
-                let ofs = putfield(&mut layout, ctypelayout(ctype));
+            CExpr::Input(idx) => {
+                let inner = ctypelayout(ps.inputs_ctype.as_slice(&pcx.tmp)[idx as usize]);
+                let ofs = putfield(&mut layout, inner);
                 ps.fields.push(&mut pcx.tmp, Field { ofs, data: idx, tag: TAG_INPUT });
             },
             CExpr::ScalarOutput(idx, ctype) => {
@@ -460,36 +445,50 @@ fn parse_cexpr(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     }
 }
 
+fn newsymref(sym: BumpRef<Sym>) -> u32 {
+    let sym: u32 = zerocopy::transmute!(sym);
+    !sym
+}
+
+fn newcallref(call: BumpRef<Call>) -> u32 {
+    zerocopy::transmute!(call)
+}
+
+fn iscallref(func: u32) -> bool {
+    (func as i32) >= 0
+}
+
 fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
     consume(pcx, Token::LBracket)?;
-    ps.sym = match pcx.data.token {
+    let fp = match pcx.data.token {
         Token::Literal => {
             let s = zerocopy::transmute!(pcx.data.tdata);
             next(pcx)?;
-            match check(pcx, Token::Colon)? {
+            let sym = match check(pcx, Token::Colon)? {
                 true => {
                     let sym = zerocopy::transmute!(pcx.data.tdata);
                     next(pcx)?;
-                    Some((s, sym))
+                    Sym { lib: s, sym }
                 },
-                false => Some((IRef::EMPTY, s))
-            }
+                false => Sym { lib: IRef::EMPTY, sym: s }
+            };
+            let sym = pcx.intern.intern(&sym).to_bump();
+            pcx.objs.push(CALLX::new(Lang::C as _, ObjRef::PTR.erase(), newsymref(sym))).cast()
         },
         _ => {
             let ptr = parse_expr(pcx)?;
             pcx.objs.annotate(ptr, ObjRef::PTR.erase());
-            ps.inputs.push(&mut pcx.tmp, ptr);
-            ps.inputs_ctype.push(&mut pcx.tmp, CType::VOID_PTR);
-            None
+            ptr
         }
     };
+    ps.inputs.push(&mut pcx.tmp, fp);
+    ps.inputs_ctype.push(&mut pcx.tmp, CType::VOID_PTR);
     consume(pcx, Token::RBracket)?;
     consume(pcx, Token::LParen)?;
     while pcx.data.token != Token::RParen {
         match parse_cexpr(pcx, ps)? {
-            CExpr::Input(idx, ctype) => {
+            CExpr::Input(idx) => {
                 ps.args.push(&mut pcx.tmp, Value::from_data_tag(idx, TAG_INPUT));
-                ps.sig.push(&mut pcx.tmp, ctype);
             },
             CExpr::ScalarOutput(..) => {
                 // TODO: report error (out parameter is not a pointer)
@@ -497,11 +496,9 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
             },
             CExpr::_TensorOutput(idx) => {
                 ps.args.push(&mut pcx.tmp, Value::from_data_tag(idx, TAG_OUTPUT_TENSOR));
-                ps.sig.push(&mut pcx.tmp, CType::VOID_PTR);
             },
             CExpr::Ptr(offset) => {
                 ps.args.push(&mut pcx.tmp, Value::from_data_tag(offset, TAG_OFFSET));
-                ps.sig.push(&mut pcx.tmp, CType::VOID_PTR);
             },
             CExpr::Struct(_) => {
                 // TODO: pass struct by value
@@ -529,41 +526,26 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
 }
 
 fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALLX> {
-    let func = {
-        let args = pcx.intern.intern(ps.sig.as_slice(&pcx.tmp));
-        let func = CFunc {
-            what: match ps.sym { Some(_) => CFunc::SYM, _ => CFunc::PTR },
-            ret: ps.ret,
-            args,
-            _pad: Default::default()
-        };
-        match ps.sym {
-            None             => pcx.intern.intern(&func),
-            Some((lib, sym)) => pcx.intern.intern(&CDynFunc { func, lib, sym }).cast(),
-        }
-    };
-    let call = {
-        let args = pcx.perm.write(ps.args.as_slice(&pcx.tmp));
-        let stores = pcx.perm.write(ps.stores.as_slice(&pcx.tmp));
-        let inputs = pcx.perm.write(ps.inputs_ctype.as_slice(&pcx.tmp));
-        let outputs = pcx.perm.write(&pcx.tmp[ps.outputs..ps.outputs.offset(ps.n as _)]);
-        pcx.perm.write(&Call {
-            func,
-            args: args.cast(),
-            inputs: inputs.cast(),
-            outputs: outputs.cast(),
-            stores: stores.cast(),
-            narg: ps.args.len() as _,
-            nout: ps.n,
-            nstore: ps.stores.len() as _,
-            size: ps.alloc.size,
-            align: ps.alloc.align as _,
-            _pad: 0
-        })
-    };
+    let args = pcx.perm.write(ps.args.as_slice(&pcx.tmp));
+    let stores = pcx.perm.write(ps.stores.as_slice(&pcx.tmp));
+    let inputs = pcx.perm.write(ps.inputs_ctype.as_slice(&pcx.tmp));
+    let outputs = pcx.perm.write(&pcx.tmp[ps.outputs..ps.outputs.offset(ps.n as _)]);
+    let call = pcx.perm.write(&Call {
+        args: args.cast(),
+        inputs_ctype: inputs.cast(),
+        outputs: outputs.cast(),
+        stores: stores.cast(),
+        narg: ps.args.len() as _,
+        nout: ps.n,
+        nstore: ps.stores.len() as _,
+        size: ps.alloc.size,
+        align: ps.alloc.align as _,
+        ret: ps.ret,
+        _pad: 0
+    });
     // TODO: nonscalar out parameters need annotations
     pcx.objs.push_args(
-        CALLX::new(Lang::C as _, ObjRef::NIL, zerocopy::transmute!(call)),
+        CALLX::new(Lang::C as _, ObjRef::NIL, newcallref(call)),
         ps.inputs.as_slice(&pcx.tmp)
     )
 }
@@ -603,18 +585,14 @@ fn lower_call(
     let call = &lcx.perm[call];
     let alloc = match call.size {
         0 => InsId::INVALID.into(),
-        size => {
-            let size = func.code.push(Ins::KINT(Type::I64, size as _));
-            let align = func.code.push(Ins::KINT(Type::I64, call.align as _));
-            func.code.push(Ins::ALLOC(size, align, ctr))
-        }
+        size => func.code.push(Ins::ABOX(ctr, size, call.align))
     };
     let callins = func.code.push(Ins::NOP_FX);
     // auto box and convert inputs
     let inputs_conv = {
         let (iref, iptr) = lcx.tmp.reserve_dst::<[InsId]>(inputs.len());
         for ((&iexpr, &ctype), (&input, ip)) in zip(
-            zip(&callx.inputs, &lcx.perm[call.inputs..call.inputs.offset(inputs.len() as _)]),
+            zip(&callx.inputs, &lcx.perm[call.inputs_ctype..call.inputs_ctype.offset(inputs.len() as _)]),
             zip(inputs, iptr)
         ) {
             if ctype != CType::VOID_PTR {
@@ -717,46 +695,96 @@ fn lower_call(
         let value = lower_value(&lower, &lcx.tmp, func, arg);
         args = func.code.push(Ins::CARG(args, value));
     }
-    if lcx.intern[call.func].what == CFunc::PTR {
-        args = func.code.push(Ins::CARG(args, inputs[0]));
-    }
-    let funcref = func.code.push(Ins::LOXX(Type::LSV,
-            LangOp::new(Lang::C, LOP_CFUNC), zerocopy::transmute!(call.func)));
-    func.code.set(callins, Ins::LOVV(Type::FX, args, funcref, LangOp::new(Lang::C, LOP_CCALL)));
+    func.code.set(callins, Ins::LOVV(Type::FX, inputs[0], args, LangOp::C(!(call.ret.to_ir() as u8))));
     outbase
+}
+
+fn lower_sym(func: &Func, nsym: u32) -> InsId {
+    func.code.push(Ins::LOXX(Type::PTR, LangOp::C(LOP_CSYM), !nsym))
 }
 
 /* ---- Emitting ------------------------------------------------------------ */
 
+fn loadsyms(ccx: &mut Ccx) -> compile::Result {
+    // this allocates instead of using ccx.tmp because dealing with pointers with zerocopy is aids.
+    // big deal, this happens once per compilation and dlopen is much slower than an allocation
+    // anyway.
+    let mut libs: Vec<(IRef<[u8]>, LibBox)> = Default::default();
+    let tmp_base = ccx.tmp.end();
+    for func in &mut ccx.ir.funcs.raw {
+        for ins in &mut func.code.inner_mut().raw {
+            if ins.opcode() == Opcode::LOXX && ins.decode_L() == LangOp::C(LOP_CSYM) {
+                let (_, fsym) = ins.decode_LOXX();
+                let fsym: BumpRef<Sym> = zerocopy::transmute!(fsym);
+                let Sym { lib, sym } = ccx.intern.bump()[fsym];
+                let handle = match libs.iter().find_map(|(l,h)| (lib==*l).then_some(&*h)) {
+                    Some(handle) => handle,
+                    None => {
+                        let libname = ccx.intern.get_slice(lib);
+                        ccx.tmp.truncate(tmp_base);
+                        ccx.tmp.write(libname);
+                        ccx.tmp.push(0u8);
+                        let Some(handle) = dl::open(&ccx.tmp[tmp_base..]) else {
+                            ccx.host.buf.clear();
+                            ccx.host.buf.write("failed to load library: `");
+                            ccx.host.buf.write(libname);
+                            ccx.host.buf.write("'");
+                            return Err(());
+                        };
+                        libs.push((lib, handle));
+                        &*libs.last().unwrap().1
+                    }
+                };
+                let symname = ccx.intern.get_slice(sym);
+                ccx.tmp.truncate(tmp_base);
+                ccx.tmp.write(symname);
+                ccx.tmp.push(0u8);
+                let fp = handle.sym(unsafe { CStr::from_bytes_with_nul_unchecked(&ccx.tmp[tmp_base..]) });
+                if fp.is_null() {
+                    ccx.host.buf.clear();
+                    ccx.host.buf.write("undefined symbol: `");
+                    ccx.host.buf.write(symname);
+                    ccx.host.buf.write("'");
+                    return Err(());
+                }
+                let fp = ccx.intern.intern(&(fp as u64).to_ne_bytes()).to_bump();
+                *ins = Ins::KINT64(Type::PTR, zerocopy::transmute!(fp));
+            }
+        }
+    }
+    ccx.tmp.truncate(tmp_base);
+    for (_, handle) in libs {
+        ccx.fin.push(handle);
+    }
+    Ok(())
+}
+
 fn emit_call(ecx: &mut Ecx, id: InsId) -> InsValue {
     let emit = &mut *ecx.data;
-    let (mut args, cf) = emit.code[id].decode_VV();
-    let func: &CFunc = &ecx.intern[zerocopy::transmute!(emit.code[cf].bc())];
-    let ptr = match func.what {
-        CFunc::PTR => {
-            let (ap, ptr) = emit.code[args].decode_CARG();
-            args = ap;
-            ptr
-        },
-        _ /* SYM */ => {
-            // TODO: load dynamic sym
-            todo!()
-        }
-    };
+    let (ptr, mut args) = emit.code[id].decode_VV();
     let mut sig = Signature::new(NATIVE_CALLCONV);
-    sig.params.extend(
-        ecx.intern.get_slice(func.args)
-        .iter()
-        .map(|ct| AbiParam::new(irt2cl(ct.to_ir())))
-    );
-    sig.returns.push(AbiParam::new(irt2cl(func.ret.to_ir())));
-    let sig = emit.fb.ctx.func.import_signature(sig);
+    let base = ecx.tmp.end();
     let argv = ecx.tmp.align_for::<InsValue>();
-    let argbase = argv.end();
-    collectargs(emit, argv, args);
-    InsValue::from_cl_inst(
-        emit.fb.ins().call_indirect(sig, emit.values[ptr].value(), cast_values(&argv[argbase..]))
-    )
+    while emit.code[args].opcode() != Opcode::NOP {
+        let (next, value) = emit.code[args].decode_CARG();
+        sig.params.push(AbiParam::new(irt2cl(emit.code[value].type_())));
+        argv.push(emit.values[value]);
+        args = next;
+    }
+    let ret = Type::from_u8(!emit.code[id].decode_L().op);
+    if ret.size() > 0 {
+        sig.returns.push(AbiParam::new(irt2cl(ret)));
+    }
+    let sig = emit.fb.ctx.func.import_signature(sig);
+    let value = InsValue::from_cl_inst(
+        emit.fb.ins().call_indirect(
+            sig,
+            emit.values[ptr].value(),
+            cast_values(&argv[base.cast_up()..])
+        )
+    );
+    ecx.tmp.truncate(base);
+    value
 }
 
 fn emit_res(ecx: &mut Ecx, id: InsId) -> InsValue {
@@ -776,7 +804,6 @@ impl Language for C {
         let mut ps = ParseState {
             need: Default::default(),
             n: n as _,
-            sig: Default::default(),
             args: Default::default(),
             inputs: Default::default(),
             inputs_ctype: Default::default(),
@@ -784,7 +811,6 @@ impl Language for C {
             alloc: Default::default(),
             stores: Default::default(),
             fields: Default::default(),
-            sym: Default::default(),
             ret: CType::VOID
         };
         ps.need.set_range(0..n);
@@ -806,20 +832,24 @@ impl Language for C {
         inputs: &[InsId]
     ) -> InsId {
         let base = lcx.tmp.end();
-        let res = lower_call(lcx, ctr, obj, func, inputs);
+        let res = match lcx.objs[obj].func {
+            f if iscallref(f) => lower_call(lcx, ctr, obj, func, inputs),
+            s => lower_sym(func, s)
+        };
         lcx.tmp.truncate(base);
         res
     }
 
-    fn begin_emit(_: &mut Ccx) -> compile::Result<Self> {
+    fn begin_emit(ccx: &mut Ccx) -> compile::Result<Self> {
+        loadsyms(ccx)?;
         Ok(Default::default())
     }
 
     fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<InsValue> {
         Ok(match lop {
-            LOP_CCALL => emit_call(ecx, id),
-            LOP_CRES  => emit_res(ecx, id),
-            _ => unreachable!()
+            LOP_CSYM => unreachable!(), // rewritten in begin_emit
+            LOP_CRES => emit_res(ecx, id),
+            _        => emit_call(ecx, id),
         })
     }
 
