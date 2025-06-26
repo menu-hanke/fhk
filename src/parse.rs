@@ -62,7 +62,7 @@ fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: IRef<[u8]>) -> ObjRef<VAR> {
 fn newanonvar(pcx: &mut Pcx, tab: ObjRef<TAB>, ann: ObjRef/*TY*/, value: ObjRef<EXPR>) -> ObjRef<VAR> {
     let var = pcx.objs.push(VAR::new(IRef::EMPTY, tab, ann));
     let vset = pcx.objs.push_args::<VSET>(VSET::new(0, var, value), &[]);
-    pcx.objs.push_args::<MOD>(MOD::new(IRef::EMPTY, tab, ObjRef::NIL.cast()), &[vset]);
+    pcx.objs.push_args::<MOD>(MOD::new(tab, ObjRef::NIL.cast()), &[vset]);
     var
 }
 
@@ -542,10 +542,7 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<VAR>>) -> compile::R
         (None, None) => ObjRef::NIL.cast()
     };
     // pcx.data.tab is guaranteed to be set here because we came here from parse_model
-    pcx.objs.push_args::<MOD>(
-        MOD::new(IRef::EMPTY, pcx.data.tab, guard),
-        cast_args(&pcx.tmp[vset_base..])
-    );
+    pcx.objs.push_args::<MOD>(MOD::new(pcx.data.tab, guard), cast_args(&pcx.tmp[vset_base..]));
     pcx.tmp.truncate(base);
     Ok(())
 }

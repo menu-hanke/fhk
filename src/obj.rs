@@ -282,12 +282,11 @@ macro_rules! define_ops {
 // note: all fields here must be 4 byte POD types.
 define_ops! {
     // named objects. name must be first. tab must be second for VAR and MOD.
-    // ORDER NAMEDOBJ
     VAR         { name: Name, tab: ObjRef<TAB>, ann: ObjRef/*TY*/};
-    MOD         { name: Name, tab: ObjRef<TAB>, guard: ObjRef<EXPR> } value: [ObjRef<VSET>];
     TAB         { name: Name, shape: ObjRef<TUPLE> };
     FUNC        { name: Name, value: ObjRef<EXPR> };
     // non-named objects.
+    MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR> } value: [ObjRef<VSET>];
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
     RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
@@ -352,16 +351,6 @@ impl Operator {
     pub fn is_type_raw(op: u8) -> bool {
         use Operator::*;
         (TVAR|TPRI|TTEN|TTUP).as_u64_truncated() & (1 << op) != 0
-    }
-
-    // depends on ORDER NAMEDOBJ
-    fn has_name_and_tab_raw(op: u8) -> bool {
-        op <= Self::MOD as u8
-    }
-
-    // depends on ORDER NAMEDOBJ
-    pub fn is_func_raw(op: u8) -> bool {
-        op <= Self::QUERY as u8
     }
 
 }
@@ -694,8 +683,8 @@ fn lookupkey(data: &[u32], idx: usize) -> (u32, IRef<[u8]>) {
     let obj: Obj = zerocopy::transmute!(data[idx]);
     let name: IRef<[u8]> = zerocopy::transmute!(data[idx+1]);
     let mut namespace = obj.op as u32;
-    if Operator::has_name_and_tab_raw(obj.op) {
-        namespace |= data[idx+2] << 3;
+    if obj.op == Obj::VAR {
+        namespace |= data[idx+obj_index_of!(VAR, tab)] << 2;
     }
     (namespace, name)
 }
@@ -775,7 +764,7 @@ impl Objects {
         match entry(
             &mut self.lookup,
             self.bump.as_slice(),
-            ((raw<<3) | Operator::VAR as u32, name)
+            ((raw<<2) | Operator::VAR as u32, name)
         ) {
             Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
             Entry::Vacant(entry) => {
