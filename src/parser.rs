@@ -17,16 +17,11 @@ use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
 use crate::intern::{Intern, IRef};
 use crate::lex::{self, Token};
-use crate::obj::{ObjRef, EXPR, TAB};
+use crate::obj::{ObjRef, TAB};
 use crate::typestate::{typestate_union, Absent, R};
 
 index!(pub struct ScopeId(u32) invalid(!0));
 index!(struct MacroId(u32) invalid(!0));
-
-pub struct Binding {
-    pub name: IRef<[u8]>,
-    pub value: ObjRef<EXPR>
-}
 
 struct Macro {
     table_pattern: IRef<[u8]>, // only for model/var
@@ -68,13 +63,14 @@ pub struct Parser<L=Absent> {
     pub tdata: TokenData,
     pub lex: LexData<L>,
     pub scope: ScopeId,
-    pub bindings: Vec<Binding>,
+    pub bindings: Vec<IRef<[u8]>>,
     pub tab: ObjRef<TAB>,
     pub marg: Vec<IRef<[u8]>>,
     pub undef: Vec<ObjRef>,
     pub undef_base: usize,
     pub this: ObjRef,
     pub rec: bool,
+    pub binddim: u8,
     macros: IndexVec<MacroId, Macro>,
     chain: HashMap<(IRef<[u8]>, Namespace), (MacroId, MacroId)>, // stem -> (head, tail)
     stack: Vec<Frame>,
@@ -795,7 +791,8 @@ impl Stage for Parser {
             stack: Default::default(),
             captures: Default::default(),
             snippet: Default::default(),
-            rec: false
+            rec: false,
+            binddim: 0
         })
     }
 

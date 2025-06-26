@@ -15,9 +15,12 @@ use zerocopy::Unalign;
 use crate::bump::{self, Aligned, Bump, BumpRef};
 use crate::compile::Ccx;
 use crate::hash::fxhash;
+use crate::index::index;
 use crate::intern::IRef;
 use crate::mcode::MCodeOffset;
 use crate::typing::Primitive;
+
+index!(pub struct LocalId(u32));
 
 // must have ALIGN=4
 pub unsafe trait ObjType: Aligned {}
@@ -81,15 +84,16 @@ impl<T: ?Sized> ObjRef<T> {
         self.erase() == ObjRef::NIL
     }
 
+    // ORDER BUILTINOBJ
+    pub fn is_builtin(self) -> bool {
+        let raw: u32 = zerocopy::transmute!(self);
+        raw <= zerocopy::transmute!(ObjRef::GLOBAL)
+    }
+
 }
 
 pub fn cast_args<T: ?Sized, U: ?Sized>(args: &[ObjRef<T>]) -> &[ObjRef<U>] {
     // hopefully one day zerocopy::transmute_ref can do this
-    unsafe { slice::from_raw_parts(args.as_ptr().cast(), args.len()) }
-}
-
-pub fn cast_args_raw<T: ?Sized>(args: &[u32]) -> &[ObjRef<T>] {
-    // same as above
     unsafe { slice::from_raw_parts(args.as_ptr().cast(), args.len()) }
 }
 
@@ -286,11 +290,11 @@ define_ops! {
     TAB         { name: Name, shape: ObjRef<TUPLE> };
     FUNC        { name: Name, value: ObjRef<EXPR> };
     // non-named objects.
-    MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR> } value: [ObjRef<VSET>];
+    MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR>, value: ObjRef<EXPR> } outputs: [ObjRef<VSET>];
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
-    RESET.id    { mlo: u32, mhi: u32 } objs: [ObjRef/*VAR|MOD*/];
+    RESET.id    { mlo: u32, mhi: u32 /* TODO: use 32-bit offset instead */ } objs: [ObjRef/*VAR|MOD*/];
     FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
-    VSET.dim    { var: ObjRef<VAR>, value: ObjRef<EXPR> } idx: [ObjRef<EXPR/*|SPEC*/>];
+    VSET.dim    { var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     // types
     TVAR        {};
     TPRI.ty     {};
@@ -308,6 +312,8 @@ define_ops! {
     DIM.axis    { ann: ObjRef/*TPRI.IDX*/ };
     LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
+    LET         { ann: ObjRef/*TY*/, value: ObjRef<EXPR>, expr: ObjRef<EXPR> };
+    LGET        { ann: ObjRef/*TY*/, slot: LocalId };
     VGET.dim    { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
@@ -433,11 +439,6 @@ impl Intrinsic {
         assert!(raw < <Intrinsic as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
         unsafe { core::mem::transmute(raw) }
     }
-
-     pub fn is_broadcast(self) -> bool {
-         use Intrinsic::*;
-         (UNM|NOT|EXP|LOG|CONV).contains(self)
-     }
 
 }
 
@@ -815,6 +816,7 @@ macro_rules! default_objs {
     };
 }
 
+// ORDER BUILTINOBJ
 default_objs! {
     pub NIL           (0)  = SPEC::new(SPEC::NIL, ObjRef::UNIT);
     pub SLURP         (2)  = SPEC::new(SPEC::SLURP, ObjRef::UNIT);

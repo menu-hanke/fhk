@@ -7,6 +7,7 @@
 // * merge functions with identical callers
 // * outline instance-invariant code
 // * loop optimizations: code motion, fusion
+// * merge identical phis
 // * load-store elimination and dead store elimination
 
 use core::hash::Hasher;

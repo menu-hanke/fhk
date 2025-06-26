@@ -19,7 +19,7 @@ use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::{decompose, decomposition, decomposition_size, reserve, CLcx};
 use crate::mmap::{Mmap, Prot};
-use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP, TVAR};
+use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
 use crate::support::SuppFunc;
@@ -208,8 +208,7 @@ fn parse_luavalue(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
             }
             consume(pcx, Token::RBracket)?;
             let shape: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
-            let tv = pcx.objs.push(TVAR::new());
-            let ty = pcx.objs.push(TTEN::new(shape.len() as _, tv.erase()));
+            let ty = pcx.objs.push(TTEN::new(shape.len() as _, ObjRef::NIL));
             let new = pcx.objs.push_args::<NEW>(NEW::new(ty.erase()), shape);
             pcx.tmp.truncate(base);
             let input = ps.inputs.len();

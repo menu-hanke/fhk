@@ -50,6 +50,7 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
     let ins = emit.code[id];
     let (value, target, phi) = ins.decode_JMP();
     let func = &ecx.ir.funcs[emit.fid];
+    debug_assert!(emit.code[value].type_() == func.phis.at(phi).type_);
     let ty = emit.code[value].type_();
     'jret: {
         if phi < func.ret && ty != Type::FX {

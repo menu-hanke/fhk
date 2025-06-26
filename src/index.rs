@@ -49,14 +49,14 @@ impl<I: Index, T> IndexSlice<I, T> {
     }
 
     pub fn pairs(&self) -> core::iter::Zip<
-            core::iter::Map<Range<usize>, fn(usize) -> I>,
+            core::iter::Map<Range<usize>, impl Fn(usize) -> I>,
             core::slice::Iter<T>>
     {
         iter_span(self.end()).zip(self.raw.iter())
     }
 
     pub fn pairs_mut(&mut self) -> core::iter::Zip<
-            core::iter::Map<Range<usize>, fn(usize) -> I>,
+            core::iter::Map<Range<usize>, impl Fn(usize) -> I>,
             core::slice::IterMut<T>>
     {
         iter_span(self.end()).zip(self.raw.iter_mut())
@@ -435,11 +435,11 @@ impl<I: Index> Default for IndexSet<I> {
     }
 }
 
-pub fn iter_range<I: Index>(range: Range<I>) -> core::iter::Map<Range<usize>, fn(usize) -> I> {
+pub fn iter_range<I: Index>(range: Range<I>) -> core::iter::Map<Range<usize>, impl Fn(usize) -> I> {
     (range.start.into()..range.end.into()).map(Into::into)
 }
 
-pub fn iter_span<I: Index>(end: I) -> core::iter::Map<Range<usize>, fn(usize) -> I> {
+pub fn iter_span<I: Index>(end: I) -> core::iter::Map<Range<usize>, impl Fn(usize) -> I> {
     iter_range(0.into()..end)
 }
 

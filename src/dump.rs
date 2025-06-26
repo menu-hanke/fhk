@@ -97,9 +97,9 @@ fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugS
             stringify(buf, intern, intern.get_slice(name), SequenceType::Pattern);
             buf.push(b')');
         },
-        ObjectRef::MOD(MOD { value, .. }) => {
+        ObjectRef::MOD(MOD { outputs, .. }) => {
             buf.push(b'(');
-            for (i, &vset) in value.iter().enumerate() {
+            for (i, &vset) in outputs.iter().enumerate() {
                 if i>0 { buf.push(b','); }
                 let VSET { var, .. } = objs[vset];
                 let VAR { name, .. } = objs[var];

@@ -12,11 +12,11 @@ use crate::bump::{self, Bump, BumpRef};
 use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
-use crate::index::{IndexOption, InvalidValue};
+use crate::index::{IndexOption, IndexVec, InvalidValue};
 use crate::ir::{self, Chunk, DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, cast_args_raw, obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LOAD, MOD, NEW, QUERY, RESET, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LET, LGET, LOAD, MOD, NEW, QUERY, RESET, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R, RW};
 use crate::typing::{Primitive, IRT_IDX};
@@ -40,23 +40,22 @@ bump::vla_struct! {
 
 bump::vla_struct! {
     struct Mod {
+        obj: ObjRef<MOD>,
         tab: BumpRef<Tab>,
-        guard: ObjRef<EXPR>,
         base: FuncId,
         n: u8,
         mt: u8
-    } value: [VSet; |m| m.n as usize]
+    } outputs: [VSet; |m| m.n as usize]
 }
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct VSet {
-    obj: ObjRef<VSET>,
     model: BumpRef<Mod>,
     var: BumpRef<Var>,
     ret: PhiId,
     vst: u8,
-    _pad: u8
+    idx: u8
 }
 
 bump::vla_struct! {
@@ -170,11 +169,38 @@ fn decomposition__old<'objs, 'work>(
     &*work
 }
 
+fn elementtype(objs: &Objects, idx: ObjRef) -> Primitive {
+    match objs.get(idx) {
+        ObjectRef::TPRI(&TPRI { ty, .. }) => Primitive::from_u8(ty),
+        ObjectRef::TTEN(&TTEN { elem, .. }) => elementtype(objs, elem),
+        _ => unreachable!()
+    }
+}
+
+fn vsettype(objs: &Objects, model: ObjRef<MOD>, idx: usize) -> ObjRef {
+    let ann = objs[objs[model].value].ann;
+    match objs[model].outputs.len() {
+        1 => {
+            debug_assert!(idx == 0);
+            ann
+        },
+        _ => {
+            debug_assert!(objs[ann].op == Obj::TTUP);
+            objs[ann.cast::<TTUP>()].elems[idx]
+        }
+    }
+}
+
+struct LocalSlot {
+    placeholder: IndexOption<InsId>,
+    only_shape: bool
+}
+
 #[repr(C)] // need repr(C) for transmuting references
 pub struct Lower<O=RW, F=RW> {
     bump: Access<Bump<u32>, O>,
     objs: Access<HashMap<ObjRef, BumpRef<()>>, O>,
-    expr: HashMap<ObjRef<EXPR>, InsId>,
+    locals: IndexVec<LocalId, LocalSlot>,
     // TODO: remove the following tmp_* fields and use ccx.tmp instead:
     tmp_ins: Vec<InsId>,
     tmp_vty: Vec<Type>, // for emitvarvalue
@@ -182,6 +208,7 @@ pub struct Lower<O=RW, F=RW> {
     // current function:
     func: Access<Func, F>,
     tab: BumpRef<Tab>,
+    check: IndexOption<InsId>
 }
 
 // for emit*
@@ -200,11 +227,6 @@ const INS_ENTRY: InsId = zerocopy::transmute!(0u16);
 
 // vars, models, and tabs always emit this as ins #1
 const INS_FLATIDX: InsId = zerocopy::transmute!(1u16);
-
-// expr obj.mark:
-// const EXPR_NONE: u8 = 0;  // no uses
-const EXPR_ONE: u8 = 1;   // one use
-const EXPR_MANY: u8 = 2;  // many uses
 
 /* ---- Initialization ------------------------------------------------------ */
 
@@ -360,7 +382,7 @@ fn isprefixidx(objs: &Objects, source: ObjRef<TAB>, vset: &VSET) -> bool {
 }
 
 fn issimplemod(objs: &Objects, model: &MOD) -> bool {
-    let &[vset] = &model.value else { return false };
+    let &[vset] = &model.outputs else { return false };
     let vset = &objs[vset];
     if !vset.idx.is_empty() { return false };
     objs[vset.var].tab == model.tab
@@ -371,25 +393,25 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
     let mt = match issimplemod(&ctx.objs, obj) { true => Mod::SIMPLE, false => Mod::COMPLEX };
     let base = ctx.ir.funcs.end();
     let model: BumpRef<Mod> = lower.bump.push(Mod {
+        obj: idx,
         tab: lower.objs[&obj.tab.erase()].cast(),
-        guard: obj.guard,
         base,
-        n: obj.value.len() as _,
+        n: obj.outputs.len() as _,
         mt,
-        value: []
+        outputs: []
     }).cast();
     // create vsets
     let mut ret: PhiId = 0.into();
-    for &setter in &obj.value {
+    for (i, &setter) in obj.outputs.iter().enumerate() {
         let vset = &ctx.objs[setter];
         let var = lower.objs[&vset.var.erase()].cast();
+        let ann = vsettype(&ctx.objs, idx, i);
         let vst = if mt == Mod::SIMPLE {
             VSet::SIMPLE
         } else if isprefixidx(&ctx.objs, obj.tab, vset) && {
             // TODO: the current code assumes that the value is rectangular,
             // but the optimization itself doesn't necessarily require it, non-rectangular values
             // just require more logic when storing/loading.
-            let ann = ctx.objs[vset.value].ann;
             let vann = ctx.objs[vset.var].ann;
             ann == vann
                 || (ctx.objs[ann].op == Obj::TTEN && ctx.objs[ann.cast::<TTEN>()].elem == vann)
@@ -398,7 +420,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         } else {
             VSet::COMPLEX
         };
-        let ptr = lower.bump.push(VSet { obj: setter, model, var, ret, vst, _pad: 0 });
+        let ptr = lower.bump.push(VSet { model, var, ret, vst, idx: i as _ });
         let vn = lower.bump[var].n;
         lower.bump[var].n = vn+1;
         lower.bump[
@@ -410,7 +432,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
         // note: for var definitions we don't actually need the last dimension sizes (at least for
         // PREFIX models), but they are included here for simpler codegen when forwarding to the
         // model. the optimizer is going to delete them anyway.
-        ret += decomposition_size(&ctx.objs, vset.value.erase()) as isize;
+        ret += decomposition_size(&ctx.objs, ann) as isize;
     }
     // create functions for complex models only
     if mt == Mod::COMPLEX {
@@ -420,15 +442,11 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
             let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
                 DebugSource::new(idx, DebugFlag::VALUE));
             let mut sig = func.build_signature();
-            for vset in &lower.bump[model].value {
-                for &ty in decomposition__old(
-                    &ctx.objs,
-                    ctx.objs[vset.obj].value.erase(),
-                    &mut lower.tmp_ty
-                ) {
-                    sig = sig.add_return(ty);
-                }
+            let base = ctx.tmp.end();
+            for &mut ty in decomposition(&ctx.objs, ctx.objs[obj.value].ann, &mut ctx.tmp) {
+                sig = sig.add_return(ty);
             }
+            ctx.tmp.truncate(base);
             maybeidxarg(sig.finish_returns(), scl).finish_args();
             ctx.ir.funcs.push(func);
         }
@@ -450,9 +468,7 @@ fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
 }
 
 fn collectobjs(ctx: &mut Ccx<Lower>) {
-    // pass 1:
-    // * count vsets in var.mark
-    // * count expr references in expr.mark
+    // pass 1: count vsets in var.mark
     let mut idx = ObjRef::NIL;
     while let Some(i) = ctx.objs.next(idx) {
         idx = i;
@@ -460,13 +476,6 @@ fn collectobjs(ctx: &mut Ccx<Lower>) {
         if obj.op == Obj::VSET {
             let var = ctx.objs[idx.cast::<VSET>()].var;
             ctx.objs[var].mark += 1;
-        }
-        for i in obj.ref_params() {
-            let p: ObjRef = zerocopy::transmute!(ctx.objs.get_raw(idx)[i+1]);
-            let pref = &mut ctx.objs[p];
-            if Operator::is_expr_raw(pref.op) {
-                pref.mark += (pref.mark < EXPR_MANY) as u8;
-            }
         }
     }
     // pass 2: allocate objs and functions (note: depends on objs being in topo order)
@@ -525,7 +534,7 @@ pub fn areserve<const K: usize>(func: &Func) -> [InsId; K] {
 }
 
 fn emitjumpifnot(func: &Func, ctr: &mut InsId, cond: InsId, target: InsId) -> InsId {
-    let next = reserve(func, 1);
+    let [next] = areserve(func);
     func.code.set(*ctr, Ins::IF(cond, next, target));
     *ctr = next;
     next
@@ -599,37 +608,97 @@ fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var
     objs[&var.erase()].cast()
 }
 
-// TODO: remove this and replace uses with code.set(replace(ctr, new), ins)
-fn swapctr(func: &Func, ctr: &mut InsId, ins: Ins, new: InsId) {
-    func.code.set(*ctr, ins);
-    *ctr = new;
+fn alloctensordata(
+    lcx: &mut Lcx,
+    ctr: InsId,
+    type_: &TTEN,
+    shape: InsId
+) -> (
+    /* data pointers: */ InsId,
+    /* element sizes: */ InsId
+) {
+    let lower = &*lcx.data;
+    let len = emitshapelen(&lower.func, shape, type_.dim as _);
+    let ds = decomposition_size(&lcx.objs, type_.elem);
+    let ptrs = reserve(&lower.func, ds);
+    let esizes = reserve(&lower.func, ds);
+    let base = lcx.tmp.end();
+    for (i, ty) in decomposition(&lcx.objs, type_.elem, &mut lcx.tmp).iter().enumerate() {
+        lower.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
+        let size = lower.func.code.push(Ins::MUL(IRT_IDX, len, esizes + i as isize));
+        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize, ctr));
+    }
+    lcx.tmp.truncate(base);
+    (ptrs, esizes)
 }
 
 /* ---- Loops --------------------------------------------------------------- */
 
-struct LoopState {
-    head: InsId,      // uninitialized slot for initialization (dominates body and tail)
-    tail: InsId,      // uninitialized slot for next/exit
-    body: InsId,      // uninitialized slot for the loop body (dominates tail)
-    out: InsId,       // initialized jump target for breaking the loop
+struct Loop {
+    enter: Ins,         // dominates head, body_entry, body, tail_entry, tail, and exit
+    head: InsId,        // dominates body_entry, body, tail_entry, tail, and exit
+    body_entry: InsId,  // dominates body, tail_entry, and tail
+    body: InsId,        // dominates tail_entry and tail
+    tail_entry: InsId,  // dominates tail
+    tail: InsId,        // jumps to either exit or body_entry
+    exit: InsId,        // exits the loop
 }
 
-fn emitrangeloop(func: &Func, loop_: &mut LoopState, ty: Type, start: InsId, end: InsId) -> InsId {
-    let head = reserve(func, 2);
-    let tail = head+1;
+fn newloop(func: &Func) -> Loop {
+    let [head, tail, body, exit] = areserve(func);
+    Loop {
+        enter: Ins::GOTO(head),
+        head,
+        body_entry: body,
+        body,
+        tail_entry: tail,
+        tail,
+        exit
+    }
+}
+
+fn closeloop(func: &Func, loop_: Loop) -> (Ins, InsId) {
+    func.code.set(loop_.head, Ins::GOTO(loop_.body_entry));
+    func.code.set(loop_.body, Ins::GOTO(loop_.tail_entry));
+    func.code.set(loop_.tail, Ins::GOTO(loop_.body_entry));
+    (loop_.enter, loop_.exit)
+}
+
+fn ctrcloseloop(func: &Func, loop_: Loop, ctr: &mut InsId) {
+    let (enter, exit) = closeloop(func, loop_);
+    func.code.set(replace(ctr, exit), enter);
+}
+
+fn emitloopinit(func: &Func, loop_: &mut Loop, phi: PhiId, init: InsId) {
+    let enter = func.code.push(loop_.enter);
+    loop_.enter = Ins::JMP(init, enter, phi);
+}
+
+fn emitrangeloop(func: &Func, loop_: &mut Loop, ty: Type, start: InsId, end: InsId) -> InsId {
+    let [head, tail] = areserve(func);
     let iphi = func.phis.push(Phi::new(ty));
     let init = func.code.push(Ins::JMP(start, head, iphi));
     let check = func.code.push(Ins::LT(start, end));
-    func.code.set(loop_.head, Ins::IF(check, init, loop_.out));
-    loop_.head = head;
+    func.code.set(replace(&mut loop_.head, head), Ins::IF(check, init, loop_.exit));
     let i = func.code.push(Ins::PHI(ty, loop_.body, iphi));
     let one = func.code.push(Ins::KINT(ty, 1));
     let inext = func.code.push(Ins::ADD(ty, i, one));
     let check = func.code.push(Ins::LT(inext, end));
     let jumptail = func.code.push(Ins::JMP(inext, tail, iphi));
-    func.code.set(loop_.tail, Ins::IF(check, jumptail, loop_.out));
-    loop_.tail = tail;
+    func.code.set(replace(&mut loop_.tail, tail), Ins::IF(check, jumptail, loop_.exit));
     i
+}
+
+fn emitcounter(func: &Func, loop_: &mut Loop, ty: Type) -> InsId {
+    let phi = func.phis.push(Phi::new(ty));
+    let zero = func.code.push(Ins::KINT(ty, 0));
+    let one = func.code.push(Ins::KINT(ty, 1));
+    emitloopinit(func, loop_, phi, zero);
+    let value = func.code.push(Ins::PHI(IRT_IDX, loop_.body_entry, phi));
+    let next = func.code.push(Ins::ADD(IRT_IDX, value, one));
+    let [tail] = areserve(func);
+    func.code.set(replace(&mut loop_.tail, tail), Ins::JMP(next, tail, phi));
+    value
 }
 
 fn extractshape(objs: &Objects, value: InsId, ty: &TTEN) -> InsId {
@@ -639,7 +708,7 @@ fn extractshape(objs: &Objects, value: InsId, ty: &TTEN) -> InsId {
 
 fn emittensordataloop(
     lcx: &mut Lcx,
-    loop_: &mut LoopState,
+    loop_: &mut Loop,
     ty: &TTEN,
     value: InsId,
     shape: InsId
@@ -660,7 +729,7 @@ fn emittensordataloop(
 
 fn emittensorloop(
     lcx: &mut Lcx,
-    loop_: &mut LoopState,
+    loop_: &mut Loop,
     ty: &TTEN,
     value: InsId
 ) -> InsId {
@@ -668,101 +737,46 @@ fn emittensorloop(
     emittensordataloop(lcx, loop_, ty, value, shape)
 }
 
-//                       +-------------------------------------------------------+
-//                       |                   +---------------------------------+ |
-//                       |                   |                                 | v
-// +-------+  r=init  +------+  l=init   +------+  r=next  +------+          +-v---+
-// | (ctr) | -------> | HEAD | --------> | BODY | -------> | TAIL | -------> | OUT |
-// +-------+          +------+           +--^---+          +------+          +-----+
-//                                          |       l=next    |              r=result
-//                                          +-----------------+
-struct Reduce {
-    loop_: LoopState,
-    start: Ins,   // start instruction (patch ctr)
-    l_phi: PhiId, // result phis outside loop (final accumulator)
-    r_phi: PhiId, // accumulator phis inside loop body
-    init: InsId,  // initial accumulator values (inside loop head)
-    value: InsId, // accumulator values (inside loop body)
-    body: InsId,  // loop body start
-    tail: InsId,  // loop tail start
-    num: u16,     // number of accumulators
-}
-
-fn newreduce(func: &Func, l_phi: PhiId, r_phi: PhiId, init: InsId, num: u16) -> Reduce {
-    let [out, head, body, tail] = areserve(func);
-    let value = func.code.extend(
-        (0..num as isize)
-        .map(|i| Ins::PHI(func.phis.at(l_phi+i).type_, body, l_phi+i))
-    );
-    let mut start = Ins::JMP(init, head, r_phi);
-    for i in 1..num as isize {
-        let idx = func.code.push(start);
-        start = Ins::JMP(init + i, idx, r_phi + i);
-    }
-    Reduce {
-        loop_: LoopState { head, tail, body, out },
-        start, l_phi, r_phi, init, value, body, tail, num
-    }
-}
-
-fn newreducety<const K: usize>(func: &Func, ty: [Type; K], init: InsId) -> Reduce {
-    let l_phis = func.phis.extend(ty.map(Phi::new));
-    let r_phis = func.phis.extend(ty.map(Phi::new));
-    newreduce(func, l_phis, r_phis, init, K as _)
-}
-
-fn newreducefx(func: &Func, num: u16) -> Reduce {
-    let l_phis = func.phis.extend(repeat_n(Phi::new(Type::FX), num as usize));
-    let r_phis = func.phis.extend(repeat_n(Phi::new(Type::FX), num as usize));
-    let inits = func.code.extend(repeat_n(Ins::NOP(Type::FX), num as usize));
-    newreduce(func, l_phis, r_phis, inits, num)
-}
-
-// logically this takes ownership of the reduce, in the sense that it shouldn't be used anymore.
-// but taking a reference here makes usage a bit more ergonomic.
-fn closereduce(func: &Func, reduce: &Reduce, next: InsId) -> InsId {
-    let &Reduce { l_phi, r_phi, init, body, tail, num, ..} = reduce;
-    let mut jhead = Ins::JMP(init, body, l_phi);
-    let mut jbody = Ins::JMP(next, tail, r_phi);
-    let mut jtail = Ins::JMP(next, body, l_phi);
-    for i in 1..num as isize {
-        let base = func.code.extend([jhead, jbody, jtail].into_iter());
-        jhead = Ins::JMP(init + i, base, l_phi + i);
-        jbody = Ins::JMP(next + i, base+1, r_phi + i);
-        jtail = Ins::JMP(next + i, base+2, l_phi + i);
-    }
-    func.code.set(reduce.loop_.head, jhead);
-    func.code.set(reduce.loop_.body, jbody);
-    func.code.set(reduce.loop_.tail, jtail);
-    func.code.extend(
-        (0..num as isize)
-        .map(|i| Ins::PHI(func.phis.at(r_phi+i).type_, reduce.loop_.out, r_phi+i))
-    )
-}
-
-fn emitreducestore(
+fn emitreduce(
     func: &Func,
-    reduce: &mut Reduce,
-    bufs: InsId,
-    strides: InsId,
-    values: InsId,
-    start: IndexOption<InsId>
+    loop_: &mut Loop,
+    ty: Type,
+    init: InsId,
+    next: InsId,
+    accumulator_placeholder: InsId,
+    result_placeholder: InsId
+) {
+    let l_phi = func.phis.push(Phi::new(ty));
+    let r_phi = func.phis.push(Phi::new(ty));
+    let [head, tail, body] = areserve(func);
+    emitloopinit(func, loop_, r_phi, init);
+    func.code.set(accumulator_placeholder, Ins::PHI(ty, loop_.body_entry, l_phi));
+    func.code.set(result_placeholder, Ins::PHI(ty, loop_.exit, r_phi));
+    func.code.set(replace(&mut loop_.head, head), Ins::JMP(init, head, l_phi));
+    func.code.set(replace(&mut loop_.body, body), Ins::JMP(next, body, r_phi));
+    func.code.set(replace(&mut loop_.tail, tail), Ins::JMP(next, tail, l_phi));
+}
+
+fn emitloopstore(
+    func: &Func,
+    loop_: &mut Loop,
+    element: InsId,
+    size: InsId,
+    ptr: InsId,
+    ds: usize
 ) -> InsId {
-    let idx_phi = func.phis.push(Phi::new(IRT_IDX));
-    let [head, tail] = areserve(func);
-    let start = match start.unpack() {
-        Some(i) => i,
-        None => func.code.push(Ins::KINT(IRT_IDX, 0))
-    };
-    func.code.set(reduce.loop_.head, Ins::JMP(start, head, idx_phi));
-    reduce.loop_.head = head;
-    let idx = func.code.push(Ins::PHI(IRT_IDX, reduce.loop_.body, idx_phi));
-    let next = emitmultistore(func, bufs, strides, idx, values, reduce.num as _);
-    let one = func.code.push(Ins::KINT(IRT_IDX, 1));
-    let next_idx = func.code.push(Ins::ADD(IRT_IDX, idx, one));
-    func.code.set(reduce.loop_.tail, Ins::JMP(next_idx, tail, idx_phi));
-    reduce.loop_.tail = tail;
-    next
+    let store_accumulator = reserve(func, ds);
+    let store_result = reserve(func, ds);
+    let nop = func.code.push(Ins::NOP(Type::FX));
+    let idx = emitcounter(func, loop_, IRT_IDX);
+    for i in 0..ds as isize {
+        let offset = func.code.push(Ins::MUL(IRT_IDX, idx, size+i));
+        let ptr_offset = func.code.push(Ins::ADDP(ptr+i, offset));
+        let store = func.code.push(Ins::STORE(ptr_offset, element+i));
+        let next = func.code.push(Ins::MOVF(Type::FX, store, store_accumulator+i));
+        emitreduce(func, loop_, Type::FX, nop, next, store_accumulator+i, store_result+i);
+    }
+    store_result
 }
 
 /* ---- Indexing ------------------------------------------------------------ */
@@ -994,43 +1008,6 @@ fn prefixlen(source_dim: usize, target_dim: usize, explicit: usize) -> usize {
     min(source_dim, target_dim-explicit)
 }
 
-// return the number of tail dimensions
-fn taillen(source_dim: usize, target_dim: usize, explicit: usize) -> usize {
-    target_dim - (prefixlen(source_dim, target_dim, explicit) + explicit)
-}
-
-// given a target table and an index expression
-//   target[i1, ..., iN]
-// return true if iterating over flat indices requires two or more nested loops.
-fn isnestedloopidx(lcx: &Lcx, source: &Tab, target: &Tab, idx: &[ObjRef<EXPR>]) -> bool {
-    if idx.is_empty() {
-        // fast path
-        return false
-    }
-    let mut foundloop = false;
-    let mut nil = false;
-    let mut explicit = 0;
-    for i in iterflatidx(&lcx.objs, idx) {
-        explicit += 1;
-        let wasnil = nil;
-        nil = i.is_nil();
-        if isscalarann(&lcx.objs, i.erase()) {
-            continue
-        }
-        if (lcx.objs[i].op, lcx.objs[i].data) == (Obj::SPEC, SPEC::SLURP) {
-            continue
-        }
-        if nil && wasnil {
-            continue
-        }
-        if foundloop {
-            return true
-        }
-        foundloop = true;
-    }
-    foundloop && !nil && taillen(source.axes.len(), target.axes.len(), explicit) > 0
-}
-
 fn emitshapelen(func: &Func, base: InsId, dim: usize) -> InsId {
     if dim == 0 {
         return func.code.push(Ins::KINT(IRT_IDX, 1));
@@ -1059,7 +1036,7 @@ fn emitsplatbounds(
 
 fn emitsplatloop(
     lcx: &mut Lcx,
-    loop_: &mut LoopState,
+    loop_: &mut Loop,
     tab: &Tab,
     flat: InsId,
     call: InsId,
@@ -1072,11 +1049,1150 @@ fn emitsplatloop(
 
 /* ---- Expressions --------------------------------------------------------- */
 
-// the 4 ways to emit an expression are:
-//   * emitvalue()    emit the value (materializes vectors)
-//   * emitshape()    same as emitvalue(), but only emit the axis sizes
-//   * emititer()     emit an iterator into a given loop
-//   * emitcheck()    emit a test for whether the value is computable or not
+struct ExprSlot {
+    value: InsId,
+    ctr: InsId
+}
+
+struct ExprIter<'a> {
+    loop_: &'a mut Loop,
+    element: InsId,
+    shape: Option<ExprSlot>
+}
+
+enum Visit<'a, 'b> {
+    Materialize(&'a mut ExprSlot),
+    Shape(&'a mut ExprSlot),
+    Iterate(&'a mut ExprIter<'b>),
+    None(&'a mut InsId)
+}
+
+impl Visit<'_, '_> {
+
+    fn is_materialize(&self) -> bool {
+        matches!(self, Visit::Materialize(_))
+    }
+
+    fn is_shape(&self) -> bool {
+        matches!(self, Visit::Shape(_))
+    }
+
+    fn is_iterate(&self) -> bool {
+        matches!(self, Visit::Iterate(_))
+    }
+
+    fn is_none(&self) -> bool {
+        matches!(self, Visit::None(_))
+    }
+
+    fn unwrap_materialize(&mut self) -> &mut ExprSlot {
+        match self {
+            Visit::Materialize(slot) => slot,
+            _ => unreachable!()
+        }
+    }
+
+    fn head(&mut self) -> &mut InsId {
+        match self {
+            Visit::Materialize(slot) | Visit::Shape(slot) => &mut slot.ctr,
+            Visit::Iterate(iter) => &mut iter.loop_.head,
+            Visit::None(ctr) => ctr
+        }
+    }
+
+    fn ctr(&mut self) -> &mut InsId {
+        match self {
+            Visit::Materialize(slot) | Visit::Shape(slot) => &mut slot.ctr,
+            Visit::Iterate(_) => unreachable!(),
+            Visit::None(ctr) => ctr
+        }
+    }
+
+}
+
+impl<'b> Visit<'_, 'b> {
+
+    fn reborrow_mut(&mut self) -> Visit<'_, 'b> {
+        match self {
+            Visit::Materialize(slot) => Visit::Materialize(slot),
+            Visit::Shape(slot) => Visit::Shape(slot),
+            Visit::Iterate(iter) => Visit::Iterate(iter),
+            Visit::None(ctr) => Visit::None(ctr)
+        }
+    }
+
+}
+
+fn isnoniterable(op: u8) -> bool {
+    // TODO: make LET/LGET iterable
+    (Operator::CAT|Operator::LET|Operator::LGET|Operator::GET|Operator::LOAD|Operator::CALLX)
+        .as_u64_truncated() & (1 << op) != 0
+}
+
+fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
+    if visit.is_none() && lcx.data.check.is_none() {
+        // nothing to do
+        return
+    }
+    if let Visit::Iterate(iter) = visit.reborrow_mut() && isnoniterable(lcx.objs[expr].op) {
+        iter.element = emitexprmi(lcx, expr, &mut iter.loop_, iter.shape.as_mut());
+        return
+    }
+    if let Visit::Shape(slot) = visit.reborrow_mut() && lcx.objs[lcx.objs[expr].ann].op != Obj::TTEN {
+        slot.value = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
+        visitexpr(lcx, expr, Visit::None(&mut slot.ctr));
+        return
+    }
+    if let Visit::None(ctr) = visit.reborrow_mut()
+        && (Operator::VGET|Operator::LET).as_u64_truncated() & (1 << lcx.objs[expr].op) == 0
+    {
+        let objs = Access::borrow(&lcx.objs);
+        let raw = objs.get_raw(expr.erase());
+        for i in objs[expr.erase()].ref_params() {
+            // only recurse into exprs, other objects are in their own chunks.
+            let o: ObjRef = zerocopy::transmute!(raw[i+1]);
+            if Operator::is_expr_raw(objs[o].op) {
+                visitexpr(lcx, o.cast(), Visit::None(ctr));
+            }
+        }
+        return
+    }
+    match lcx.objs[expr].op {
+        Obj::KINT|Obj::KINT64|Obj::KFP64|Obj::KSTR => {
+            visit.unwrap_materialize().value = emitk(lcx, expr)
+        },
+        Obj::DIM => {
+            visit.unwrap_materialize().value = emitdim(lcx, expr.cast())
+        },
+        Obj::LEN => {
+            let slot = visit.unwrap_materialize();
+            slot.value = emitlen(lcx, expr.cast(), &mut slot.ctr);
+        },
+        Obj::LET => visitlet(lcx, expr.cast(), visit),
+        Obj::LGET => visitlget(lcx, expr.cast(), visit),
+        Obj::VGET => visitvget(lcx, expr.cast(), visit),
+        Obj::CAT => visitcat(lcx, expr.cast(), visit),
+        Obj::IDX => todo!(),
+        Obj::BINOP => visitbinop(lcx, expr.cast(), visit),
+        Obj::INTR => visitintrinsic(lcx, expr.cast(), visit),
+        Obj::LOAD => visitload(lcx, expr.cast(), visit),
+        Obj::NEW => visitnew(lcx, expr.cast(), visit),
+        Obj::GET => visitget(lcx, expr.cast(), visit),
+        Obj::CALLX => visitcallx(lcx, expr.cast(), visit),
+        _ => unreachable!()
+    }
+}
+
+// iterate
+fn emitexpri(
+    lcx: &mut Lcx,
+    expr: ObjRef<EXPR>,
+    loop_: &mut Loop,
+    shape: Option<&mut ExprSlot>
+) -> InsId {
+    let mut expri = ExprIter {
+        loop_,
+        element: InsId::INVALID.into(),
+        shape: match &shape {
+            &Some(&mut ExprSlot { ctr, .. }) => Some(ExprSlot {
+                value: InsId::INVALID.into(),
+                ctr
+            }),
+            None => None
+        }
+    };
+    visitexpr(lcx, expr, Visit::Iterate(&mut expri));
+    if let Some(shape) = shape {
+        *shape = expri.shape.unwrap();
+        debug_assert!(shape.value != InsId::INVALID.into());
+    }
+    debug_assert!(expri.element != InsId::INVALID.into());
+    expri.element
+}
+
+// iterate and return shape
+fn emitexpris(
+    lcx: &mut Lcx,
+    expr: ObjRef<EXPR>,
+    loop_: &mut Loop,
+    shapectr: &mut InsId
+) -> (InsId, InsId) {
+    let mut shape = ExprSlot {
+        value: InsId::INVALID.into(),
+        ctr: *shapectr
+    };
+    let element = emitexpri(lcx, expr, loop_, Some(&mut shape));
+    *shapectr = shape.ctr;
+    (element, shape.value)
+}
+
+// iterate then materialize
+fn emitexprim(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId) -> InsId {
+    let objs = Access::borrow(&lcx.objs);
+    let cty: &TTEN = &objs[objs[expr].ann.cast()];
+    let mut loop_ = newloop(&lcx.data.func);
+    let (element, shape) = emitexpris(lcx, expr, &mut loop_, ctr);
+    let (ptrs, esizes) = alloctensordata(lcx, *ctr, cty, shape);
+    let eds = decomposition_size(objs, cty.elem);
+    let stores = emitloopstore(&lcx.data.func, &mut loop_, element, esizes, ptrs, eds);
+    ctrcloseloop(&lcx.data.func, loop_, ctr);
+    let ret = lcx.data.func.code.extend(
+        (0..eds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, stores+i)));
+    lcx.data.func.code.extend((0..cty.dim as isize).map(|i| Ins::MOV(IRT_IDX, shape+i)));
+    ret
+}
+
+// materialize then iterate
+fn emitexprmi(
+    lcx: &mut Lcx,
+    expr: ObjRef<EXPR>,
+    loop_: &mut Loop,
+    mut want_shape: Option<&mut ExprSlot>
+) -> InsId {
+    let objs = Access::borrow(&lcx.objs);
+    let cty: &TTEN = &objs[objs[expr].ann.cast()];
+    let ctr = match want_shape.as_deref_mut() {
+        Some(slot) => &mut slot.ctr,
+        None => &mut loop_.head
+    };
+    let value = emitexprv(lcx, expr, ctr);
+    let shape = extractshape(objs, value, cty);
+    if let Some(out) = want_shape {
+        out.value = shape;
+    }
+    emittensordataloop(lcx, loop_, cty, value, shape)
+}
+
+fn emitexprvors(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId, v: bool) -> InsId {
+    let mut slot = ExprSlot {
+        value: InsId::INVALID.into(),
+        ctr: *ctr
+    };
+    let visit = match v {
+        true => Visit::Materialize(&mut slot),
+        false => Visit::Shape(&mut slot)
+    };
+    visitexpr(lcx, expr, visit);
+    debug_assert!(slot.value != InsId::INVALID.into());
+    *ctr = slot.ctr;
+    slot.value
+}
+
+// materialize
+fn emitexprv(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId) -> InsId {
+    emitexprvors(lcx, expr, ctr, true)
+}
+
+// shape
+fn emitexprs(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId) -> InsId {
+    emitexprvors(lcx, expr, ctr, false)
+}
+
+// iterate if tensor, materialize if scalar
+fn emitbroadcastv(
+    lcx: &mut Lcx,
+    expr: ObjRef<EXPR>,
+    loop_: &mut Loop,
+    shape: Option<&mut ExprSlot>
+) -> InsId {
+    match lcx.objs[lcx.objs[expr].ann].op {
+        Obj::TTEN => {
+            emitexpri(lcx, expr, loop_, shape)
+        },
+        _ => {
+            if let Some(slot) = shape {
+                slot.value = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
+            }
+            emitexprv(lcx, expr, &mut loop_.head)
+        }
+    }
+}
+
+// check
+fn emitexprc(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId, fail: InsId) {
+    let prev = replace(&mut lcx.data.check, Some(fail).into());
+    visitexpr(lcx, expr, Visit::None(ctr));
+    lcx.data.check = prev;
+}
+
+// check and value
+fn emitexprcv(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId, fail: InsId) -> InsId {
+    let prev = replace(&mut lcx.data.check, Some(fail).into());
+    let value = emitexprv(lcx, expr, ctr);
+    lcx.data.check = prev;
+    value
+}
+
+fn emitk(lcx: &mut Lcx, expr: ObjRef<EXPR>) -> InsId {
+    let ObjectRef::TPRI(&TPRI { ty, .. }) = lcx.objs.get(lcx.objs[expr].ann) else { unreachable!() };
+    let ty = Primitive::from_u8(ty).to_ir();
+    match lcx.objs.get(expr.erase()) {
+        ObjectRef::KINT(&KINT { k, .. }) => lcx.data.func.code.push(Ins::KINT(ty, k as _)),
+        ObjectRef::KINT64(&KINT64 { k, .. }) => lcx.data.func.code.push(Ins::KINT64(ty, zerocopy::transmute!(k))),
+        ObjectRef::KFP64(&KFP64 { k, .. }) => lcx.data.func.code.push(Ins::KFP64(ty, zerocopy::transmute!(k))),
+        ObjectRef::KSTR(&KSTR { k, .. }) => lcx.data.func.code.push(Ins::KSTR(ty, zerocopy::transmute!(k))),
+        _ => unreachable!()
+    }
+}
+
+fn emitdim(lcx: &mut Lcx, expr: ObjRef<DIM>) -> InsId {
+    let source = lcx.data.bump[lcx.data.tab].axes.len();
+    let axis = lcx.objs[expr].axis;
+    axisidx(lcx, lcx.data.tab, source, (axis+1) as _, INS_FLATIDX)
+}
+
+fn emitlen(lcx: &mut Lcx, expr: ObjRef<LEN>, ctr: &mut InsId) -> InsId {
+    let LEN { axis, value, .. } = lcx.objs[expr];
+    emitexprs(lcx, value, ctr) + axis as isize
+}
+
+fn visitlet(lcx: &mut Lcx, let_: ObjRef<LET>, mut visit: Visit) {
+    let LET { value, expr, .. } = lcx.objs[let_];
+    lcx.data.locals.push(LocalSlot {
+        placeholder: None.into(),
+        only_shape: false
+    });
+    let [ctrnew] = areserve(&lcx.data.func);
+    let mut ctr = replace(visit.ctr(), ctrnew);
+    visitexpr(lcx, expr, visit);
+    let slot = lcx.data.locals.raw.pop().unwrap();
+    if let Some(placeholder) = slot.placeholder.unpack() {
+        if slot.only_shape {
+            let s = emitexprs(lcx, value, &mut ctr);
+            for i in 0..lcx.objs[lcx.objs[value].ann.cast::<TTEN>()].dim as isize {
+                lcx.data.func.code.set(placeholder+i, Ins::MOV(IRT_IDX, s+i));
+            }
+        } else {
+            let v = emitexprv(lcx, value, &mut ctr);
+            let base = lcx.tmp.end();
+            for (i, &ty) in decomposition(&lcx.objs, lcx.objs[value].ann, &mut lcx.tmp)
+                .iter()
+                .enumerate()
+            {
+                lcx.data.func.code.set(placeholder + i as isize, Ins::MOV(ty, v + i as isize));
+            }
+            lcx.tmp.truncate(base);
+        }
+    } else {
+        visitexpr(lcx, value, Visit::None(&mut ctr));
+    }
+    lcx.data.func.code.set(ctr, Ins::GOTO(ctrnew));
+}
+
+fn visitlget(lcx: &mut Lcx, expr: ObjRef<LGET>, visit: Visit) {
+    let LGET { ann, slot, .. } = lcx.objs[expr];
+    let lower = &mut *lcx.data;
+    let slot = &mut lower.locals[slot];
+    match visit {
+        Visit::Materialize(s) => {
+            s.value = if let Some(v) = slot.placeholder.unpack() && !slot.only_shape {
+                v
+            } else {
+                let ds = decomposition_size(&lcx.objs, ann);
+                let placeholder = reserve(&lower.func, ds);
+                if let Some(v) = slot.placeholder.unpack() {
+                    let dim = lcx.objs[ann.cast::<TTEN>()].dim;
+                    for i in 0..dim as isize {
+                        lower.func.code.set(v+i,
+                            Ins::MOV(IRT_IDX, placeholder + ds as isize - dim as isize + i));
+                    }
+                    slot.only_shape = false;
+                }
+                slot.placeholder = Some(placeholder).into();
+                placeholder
+            };
+        },
+        Visit::Shape(s) => {
+            s.value = if let Some(mut v) = slot.placeholder.unpack() {
+                if !slot.only_shape {
+                    v = extractshape(&lcx.objs, v, &lcx.objs[ann.cast()]);
+                }
+                v
+            } else {
+                let placeholder = reserve(&lower.func, lcx.objs[ann.cast::<TTEN>()].dim as _);
+                slot.placeholder = Some(placeholder).into();
+                slot.only_shape = true;
+                placeholder
+            };
+        },
+        Visit::None(_) => unreachable!(),
+        Visit::Iterate(_) => todo!()
+    }
+}
+
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct VGETIdx {
+    expr: ObjRef<EXPR>, // selected indices or NIL for splat
+    value: IndexOption<InsId>, // value if non-nil; tensor for materialized, scalar for iterators
+    shape: IndexOption<InsId>, // shape if computed (only for iterator)
+    axis: u8, // axis in the table (first spanned axis)
+    span: u8, // number of table axes spanned (slurped)
+    nest: u8, // output nest level
+    oaxis: u8, // axis in the output (for the nest level)
+    scalar_expr: i8, // 1=>scalar, 0=>tensor, -1=>iterator (of scalars)
+    scalar_axis: u8,
+    _pad: [u8; 2]
+}
+
+fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<VGETIdx>) {
+    let base = buf.end();
+    let var = vardata(&lower.objs, vget.var);
+    let target = &lower.bump[lower.bump[var].tab];
+    let mut taxis = prefixlen(lower.bump[lower.tab].axes.len(), target.axes.len(), vget.dim as _);
+    let mut span = 0;
+    let mut oaxis = 0;
+    for &expr in &vget.idx {
+        let o = objs[expr.erase()];
+        match o.op {
+            Obj::SPEC if o.data == SPEC::SLURP => span += 1,
+            Obj::FLAT => {
+                debug_assert!(span == 0);
+                let fidx = &objs[expr.cast::<FLAT>()].idx;
+                let mut nil = false;
+                for (i, &v) in fidx.iter().enumerate() {
+                    if nil && v.is_nil() {
+                        debug_assert!(span == 0);
+                        let top = buf.end().offset(-1);
+                        buf[top].span += 1;
+                        continue
+                    }
+                    nil = v.is_nil();
+                    if (objs[v].op, objs[v].data) == (Obj::SPEC, SPEC::SLURP) {
+                        span += 1;
+                        continue
+                    }
+                    let (_, idx) = buf.reserve::<VGETIdx>();
+                    idx.expr = v;
+                    idx.value = None.into();
+                    idx.shape = None.into();
+                    idx.axis = (taxis + i) as _;
+                    idx.span = span+1;
+                    idx.oaxis = oaxis;
+                    idx.scalar_expr = isscalarann(objs, v.erase()) as _;
+                    span = 0;
+                }
+                taxis += fidx.len();
+                oaxis += 1;
+            },
+            _ => {
+                let is_scalar = isscalarann(objs, expr.erase());
+                let (_, idx) = buf.reserve::<VGETIdx>();
+                idx.expr = expr;
+                idx.value = None.into();
+                idx.shape = None.into();
+                idx.axis = taxis as _;
+                idx.span = span+1;
+                idx.oaxis = oaxis;
+                idx.scalar_expr = is_scalar as _;
+                (taxis, span) = (taxis+1, 0);
+                if !is_scalar { oaxis += 1 }
+            }
+        }
+    }
+    debug_assert!(span == 0);
+    while taxis < target.axes.len() {
+        let (_, idx) = buf.reserve::<VGETIdx>();
+        idx.expr = ObjRef::NIL.cast();
+        idx.value = None.into();
+        idx.shape = None.into();
+        idx.axis = taxis as _;
+        idx.span = 1;
+        idx.oaxis = oaxis;
+        idx.scalar_expr = 0;
+        taxis += 1;
+        oaxis += 1;
+    }
+    if oaxis > 0 {
+        let mut ann = &objs[vget.ann.cast::<TTEN>()];
+        debug_assert!(ann.op == Obj::TTEN);
+        let mut offset = 0;
+        let mut onest = 0;
+        debug_assert!(oaxis >= ann.dim as _);
+        for i in &mut buf[base..] {
+            let scalar = target.axes[i.axis as usize..(i.axis+i.span) as usize]
+                .iter()
+                .all(|a| a.rank == Axis::SCALAR);
+            i.scalar_axis = scalar as _;
+            if i.oaxis == offset+ann.dim {
+                offset = i.oaxis;
+                onest += 1;
+                ann = &objs[ann.elem.cast::<TTEN>()];
+                debug_assert!(ann.op == Obj::TTEN);
+            }
+            i.oaxis -= offset;
+            i.nest = onest;
+            debug_assert!(scalar || i.oaxis == 0);
+        }
+    }
+}
+
+fn emitvgetidx(
+    lcx: &mut Lcx,
+    ctr: &mut InsId,
+    start: BumpRef<VGETIdx>,
+    end: BumpRef<VGETIdx>,
+    outerloop: &mut Option<Loop>
+) {
+    let mut first_tensor = true;
+    let first_nonrect = lcx.tmp[start..end]
+        .iter()
+        .find_map(|i| if let &VGETIdx { expr, oaxis, scalar_axis: 0, nest: 0, .. } = i
+            && expr.is_nil()
+        {
+            Some(oaxis)
+        } else {
+            None
+        })
+        .unwrap_or(!0);
+    let mut idx = start;
+    while idx < end {
+        match lcx.tmp[idx] {
+            VGETIdx { value, .. } if value.is_some() => {
+                // outer loop fused
+                first_tensor = false;
+            },
+            VGETIdx { expr, oaxis, scalar_expr: 0, nest: 0, .. }
+                if first_tensor && oaxis < first_nonrect && !expr.is_nil() =>
+            {
+                let loop_ = outerloop.insert(newloop(&lcx.data.func));
+                let (element, shape) = emitexpris(lcx, expr, loop_, ctr);
+                lcx.tmp[idx].value = Some(element).into();
+                lcx.tmp[idx].shape = Some(shape).into();
+                lcx.tmp[idx].scalar_expr = -1;
+                first_tensor = false;
+            },
+            VGETIdx { expr, .. } if !expr.is_nil() => {
+                let v = emitexprv(lcx, expr, ctr);
+                lcx.tmp[idx].value = Some(v).into();
+            },
+            _ => {}
+        }
+        if first_tensor && lcx.tmp[idx].scalar_expr == 0 {
+            first_tensor = false;
+        }
+        idx = idx.offset(1);
+    }
+}
+
+fn emitvgets(
+    lcx: &mut Lcx,
+    ctr: &mut InsId,
+    start: BumpRef<VGETIdx>,
+    mut end: BumpRef<VGETIdx>,
+    outshape: InsId, // must have reserved one slot per `oaxis`
+    call: InsId,
+    target: &Tab,
+) -> IndexOption<InsId> {
+    debug_assert!(start < end);
+    debug_assert!(lcx.tmp[start..end].iter().all(|i| i.nest == lcx.tmp[start].nest));
+    let objs = Access::borrow(&lcx.objs);
+    let mut prefix: Option<(/*flat placeholder:*/InsId, /*accumulator:*/InsId)> = None;
+    let mut innerloop: Option<(/*init:*/ InsId, /*start:*/ Ins, /*out:*/ InsId)> = None;
+    while start < end {
+        let mut e = end;
+        end = end.offset(-1);
+        while end > start && lcx.tmp[end].oaxis == lcx.tmp[end.offset(-1)].oaxis {
+            end = end.offset(-1);
+        }
+        let mut len: IndexOption<InsId> = None.into();
+        while e > end {
+            e = e.offset(-1);
+            let n = match (&mut prefix, &lcx.tmp[e]) {
+                (None, &VGETIdx { scalar_expr: 1, .. }) => continue,
+                (Some((flat, _)), &VGETIdx { value, axis, span, scalar_expr: 1, .. }) => {
+                    let [nextflat] = areserve(&lcx.data.func);
+                    let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, nextflat);
+                    lcx.data.func.code.set(replace(flat, nextflat),
+                        Ins::ADD(IRT_IDX, baseflat, value.unwrap()));
+                    continue
+                },
+                (None, &VGETIdx { shape, .. }) if shape.is_some() => shape.raw,
+                (None, &VGETIdx { expr, value, .. }) if value.is_some() =>
+                    extractshape(objs, value.raw, &objs[objs[expr].ann.cast()]),
+                (None, &VGETIdx { axis, span, scalar_axis: 1, .. }) => {
+                    let mut size = lcx.data.func.code.push(
+                        Ins::RES(IRT_IDX, call, target.axes[axis as usize].ret));
+                    for i in 1..span {
+                        let s = lcx.data.func.code.push(
+                            Ins::RES(IRT_IDX, call, target.axes[(axis+i) as usize].ret));
+                        size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, size, s));
+                    }
+                    size
+                },
+                (None, &VGETIdx { axis, span, oaxis, .. }) => {
+                    debug_assert!(innerloop.is_none());
+                    debug_assert!(oaxis == 0);
+                    let [flat] = areserve(&lcx.data.func);
+                    let (start, end) = emitsplatbounds(lcx, target, flat, call, axis as _,
+                        (axis+span) as _);
+                    let num = lcx.data.func.code.push(Ins::SUB(IRT_IDX, end, start));
+                    prefix = Some((flat, num));
+                    continue
+                },
+                (Some((flat, accumulator)), &VGETIdx { expr, value, shape, axis, span, .. }) => {
+                    debug_assert!(shape.is_none()); // must materialize for nested loops
+                    let [loop_init, loop_acc, loop_result, nextflat] = areserve(&lcx.data.func);
+                    let mut loop_ = newloop(&lcx.data.func);
+                    let j = match expr.is_nil() {
+                        true => {
+                            let j = emitsplatloop(lcx, &mut loop_, target, nextflat, call, axis as _,
+                                (axis+span) as _);
+                            Ins::MOV(IRT_IDX, j)
+                        },
+                        false => {
+                            let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _,
+                                nextflat);
+                            let j = emittensorloop(lcx, &mut loop_, &objs[objs[expr].ann.cast()],
+                                value.unwrap());
+                            Ins::ADD(IRT_IDX, baseflat, j)
+                        }
+                    };
+                    match innerloop {
+                        Some((inner_init, start, out)) => {
+                            lcx.data.func.code.set(inner_init, Ins::MOV(IRT_IDX, loop_acc));
+                            lcx.data.func.code.set(replace(&mut loop_.body, out), start);
+                        },
+                        None => *accumulator = lcx.data.func.code.push(
+                            Ins::ADD(IRT_IDX, loop_acc, *accumulator))
+                    }
+                    emitreduce(&lcx.data.func, &mut loop_, IRT_IDX, loop_init,
+                        replace(accumulator, loop_result), loop_acc, loop_result);
+                    let (enter, exit) = closeloop(&lcx.data.func, loop_);
+                    innerloop = Some((loop_init, enter, exit));
+                    lcx.data.func.code.set(replace(flat, nextflat), j);
+                    continue
+                }
+            };
+            len = Some(match len.unpack() {
+                Some(len) => lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, n)),
+                None => n
+            }).into();
+        }
+        if let Some((_, accumulator)) = prefix {
+            len = Some(match len.unpack() {
+                Some(len) => lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, accumulator)),
+                None => accumulator
+            }).into();
+            if let Some((init, start, out)) = innerloop {
+                lcx.data.func.code.set(init, Ins::KINT(IRT_IDX, 0));
+                lcx.data.func.code.set(replace(ctr, out), start);
+            }
+        }
+        let len = match len.unpack() {
+            Some(len) => Ins::MOV(IRT_IDX, len),
+            None => Ins::KINT(IRT_IDX, 1)
+        };
+        lcx.data.func.code.set(outshape + lcx.tmp[end].oaxis as isize, len);
+    }
+    prefix.map(|(flat,_)| flat).into()
+}
+
+fn emitvgetvc(
+    lcx: &mut Lcx,
+    start: BumpRef<VGETIdx>,
+    mut end: BumpRef<VGETIdx>,
+    collect: Option<(/*out:*/InsId, /*in:*/InsId, /*anchor:*/InsId, /*type:*/&TTEN)>,
+    outerloop: &mut Option<Loop>,
+    cc: &mut IndexOption<InsId>,
+    flat: &mut InsId,
+    innerloop: &mut Option<(/*start:*/Ins, /*out:*/InsId)>,
+    call: InsId,
+    target: &Tab,
+) {
+    debug_assert!(start < end);
+    let objs = Access::borrow(&lcx.objs);
+    let (buf, esizes, eds) = match collect {
+        Some((out, _, anchor, ty)) => {
+            let eds = decomposition_size(objs, ty.elem);
+            let (buf, esizes) = alloctensordata(lcx, anchor, ty, out + eds as isize);
+            (buf, esizes, eds)
+        },
+        None => (InsId::INVALID.into(), InsId::INVALID.into(), 0)
+    };
+    let mut inner: Option<(/*init:*/ InsId, /*result:*/ InsId)> = None;
+    while start < end {
+        end = end.offset(-1);
+        let [nextflat] = areserve(&lcx.data.func);
+        let j = match lcx.tmp[end] {
+            VGETIdx { value, axis, span, scalar_expr: 1, .. } => {
+                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, nextflat);
+                Ins::ADD(IRT_IDX, baseflat, value.unwrap())
+            },
+            VGETIdx { value, expr, scalar_expr, mut axis, mut span, .. } => {
+                if expr.is_nil() {
+                    while end > start && lcx.tmp[end.offset(-1)].expr.is_nil() {
+                        end = end.offset(-1);
+                        span += lcx.tmp[end].span;
+                        axis = lcx.tmp[end].axis;
+                    }
+                }
+                let (mut loop_, j) = match scalar_expr {
+                    0 => {
+                        let mut loop_ = newloop(&lcx.data.func);
+                        let j = match expr.is_nil() {
+                            true => {
+                                let j = emitsplatloop(lcx, &mut loop_, target, nextflat, call, axis as _,
+                                    (axis+span) as _);
+                                Ins::MOV(IRT_IDX, j)
+                            },
+                            false => {
+                                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _,
+                                nextflat);
+                                let j = emittensorloop(lcx, &mut loop_, &objs[objs[expr].ann.cast()],
+                                    value.raw);
+                                Ins::ADD(IRT_IDX, baseflat, j)
+                            }
+                        };
+                        (loop_, j)
+                    },
+                    _ => {
+                        (outerloop.take().unwrap(), Ins::MOV(IRT_IDX, value.raw))
+                    }
+                };
+                if let Some(cond) = cc.unpack() {
+                    emitjumpifnot(&lcx.data.func, &mut loop_.body, cond, lcx.data.check.raw);
+                    *cc = None.into();
+                }
+                if let &mut Some((start, out)) = innerloop {
+                    lcx.data.func.code.set(replace(&mut loop_.body, out), start);
+                }
+                if let Some((_, invalue, _, _)) = collect {
+                    let init = reserve(&lcx.data.func, 1+eds);
+                    let accumulator = reserve(&lcx.data.func, 1+eds);
+                    let result = reserve(&lcx.data.func, 1+eds);
+                    let next = match inner {
+                        Some((inner_init, inner_result)) => {
+                            lcx.data.func.code.set(inner_init, Ins::MOV(IRT_IDX, accumulator));
+                            for i in 1..(1+eds) as isize {
+                                lcx.data.func.code.set(inner_init+i, Ins::MOV(Type::FX, accumulator+i));
+                            }
+                            inner_result
+                        },
+                        None => {
+                            let stores = emitmultistore(&lcx.data.func, buf, esizes, accumulator,
+                                invalue, eds);
+                            let one = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
+                            let next = lcx.data.func.code.push(Ins::ADD(IRT_IDX, accumulator, one));
+                            lcx.data.func.code.extend(
+                                (0..eds as isize)
+                                .map(|i| Ins::MOVF(Type::FX, accumulator+1+i, stores+i))
+                            );
+                            next
+                        }
+                    };
+                    emitreduce(&lcx.data.func, &mut loop_, IRT_IDX, init, next, accumulator, result);
+                    for i in 1..(1+eds) as isize {
+                        emitreduce(&lcx.data.func, &mut loop_, Type::FX, init+i, next+i,
+                            accumulator+i, result+i);
+                    }
+                    inner = Some((init, result));
+                }
+                *innerloop = Some(closeloop(&lcx.data.func, loop_));
+                j
+            }
+        };
+        lcx.data.func.code.set(replace(flat, nextflat), j);
+    }
+    if let Some((out, in_, _, _)) = collect {
+        let stores = match inner {
+            Some((init, result)) => {
+                lcx.data.func.code.set(init, Ins::KINT(IRT_IDX, 0));
+                for i in 1..(1+eds) as isize {
+                    lcx.data.func.code.set(init+i, Ins::NOP(Type::FX));
+                }
+                result
+            },
+            None => {
+                // no inner loop. this is a "degenerate" case, like A[(i,j)].
+                lcx.data.func.code.extend((0..eds as isize) .map(|i| Ins::STORE(buf+i, in_+i)))
+            }
+        };
+        for i in 0..eds as isize {
+            lcx.data.func.code.set(out+i, Ins::MOVF(Type::PTR, buf+i, stores+1+i));
+        }
+    }
+}
+
+// if ALL of the following are true...
+//   (1) the VGET variable has exactly one model,
+//   (2) VGET and VSET tables match,
+//   (3) VGET and VSET indices match,
+//   (4) the model is COMPLEX
+// then the VGET can be forwarded to load directly from the VSET
+fn maybefwdvget(lcx: &Lcx, vget: &VGET) -> Option<BumpRef<VSet>> {
+    let lower = &*lcx.data;
+    let var = &lower.bump[vardata(&lower.objs, vget.var)];
+    let [vv] = var.value else { return None };
+    let vset = &lower.bump[vv];
+    let model = &lower.bump[vset.model];
+    if lower.bump[vset.model].mt != Mod::COMPLEX { return None };
+    // TODO: this check can be relaxed, just need to translate index.
+    if !sametab(&lcx.objs, &lower.bump[lower.tab], &lower.bump[model.tab])
+        || !lcx.objs.allequal(cast_args(&vget.idx),
+            cast_args(&lcx.objs[lcx.objs[model.obj].outputs[vset.idx as usize]].idx))
+    {
+        return None
+    }
+    Some(vv)
+}
+
+fn maybefusevget(idx: &[VGETIdx]) -> Option<usize> {
+    let mut foundloop = None;
+    for (j,i) in idx.iter().enumerate() {
+        if i.nest > 0 { break }
+        if i.scalar_expr == 0 {
+            if foundloop.is_some() {
+                // nested loop -> cannot fuse
+                return None
+            }
+            foundloop = Some(j);
+        }
+    }
+    foundloop
+}
+
+fn visitvgetinner(
+    lcx: &mut Lcx,
+    mut visit: Visit,
+    start: BumpRef<VGETIdx>,
+    end: BumpRef<VGETIdx>,
+    ann: ObjRef,
+    var: ObjRef<VAR>,
+    inline: bool,
+    fwdload: Option<BumpRef<VSet>> // TODO: deduce it here
+) -> InsId {
+    debug_assert!(!visit.is_iterate());
+    let bump = Access::borrow(&lcx.data.bump);
+    let objs = Access::borrow(&lcx.objs);
+    let vdata = vardata(&lcx.data.objs, var);
+    let target = &bump[bump[vdata].tab];
+    let isscalarload = ann == objs[var].ann;
+    let mut outerloop = None;
+    emitvgetidx(lcx, visit.head(), start, end, &mut outerloop);
+    let [mut flat] = areserve(&lcx.data.func);
+    let mut cc: IndexOption<InsId> = match (lcx.data.check.is_some(), fwdload) {
+        (true, Some(vset)) => {
+            let base = bump[bump[vset].model].base;
+            let call = emitcallvm(&lcx.data, flat, base + Mod::SUB_AVAIL, inline);
+            let cond = lcx.data.func.code.push(Ins::RES(Type::B1, call, 0.into()));
+            Some(cond)
+        },
+        (true, None) => {
+            let base = bump[vdata].base;
+            let call = emitcallvm(&lcx.data, flat, base + Var::SUB_ARM, inline);
+            let arm = lcx.data.func.code.push(Ins::RES(IRT_ARM, call, 0.into()));
+            let none = lcx.data.func.code.push(Ins::KINT(IRT_ARM, !0));
+            let cond = lcx.data.func.code.push(Ins::NE(arm, none));
+            Some(cond)
+        },
+        (false, _) => None
+    }.into();
+    let eds = match objs.get(ann) {
+        ObjectRef::TTEN(&TTEN { elem, .. }) => decomposition_size(objs, elem),
+        _ => 0
+    };
+    let vload: IndexOption<InsId> = match visit.is_materialize()
+        || (visit.is_shape() && isscalarload && eds > 0)
+    {
+        true => {
+            let (func, ty, ret) = match fwdload {
+                Some(vset) => {
+                    let VSet { ret, idx, model, .. } = bump[vset];
+                    (bump[model].base + Mod::SUB_VALUE, vsettype(objs, bump[model].obj, idx as _), ret)
+                },
+                None => {
+                    let Var { base, obj, .. } = bump[vdata];
+                    (base + Var::SUB_VALUE, obj.erase(), 0.into())
+                }
+            };
+            let call = emitcallvm(&lcx.data, flat, func, inline);
+            let base1 = lcx.tmp.end();
+            let res = lcx.data.func.code.extend(
+                decomposition(objs, ty, &mut lcx.tmp)
+                .iter()
+                .enumerate()
+                .map(|(i,&ty)| Ins::RES(ty, call, ret + i as isize))
+            );
+            lcx.tmp.truncate(base1);
+            Some(res)
+        },
+        false => None
+    }.into();
+    if isscalarload {
+        match visit.reborrow_mut() {
+            Visit::Materialize(slot) => slot.value = vload.unwrap(),
+            Visit::Shape(slot) => slot.value = match vload.unpack() {
+                Some(vload) => vload + eds as isize,
+                None => lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1))
+            },
+            Visit::None(_) => {},
+            Visit::Iterate(_) => unreachable!()
+        }
+        if (cc.is_some() || vload.is_some()) && start < end {
+            let tcall = emittabcall(&lcx.data.func, target.func);
+            emitvgetvc(lcx, start, end, None, &mut outerloop, &mut cc, &mut flat, &mut None, tcall,
+                target);
+        }
+    } else {
+        let mut innerloop: Option<(/*start:*/Ins, /*out:*/InsId)> = None;
+        let tcall = emittabcall(&lcx.data.func, target.func);
+        if let Visit::Materialize(slot) = visit.reborrow_mut() {
+            let nest = lcx.tmp[start..].last().map(|i| i.nest+1).unwrap_or(0);
+            let mut a = ann;
+            for _ in 0..nest {
+                debug_assert!(objs[a].op == Obj::TTEN);
+                lcx.tmp.push(a);
+                a = objs[a.cast::<TTEN>()].elem;
+            }
+            let mut end = end;
+            let mut value = vload.unwrap();
+            let mut anchor: IndexOption<InsId> = None.into();
+            for level in (0..nest).rev() {
+                let mut s = end;
+                while s > start && lcx.tmp[s.offset(-1)].nest == level {
+                    s = s.offset(-1);
+                }
+                let a: &TTEN = &objs[lcx.tmp.pop().unwrap()];
+                let aeds = decomposition_size(objs, a.elem);
+                let nextvalue = reserve(&lcx.data.func, a.dim as usize + aeds);
+                let sprefix = emitvgets(lcx, &mut slot.ctr, s, end, nextvalue + aeds as isize,
+                    tcall, target);
+                if level > 0 && anchor.is_none() {
+                    anchor = Some(reserve(&lcx.data.func, 1)).into();
+                }
+                let actr = anchor.unpack().unwrap_or(slot.ctr);
+                emitvgetvc(lcx, s, end, Some((nextvalue, value, actr, a)), &mut outerloop, &mut cc,
+                    &mut flat, &mut innerloop, tcall, target);
+                if let Some(p) = sprefix.unpack() {
+                    lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, flat));
+                }
+                if let (Some(a), Some((start, _))) = (anchor.unpack(), &mut innerloop) {
+                    lcx.data.func.code.set(a, replace(start, Ins::GOTO(a)));
+                    anchor = None.into();
+                }
+                (value, end) = (nextvalue, s);
+            }
+            if let Some(anchor) = anchor.unpack() {
+                lcx.data.func.code.set(replace(&mut slot.ctr, anchor), Ins::GOTO(anchor));
+            }
+            slot.value = value;
+        } else {
+            if cc.is_some() && start < end {
+                emitvgetvc(lcx, start, end, None, &mut outerloop, &mut cc, &mut flat, &mut innerloop,
+                    tcall, target);
+            }
+            if let Visit::Shape(slot) = visit.reborrow_mut() {
+                if start < end {
+                    slot.value = reserve(&lcx.data.func, objs[ann.cast::<TTEN>()].dim as _);
+                    if let Some(p) = emitvgets(lcx, &mut slot.ctr, start, end, slot.value, tcall,
+                        target).unpack()
+                    {
+                        lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, flat));
+                    }
+                } else {
+                    slot.value = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
+                }
+            }
+        }
+        if let Some((start, out)) = innerloop {
+            lcx.data.func.code.set(replace(visit.ctr(), out), start);
+        }
+    }
+    if let Some(cond) = cc.unpack() {
+        // no loops
+        emitjumpifnot(&lcx.data.func, visit.ctr(), cond, lcx.data.check.raw);
+    }
+    debug_assert!(outerloop.is_none());
+    flat
+}
+
+fn emitvgetfuse(
+    lcx: &mut Lcx,
+    loop_: &mut Loop,
+    want_shape: Option<&mut ExprSlot>,
+    mut start: BumpRef<VGETIdx>,
+    end: BumpRef<VGETIdx>,
+    fuse: BumpRef<VGETIdx>,
+    ann: ObjRef,
+    var: ObjRef<VAR>,
+    inline: bool,
+    fwdload: Option<BumpRef<VSet>>,
+    mut prefix: InsId
+) -> InsId {
+    let bump = Access::borrow(&lcx.data.bump);
+    let objs = Access::borrow(&lcx.objs);
+    debug_assert!(objs[ann].op == Obj::TTEN);
+    let vdata = vardata(&lcx.data.objs, var);
+    let target = &bump[bump[vdata].tab];
+    let tcall = emittabcall(&lcx.data.func, target.func);
+    while start < fuse {
+        let VGETIdx { value, scalar_expr, axis, span, .. } = lcx.tmp[start];
+        debug_assert!(scalar_expr == 1);
+        prefix = idxftrann(lcx, target, tcall, axis as _, (axis+span) as _, prefix);
+        prefix = lcx.data.func.code.push(Ins::ADD(IRT_IDX, prefix, value.unwrap()));
+        start = start.offset(1);
+    }
+    if let Some(outshape) = want_shape {
+        outshape.value = reserve(&lcx.data.func, objs[ann.cast::<TTEN>()].dim as _);
+        let outer_end = bump::iter_range(start..end)
+            .find(|&i| lcx.tmp[i].nest > 0)
+            .unwrap_or(end);
+        if let Some(p) = emitvgets(lcx, &mut outshape.ctr, start, outer_end,
+        outshape.value, tcall, target).unpack()
+        {
+            lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, prefix));
+        }
+    }
+    prefix = match lcx.tmp[fuse] {
+        VGETIdx { expr, axis, span, .. } if expr.is_nil() => emitsplatloop(lcx, loop_, target,
+            prefix, tcall, axis as _, (axis+span) as _),
+        VGETIdx { expr, .. } => emitexpri(lcx, expr, loop_, None)
+    };
+    let mut slot = ExprSlot { value: InsId::INVALID.into(), ctr: loop_.body };
+    let flat = visitvgetinner(
+        lcx,
+        Visit::Materialize(&mut slot),
+        fuse.add(1),
+        end,
+        objs[ann.cast::<TTEN>()].elem,
+        var,
+        inline,
+        fwdload
+    );
+    lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
+    loop_.body = slot.ctr;
+    slot.value
+}
+
+fn visitvget(lcx: &mut Lcx, expr: ObjRef<VGET>, mut visit: Visit) {
+    let bump = Access::borrow(&lcx.data.bump);
+    let objs = Access::borrow(&lcx.objs);
+    let vget = &objs[expr];
+    let base = lcx.tmp.end();
+    let fwdload = maybefwdvget(lcx, vget);
+    if fwdload.is_none() {
+        // TODO: the forwarding logic could be more general, e.g. consider
+        //   table a[...]
+        //   table b[:,...]
+        //   model a b.xs = ...
+        //   model global y = b.xs
+        // this could be lowered as an outer loop + forwarded tail part instead of an inner loop
+        vgetidx(&lcx.data, objs, vget, lcx.tmp.align_for());
+    }
+    let idx_start: BumpRef<VGETIdx> = base.cast_up();
+    let idx_end: BumpRef<VGETIdx> = lcx.tmp.end().cast();
+    let var = vardata(&lcx.data.objs, vget.var);
+    let target = &bump[bump[var].tab];
+    let source = &bump[lcx.data.tab];
+    let nprefix = prefixlen(source.axes.len(), target.axes.len(), vget.dim as _);
+    let prefix = idxtransfer(lcx, lcx.data.tab, bump[var].tab, source.axes.len(), nprefix, INS_FLATIDX);
+    let inline = isdisjointidx(&bump[lcx.data.tab], target, &vget.idx);
+    if let Visit::Iterate(iter) = visit.reborrow_mut() {
+        if let Some(fuseidx) = maybefusevget(&lcx.tmp[base.cast()..idx_end]) {
+            iter.element = emitvgetfuse(
+                lcx,
+                &mut iter.loop_,
+                iter.shape.as_mut(),
+                idx_start,
+                idx_end,
+                idx_start.add(fuseidx),
+                vget.ann,
+                vget.var,
+                inline,
+                fwdload,
+                prefix
+            );
+        } else {
+            iter.element = emitexprmi(lcx, expr.cast(), &mut iter.loop_, iter.shape.as_mut());
+        }
+    } else {
+        let flat = visitvgetinner(lcx, visit, idx_start, idx_end, vget.ann, vget.var, inline, fwdload);
+        lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
+    };
+    lcx.tmp.truncate(base);
+}
+
+fn emitcat(lcx: &mut Lcx, expr: ObjRef<CAT>, ctr: &mut InsId) -> InsId {
+    let objs = Access::borrow(&lcx.objs);
+    let &CAT { ann, ref elems, .. } = &objs[expr];
+    debug_assert!(objs[ann].op == Obj::TTEN);
+    let cty: &TTEN = &objs[ann.cast()];
+    if cty.dim != 1 { todo!() }
+    let eds = decomposition_size(objs, cty.elem);
+    let ptrs = reserve(&lcx.data.func, eds);
+    let esizes = reserve(&lcx.data.func, eds);
+    let mut idx: InsId = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+    let mut fx: IndexOption<InsId> = None.into();
+    let mut eloop: Option<(/*enter:*/Ins, /*exit:*/InsId)> = None;
+    for &e in elems {
+        let (stores, shape) = match objs[e].op {
+            Obj::SPLAT => {
+                let mut loop_ = newloop(&lcx.data.func);
+                let e = objs[e.cast::<SPLAT>()].value;
+                let (element, shape) = emitexpris(lcx, e, &mut loop_, ctr);
+                let dest = reserve(&lcx.data.func, eds);
+                for i in 0..eds as isize {
+                    let ofs = lcx.data.func.code.push(Ins::MUL(IRT_IDX, idx, esizes+i));
+                    lcx.data.func.code.set(dest+i, Ins::ADDP(ptrs+i, ofs));
+                }
+                let stores = emitloopstore(&lcx.data.func, &mut loop_, element, esizes, dest, eds);
+                let (enter, exit) = closeloop(&lcx.data.func, loop_);
+                match &mut eloop {
+                    Some((_, prev_exit)) => lcx.data.func.code.set(replace(prev_exit, exit), enter),
+                    None => eloop = Some((enter, exit))
+                }
+                (stores, shape)
+            },
+            _ => {
+                let value = emitexprv(lcx, e, ctr);
+                let stores = emitmultistore(&lcx.data.func, ptrs, esizes, idx, value, eds);
+                let shape = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
+                (stores, shape)
+            }
+        };
+        idx = lcx.data.func.code.push(Ins::ADD(IRT_IDX, idx, shape));
+        fx = Some(match fx.unpack() {
+            Some(fx) => lcx.data.func.code.extend(
+                (0..eds as isize).map(|j| Ins::MOVF(Type::FX, fx+j, stores+j))),
+            None => stores
+        }).into();
+    }
+    let base = lcx.tmp.end();
+    for (i, ty) in decomposition(&lcx.objs, cty.elem, &mut lcx.tmp).iter().enumerate() {
+        lcx.data.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
+        let size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, idx, esizes + i as isize));
+        lcx.data.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize, *ctr));
+    }
+    if let Some((enter, exit)) = eloop {
+        lcx.data.func.code.set(replace(ctr, exit), enter);
+    }
+    lcx.tmp.truncate(base);
+    let ret = match fx.unpack() {
+        Some(fx) => lcx.data.func.code.extend(
+            (0..eds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, fx+i))),
+        None => lcx.data.func.code.extend((0..eds as isize).map(|i| Ins::MOV(Type::PTR, ptrs+i)))
+    };
+    lcx.data.func.code.push(Ins::MOV(IRT_IDX, idx));
+    ret
+}
+
+fn visitcat(lcx: &mut Lcx, expr: ObjRef<CAT>, visit: Visit) {
+    match visit {
+        Visit::Materialize(slot) => {
+            slot.value = emitcat(lcx, expr, &mut slot.ctr);
+        },
+        Visit::Shape(slot) => {
+            let objs = Access::borrow(&lcx.objs);
+            let mut len = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+            for &e in &objs[expr].elems {
+                let s = emitexprs(lcx, e, &mut slot.ctr);
+                len = lcx.data.func.code.push(Ins::ADD(IRT_IDX, len, s));
+            }
+            slot.value = len;
+        },
+        _ => unreachable!()
+    }
+}
 
 // AND:
 //      IF left ->ri ->fal
@@ -1095,7 +2211,7 @@ fn emitlogic(func: &Func, ctr: &mut InsId, left: InsId, right: InsId, op: BinOp)
     let kbool = func.code.push(Ins::KINT(Type::B1, (op == BinOp::OR) as _));
     let mut other = func.code.push(Ins::JMP(kbool, merge, phi));
     if op == BinOp::OR { (ri, other) = (other, ri); }
-    swapctr(func, ctr, Ins::IF(left, ri, other), merge);
+    func.code.set(replace(ctr, merge), Ins::IF(left, ri, other));
     func.code.push(Ins::PHI(Type::B1, merge, phi))
 }
 
@@ -1138,1342 +2254,325 @@ fn emitscalarbinop(
     }
 }
 
-fn broadcastbinop(
-    lcx: &mut Lcx,
-    loop_: &mut LoopState,
-    op: BinOp,
-    ty: ObjRef,
-    left: ObjRef<EXPR>,
-    right: ObjRef<EXPR>
-) -> InsId {
-    let lhs = emitbroadcast(lcx, loop_, left);
-    let rhs = emitbroadcast(lcx, loop_, right);
-    match lcx.objs.get(ty) {
-        ObjectRef::TPRI(&TPRI { ty, .. }) => emitscalarbinop(lcx, &mut loop_.body, op,
-            Primitive::from_u8(ty), lhs, rhs),
-        t => {
-            debug_assert!(matches!(t, ObjectRef::TTEN(_)));
-            // TODO: this *can* be implemented by materializing it here.
-            // whether that's even useful is another question.
-            // but it makes sense from the type system perspective
-            // (+ :: (T,T) -> T regardless of whether T is scalar or tensor[U,N] or
-            // tensor[tensor[U,N],M] or ... you get the idea)
-            todo!()
-        }
-    }
-}
-
-fn emitscalarintrinsic(
-    lcx: &mut Lcx,
-    _ctr: &mut InsId,
-    f: Intrinsic,
-    _args: &[ObjRef<EXPR>],
-    ty: Type,
-    base: BumpRef<InsId>
-) -> InsId {
-    use Intrinsic::*;
-    let argv = &lcx.tmp[base..];
-    let func = &lcx.data.func;
-    match f {
-        UNM|NOT => func.code.push(Ins::NEG(ty, argv[0])),
-        EXP     => todo!(), // ir intrinsic call?
-        LOG     => todo!(), // ir intrinsic call?
-        CONV    => todo!(),
-        _       => unreachable!() // non-scalar
-    }
-}
-
-fn emitsum(lcx: &mut Lcx, ctr: &mut InsId, arg: ObjRef<EXPR>, ty: Type) -> InsId {
-    if isscalarann(&lcx.objs, arg.erase()) {
-        return emitvalue(lcx, ctr, arg);
-    }
-    let zero = lcx.data.func.code.push(Ins::KINT(ty, 0));
-    let mut reduce = newreducety(&lcx.data.func, [ty], zero);
-    let elem = emititer(lcx, &mut reduce.loop_, arg);
-    let next = lcx.data.func.code.push(Ins::ADD(ty, reduce.value, elem));
-    swapctr(&lcx.data.func, ctr, reduce.start, reduce.loop_.out);
-    closereduce(&lcx.data.func, &reduce, next)
-}
-
-fn emitanyall(lcx: &mut Lcx, ctr: &mut InsId, arg: ObjRef<EXPR>, f: Intrinsic) -> InsId {
-    let resphi = lcx.data.func.phis.push(Phi::new(Type::B1));
-    let [tail, body, merge] = areserve(&lcx.data.func);
-    let default = lcx.data.func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ALL) as _));
-    let notdefault = lcx.data.func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ANY) as _));
-    let out = lcx.data.func.code.push(Ins::JMP(default, merge, resphi));
-    let found = lcx.data.func.code.push(Ins::JMP(notdefault, merge, resphi));
-    let mut loop_ = LoopState { head: *ctr, tail, body, out };
-    let value = emititer(lcx, &mut loop_, arg);
-    lcx.data.func.code.set(loop_.body, if f == Intrinsic::ALL {
-        Ins::IF(value, tail, found)
-    } else {
-        Ins::IF(value, found, tail)
-    });
-    lcx.data.func.code.set(loop_.tail, Ins::GOTO(body));
-    lcx.data.func.code.set(loop_.head, Ins::GOTO(body));
-    *ctr = merge;
-    lcx.data.func.code.push(Ins::PHI(Type::B1, merge, resphi))
-}
-
-fn scalarintrinsic(
-    lcx: &mut Lcx,
-    ctr: &mut InsId,
-    f: Intrinsic,
-    args: &[ObjRef<EXPR>],
-    ty: Type
-) -> InsId {
-    use Intrinsic::*;
-    match f {
-        SUM => emitsum(lcx, ctr, args[0], ty),
-        ANY|ALL => emitanyall(lcx, ctr, args[0], f),
-        _ => {
-            let base = lcx.tmp.end();
-            for &arg in args {
-                let v = emitvalue(lcx, ctr, arg);
-                lcx.tmp.push(v);
-            }
-            let v = emitscalarintrinsic(lcx, ctr, f, args, ty, base.cast_up());
-            lcx.tmp.truncate(base);
-            v
-        }
-    }
-}
-
-fn broadcastintrinsic(
-    lcx: &mut Lcx,
-    loop_: &mut LoopState,
-    f: Intrinsic,
-    args: &[ObjRef<EXPR>],
-    ety: ObjRef
-) -> InsId {
-    let base = lcx.tmp.end();
-    for &arg in args {
-        let v = emititer(lcx, loop_, arg);
-        lcx.tmp.push(v);
-    }
-    let v = match lcx.objs.get(ety) {
-        ObjectRef::TPRI(&TPRI { ty, .. }) => {
-            emitscalarintrinsic(lcx, &mut loop_.body, f, args, Primitive::from_u8(ty).to_ir(),
-                base.cast_up())
+fn visitbinop(lcx: &mut Lcx, expr: ObjRef<BINOP>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let BINOP { binop, ann, left, right, .. } = objs[expr];
+    match visit {
+        Visit::Materialize(slot) if objs[ann].op == Obj::TTEN => {
+            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
         },
-        _ => {
-            // see comment in `broadcastbinop`
-            todo!()
-        }
-    };
-    lcx.tmp.truncate(base);
-    v
-}
-
-fn emitcallx(lcx: &mut Lcx, ctr: &mut InsId, callx: ObjRef<CALLX>) -> InsId {
-    let objs = Access::borrow(&lcx.objs);
-    let base = lcx.data.tmp_ins.len();
-    for &input in &objs[callx].inputs {
-        let value = emitvalue(lcx, ctr, input);
-        lcx.data.tmp_ins.push(value);
-    }
-    let lang = Lang::from_u8(objs[callx].lang);
-    let value = {
-        // safety: this casts (ignoring newtype wrappers):
-        //   &mut Ccx<Lower> -> &mut Ccx<UnsafeCell<Lower>>
-        let lcx: &mut CLcx = unsafe { core::mem::transmute(&mut *lcx) };
-        let lower = Access::borrow(&lcx.data);
-        lang.lower(lcx, *ctr, callx, &lower.func, &lower.tmp_ins[base..])
-    };
-    lcx.data.tmp_ins.truncate(base);
-    value
-}
-
-fn emitcat(lcx: &mut Lcx, ctr: &mut InsId, cat: &CAT) -> InsId {
-    let objs = Access::borrow(&lcx.objs);
-    let cty = &objs[cat.ann.cast::<TTEN>()];
-    debug_assert!(cty.op == Obj::TTEN);
-    if cty.dim != 1 { todo!() }
-    let idxs = reserve(&lcx.data.func, (cat.elems.len()+1) as _);
-    lcx.data.func.code.set(idxs, Ins::KINT(IRT_IDX, 0));
-    for (i, &e) in cat.elems.iter().enumerate() {
-        let len = match objs[e].op {
-            Obj::SPLAT => emitshape(lcx, ctr, objs[e.cast::<SPLAT>()].value),
-            _ => lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1))
-        };
-        lcx.data.func.code.set(idxs + 1 + i as isize, Ins::ADD(IRT_IDX, idxs + i as isize, len));
-    }
-    let ds = decomposition_size(objs, cty.elem);
-    let (ptrs, esizes) = alloctensordata(lcx, *ctr, cty, idxs + cat.elems.len() as isize);
-    let mut effects: IndexOption<InsId> = None.into();
-    for (i, &e) in cat.elems.iter().enumerate() {
-        let stores = match objs[e].op {
-            Obj::SPLAT => {
-                let mut reduce = newreducefx(&lcx.data.func, ds as _);
-                let value = emititer(lcx, &mut reduce.loop_, objs[e.cast::<SPLAT>()].value);
-                let next = emitreducestore(&lcx.data.func, &mut reduce, ptrs, esizes, value,
-                    Some(idxs + i as isize).into());
-                swapctr(&lcx.data.func, ctr, reduce.start, reduce.loop_.out);
-                closereduce(&lcx.data.func, &reduce, next)
-            },
-            _ => {
-                let value = emitvalue(lcx, ctr, e);
-                emitmultistore(&lcx.data.func, ptrs, esizes, idxs + i as isize, value, ds)
-            }
-        };
-        effects = Some(match effects.unpack() {
-            Some(fx) => lcx.data.func.code.extend(
-                (0..ds as isize).map(|j| Ins::MOVF(Type::FX, fx+j, stores+j))),
-            None => stores
-        }).into();
-    }
-    let ret = match effects.unpack() {
-        Some(fx) => lcx.data.func.code.extend(
-            (0..ds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, fx+i))),
-        None => lcx.data.func.code.extend((0..ds as isize).map(|i| Ins::MOV(Type::PTR, ptrs+i)))
-    };
-    lcx.data.func.code.push(Ins::MOV(IRT_IDX, idxs + cat.elems.len() as isize));
-    ret
-}
-
-fn emitget(lcx: &mut Lcx, ctr: &mut InsId, get: &GET) -> InsId {
-    debug_assert!(lcx.objs[lcx.objs[get.value].ann].op == Obj::TTUP);
-    let offset: usize = lcx.objs[lcx.objs[get.value].ann.cast::<TTUP>()].elems[..get.idx as usize]
-        .iter()
-        .map(|&e| decomposition_size(&lcx.objs, e))
-        .sum();
-    emitvalue(lcx, ctr, get.value) + offset as isize
-}
-
-fn emitvget1(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
-    debug_assert!(vget.ann == lcx.objs[vget.var].ann);
-    let i = emitvgetidx(lcx, ControlFlow::Straight(ctr), vget);
-    let var = vardata(&lcx.data.objs, vget.var);
-    let inline = isdisjointidx(&lcx.data.bump[lcx.data.tab],
-        &lcx.data.bump[lcx.data.bump[var].tab], &vget.idx);
-    emitvarload(lcx, var, i, inline)
-}
-
-fn computeshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
-    let objs = Access::borrow(&lcx.objs);
-    match objs.get(expr.erase()) {
-        ObjectRef::VGET(vget @ &VGET { var, ann, ref idx, .. }) => {
-            debug_assert!(objs[ann].op == Obj::TTEN);
-            let bump = Access::borrow(&lcx.data.bump);
-            let v = vardata(&lcx.data.objs, var);
-            let tab = bump[v].tab;
-            if ann == lcx.objs[var].ann {
-                // scalar load of a vector variable
-                let i = emitvgetidx(lcx, ControlFlow::Straight(ctr), vget);
-                emitvarloadshape(lcx, v, i, i == INS_FLATIDX)
-            } else {
-                // vector load
-                let target = &bump[tab];
-                debug_assert!(!isnestedloopidx(lcx, &bump[lcx.data.tab], target, idx));
-                let base = lcx.tmp.end();
-                let call = emittabcall(&lcx.data.func, target.func);
-                let shape = reserve(&lcx.data.func, objs[ann.cast::<TTEN>()].dim as _);
-                vgetidx(&lcx.data, objs, vget, lcx.tmp.align_for());
-                if let Some(p) = vgetshape(lcx, ctr, call, target, base.cast_up(), shape).unpack() {
-                    let source = &bump[lcx.data.tab];
-                    let nprefix = prefixlen(source.axes.len(), target.axes.len(), vget.dim as _);
-                    let prefix = idxtransfer(lcx, lcx.data.tab, bump[v].tab, source.axes.len(),
-                        nprefix, INS_FLATIDX);
-                    lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, prefix));
-                }
-                lcx.tmp.truncate(base);
-                shape
-            }
+        Visit::Materialize(slot) => {
+            let l = emitexprv(lcx, left, &mut slot.ctr);
+            let r = emitexprv(lcx, right, &mut slot.ctr);
+            slot.value = emitscalarbinop(lcx, &mut slot.ctr, BinOp::from_u8(binop),
+                Primitive::from_u8(objs[ann.cast::<TPRI>()].ty), l, r);
         },
-        ObjectRef::IDX(_) => todo!(),
-        ObjectRef::BINOP(&BINOP { left, right, .. }) => {
-            // TODO: this should really insert an assertion that both shapes indeed are equal.
-            let n = match objs[objs[left].ann].op {
-                Obj::TPRI => right,
-                _ /* TTEN */ => left
+        Visit::Shape(slot) => {
+            let (a, b) = if objs[objs[right].ann].op == Obj::TPRI { (left, right) } else { (right, left) };
+            visitexpr(lcx, b, Visit::None(&mut slot.ctr));
+            slot.value = emitexprs(lcx, a, &mut slot.ctr);
+        },
+        Visit::Iterate(iter) => {
+            let (ls, rs) = match objs[objs[right].ann].op {
+                Obj::TPRI => (iter.shape.as_mut(), None),
+                _ => (None, iter.shape.as_mut())
             };
-            computeshape(lcx, ctr, n)
+            let l = emitbroadcastv(lcx, left, &mut iter.loop_, ls);
+            let r = emitbroadcastv(lcx, right, &mut iter.loop_, rs);
+            iter.element = emitscalarbinop(lcx, &mut iter.loop_.body, BinOp::from_u8(binop),
+                elementtype(objs, ann), l, r);
         },
-        ObjectRef::INTR(&INTR { func, ref args, .. }) => {
-            let func = Intrinsic::from_u8(func);
-            debug_assert!(func.is_broadcast());
-            computeshape(lcx, ctr, args[0])
-        },
-        ObjectRef::LOAD(LOAD { shape, .. }) | ObjectRef::NEW(NEW { shape, .. })
-            => emitvalues(lcx, ctr, shape),
-        ObjectRef::GET(_) => todo!(),
-        ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLX(_) => todo!(),
-        _ => unreachable!()
+        Visit::None(ctr) => {
+            visitexpr(lcx, left, Visit::None(ctr));
+            visitexpr(lcx, right, Visit::None(ctr));
+        }
     }
 }
 
-fn alloctensordata(
-    lcx: &mut Lcx,
-    ctr: InsId,
-    type_: &TTEN,
-    shape: InsId
-) -> (
-    /* data pointers: */ InsId,
-    /* element sizes: */ InsId
-) {
-    let lower = &*lcx.data;
-    let len = emitshapelen(&lower.func, shape, type_.dim as _);
-    let ds = decomposition_size(&lcx.objs, type_.elem);
-    let ptrs = reserve(&lower.func, ds);
-    let esizes = reserve(&lower.func, ds);
-    let base = lcx.tmp.end();
-    for (i, ty) in decomposition(&lcx.objs, type_.elem, &mut lcx.tmp).iter().enumerate() {
-        lower.func.code.set(esizes + i as isize, Ins::KINT(IRT_IDX, ty.size() as _));
-        let size = lower.func.code.push(Ins::MUL(IRT_IDX, len, esizes + i as isize));
-        lower.func.code.set(ptrs + i as isize, Ins::ALLOC(size, esizes + i as isize, ctr));
+fn emitscalarintrinsic(lcx: &mut Lcx, intr: Intrinsic, arg: InsId, ty: Type) -> InsId {
+    use Intrinsic::*;
+    match intr {
+        UNM|NOT => lcx.data.func.code.push(Ins::NEG(ty, arg)),
+        EXP     => todo!(),
+        LOG     => todo!(),
+        _       => unreachable!()
     }
-    lcx.tmp.truncate(base);
-    (ptrs, esizes)
 }
 
-struct Collect {
-    reduce: Reduce,
-    dim: u8,
-    shape: InsId,
-    esizes: InsId,
-    ptrs: InsId
+fn visitbroadcastintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit) {
+    let INTR { ann, func, args: [arg], .. } = lcx.objs[expr] else { unreachable!() };
+    match visit.reborrow_mut() {
+        Visit::Materialize(slot) if lcx.objs[ann].op == Obj::TTEN => {
+            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
+        },
+        Visit::Materialize(slot) => {
+            let v = emitexprv(lcx, arg, &mut slot.ctr);
+            slot.value = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
+                Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty).to_ir());
+        },
+        Visit::Iterate(iter) => {
+            let v = emitexpri(lcx, arg, &mut iter.loop_, iter.shape.as_mut());
+            iter.element = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
+                elementtype(&lcx.objs, ann).to_ir());
+        },
+        Visit::Shape(_) | Visit::None(_) => {
+            visitexpr(lcx, arg, visit);
+        }
+    }
 }
 
-fn newcollect(lcx: &mut Lcx, cty: &TTEN, shape: InsId) -> Collect {
-    let ds = decomposition_size(&lcx.objs, cty.elem) as u16;
-    let reduce = newreducefx(&lcx.data.func, ds);
-    let (ptrs, esizes) = alloctensordata(lcx, reduce.loop_.head, cty, shape);
-    Collect { reduce, esizes, dim: cty.dim, shape, ptrs }
-}
-
-fn closecollect(
-    lcx: &mut Lcx,
-    collect: Collect,
-    value: InsId,
-) -> (
-    /* out: */ InsId,
-    /* result (dominated by out): */ InsId,
-    /* ctr instruction: */ Ins,
-) {
-    let Collect { mut reduce, esizes, dim, shape, ptrs } = collect;
-    let func = &lcx.data.func;
-    let next = emitreducestore(func, &mut reduce, ptrs, esizes, value, None.into());
-    let stores = closereduce(func, &reduce, next);
-    let ret = func.code.extend(
-        (0..reduce.num as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, stores+i)));
-    func.code.extend((0..dim as isize).map(|i| Ins::MOV(IRT_IDX, shape+i)));
-    (reduce.loop_.out, ret, reduce.start)
-}
-
-fn materializecollect(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>, cty: &TTEN) -> InsId {
-    let shape = computeshape(lcx, ctr, expr);
-    let mut collect = newcollect(lcx, cty, shape);
-    let value = emititer(lcx, &mut collect.reduce.loop_, expr);
-    let (out, result, start) = closecollect(lcx, collect, value);
-    swapctr(&lcx.data.func, ctr, start, out);
+fn emitsum(func: &Func, loop_: &mut Loop, element: InsId, ty: Type) -> InsId {
+    let [accumulator, result] = areserve(func);
+    let init = func.code.push(Ins::KINT(ty, 0));
+    let next = func.code.push(Ins::ADD(ty, accumulator, element));
+    emitreduce(func, loop_, ty, init, next, accumulator, result);
     result
 }
 
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-struct IdxExpr {
-    expr: ObjRef<EXPR>,
-    axis: u8,
-    span: u8,
-    _pad: [u8; 2]
+fn emitanyall(func: &Func, loop_: &mut Loop, element: InsId, f: Intrinsic) -> InsId {
+    let resphi = func.phis.push(Phi::new(Type::B1));
+    let default = func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ALL) as _));
+    let notdefault = func.code.push(Ins::KINT(Type::B1, (f == Intrinsic::ANY) as _));
+    emitloopinit(func, loop_, resphi, default);
+    let found = func.code.push(Ins::JMP(notdefault, loop_.exit, resphi));
+    let [body] = areserve(func);
+    func.code.set(replace(&mut loop_.body, body), if f == Intrinsic::ALL {
+        Ins::IF(element, body, found)
+    } else {
+        Ins::IF(element, found, body)
+    });
+    func.code.push(Ins::PHI(Type::B1, loop_.exit, resphi))
 }
 
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-struct IdxStruct {
-    idx: IdxExpr,
-    value: IndexOption<InsId>,
-    oaxis: u8,
-    flags: u8
-}
-
-impl IdxStruct {
-    const SCALAR_VALUE: u8 = 0x1; // set iff `expr` is scalar-valued, must be 0x1.
-    const SCALAR_AXIS: u8  = 0x2; // set iff all target axes in [axis, axis+span) are scalar axes
-}
-
-// note: this doesn't fill in value
-fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<IdxStruct>) {
-    let base = buf.end();
-    let var = vardata(&lower.objs, vget.var);
-    let target = &lower.bump[lower.bump[var].tab];
-    let mut taxis = prefixlen(lower.bump[lower.tab].axes.len(), target.axes.len(), vget.dim as _);
-    let mut span = 0;
-    let mut oaxis = 0;
-    for &expr in &vget.idx {
-        let o = objs[expr.erase()];
-        match o.op {
-            Obj::SPEC if o.data == SPEC::SLURP => span += 1,
-            Obj::FLAT => {
-                debug_assert!(span == 0);
-                let fidx = &objs[expr.cast::<FLAT>()].idx;
-                let mut nil = false;
-                for (i, &v) in fidx.iter().enumerate() {
-                    if nil && v.is_nil() {
-                        debug_assert!(span == 0);
-                        let top = buf.end().offset(-1);
-                        buf[top].idx.span += 1;
-                        continue
-                    }
-                    nil = v.is_nil();
-                    if (objs[v].op, objs[v].data) == (Obj::SPEC, SPEC::SLURP) {
-                        span += 1;
-                        continue
-                    }
-                    buf.push(IdxStruct {
-                        idx: IdxExpr {
-                            expr: v,
-                            axis: (taxis + i) as _,
-                            span: span+1,
-                            _pad: Default::default()
-                        },
-                        value: None.into(),
-                        oaxis,
-                        flags: isscalarann(objs, v.erase()) as _,
-                    });
-                    span = 0;
-                }
-                taxis += fidx.len();
-                oaxis += 1;
-            },
-            _ => {
-                let is_scalar = isscalarann(objs, expr.erase());
-                buf.push(IdxStruct {
-                    idx: IdxExpr {
-                        expr,
-                        axis: taxis as _,
-                        span: span+1,
-                        _pad: Default::default()
-                    },
-                    value: None.into(),
-                    oaxis,
-                    flags: is_scalar as _
-                });
-                (taxis, span) = (taxis+1, 0);
-                if !is_scalar { oaxis += 1 }
-            }
-        }
-    }
-    debug_assert!(span == 0);
-    let odim = objs[vget.ann.cast::<TTEN>()].dim;
-    debug_assert!(oaxis <= odim);
-    while oaxis < odim {
-        buf.push(IdxStruct {
-            idx: IdxExpr {
-                expr: ObjRef::NIL.cast(),
-                axis: taxis as _,
-                span: 1,
-                _pad: Default::default()
-            },
-            value: None.into(),
-            oaxis,
-            flags: 0
-        });
-        taxis += 1;
-        oaxis += 1;
-    }
-    debug_assert!(!matches!(target.axes.get(taxis), Some(Axis { rank: Axis::SCALAR, .. })));
-    for i in &mut buf[base..] {
-        if target.axes[i.idx.axis as usize..(i.idx.axis+i.idx.span) as usize]
-            .iter().all(|a| a.rank == Axis::SCALAR)
-        {
-            i.flags |= IdxStruct::SCALAR_AXIS;
-        }
-    }
-}
-
-fn vgetidxvalue(lcx: &mut Lcx, ctr: &mut InsId, base: BumpRef<IdxStruct>) {
-    let first_vsplat = lcx.tmp[base..]
-        .iter()
-        .find_map(|i| if (i.flags & IdxStruct::SCALAR_AXIS) == 0 && i.idx.expr.is_nil() {
-            Some(i.oaxis)
-        } else {
-            None
-        })
-        .unwrap_or(!0);
-    let end: BumpRef<IdxStruct> = lcx.tmp.end().cast();
-    let mut i = base;
-    let mut first_vector = true;
-    while i < end {
-        let expr = lcx.tmp[i].idx.expr;
-        if (lcx.tmp[i].flags & IdxStruct::SCALAR_VALUE) == 0 && first_vector {
-            first_vector = false;
-            if first_vsplat > lcx.tmp[i].oaxis {
-                // first group is rectangular, so it only needs to be iterated once.
-                // don't emitvalue here, use emititer later instead.
-                i = i.offset(1);
-                continue;
-            }
-        }
-        if !expr.is_nil() {
-            lcx.tmp[i].value = Some(emitvalue(lcx, ctr, expr)).into();
-        }
-        i = i.offset(1);
-    }
-}
-
-fn pushflatidx(
-    objs: &Objects,
-    source_dim: usize,
-    target_dim: usize,
-    explicit: usize,
-    idx: &[ObjRef<EXPR>],
-    buf: &mut Bump<IdxExpr>
-) {
-    let prefix = prefixlen(source_dim, target_dim, explicit);
-    let mut axis = prefix;
-    let mut span = 0;
-    let mut nil = false;
-    for expr in iterflatidx(objs, idx) {
-        if expr.is_nil() {
-            span += 1;
-            nil = true;
-        } else {
-            if nil {
-                buf.push(IdxExpr {
-                    expr: ObjRef::NIL.cast(),
-                    axis: axis as _,
-                    span: span as _,
-                    _pad: Default::default()
-                });
-                axis += span;
-                span = 0;
-                nil = false;
-            }
-            if objs[expr].op == Obj::SPEC && objs[expr].op == SPEC::SLURP {
-                span += 1;
-            } else {
-                buf.push(IdxExpr {
-                    expr,
-                    axis: axis as _,
-                    span: (span+1) as _,
-                    _pad: Default::default()
-                });
-                axis += span+1;
-                span = 0;
-            }
-        }
-    }
-    debug_assert!(nil || span == 0);
-    debug_assert!(axis+span <= target_dim);
-    if axis < target_dim {
-        buf.push(IdxExpr {
-            expr: ObjRef::NIL.cast(),
-            axis: axis as _,
-            span: (target_dim-axis) as _,
-            _pad: Default::default()
-        });
-    }
-}
-
-enum ControlFlow<'a> {
-    Straight(&'a mut InsId),
-    Loop(&'a mut LoopState)
-}
-
-fn emitvgetidx(lcx: &mut Lcx, mut ctr: ControlFlow, vget: &VGET) -> InsId {
-    let bump = Access::borrow(&lcx.data.bump);
-    let objs = Access::borrow(&lcx.objs);
-    let var = vardata(&lcx.data.objs, vget.var);
-    let tab = bump[var].tab;
-    let target = &bump[tab];
-    debug_assert!(!isnestedloopidx(lcx, &bump[lcx.data.tab], target, &vget.idx));
-    let sdim = bump[lcx.data.tab].axes.len();
-    let tdim = target.axes.len();
-    let prefix = prefixlen(sdim, tdim, vget.dim as _);
-    let mut flat = idxtransfer(lcx, lcx.data.tab, tab, sdim, prefix, INS_FLATIDX);
-    if prefix == tdim {
-        // nothing to do here (skip emitting the tabcall).
-        return flat;
-    }
-    let call = emittabcall(&lcx.data.func, target.func);
-    let base = lcx.tmp.end();
-    pushflatidx(objs, sdim, tdim, vget.dim as _, &vget.idx, lcx.tmp.align_for());
-    let mut i: BumpRef<IdxExpr> = base.cast_up();
-    let end: BumpRef<IdxExpr> = lcx.tmp.end().cast();
-    while i < end {
-        flat = match lcx.tmp[i] {
-            IdxExpr { expr, axis, span, .. } if expr.is_nil() => {
-                let ControlFlow::Loop(loop_) = &mut ctr else { unreachable!() };
-                emitsplatloop(lcx, loop_, target, flat, call, axis as _, (axis+span) as _)
-            },
-            IdxExpr { expr, axis, span, .. } => {
-                let j = match isscalarann(objs, expr.erase()) {
-                    true => {
-                        let ctr = match &mut ctr {
-                            ControlFlow::Straight(ctr) => ctr,
-                            ControlFlow::Loop(loop_) => &mut loop_.head
-                        };
-                        emitvalue(lcx, ctr, expr)
-                    },
-                    false => {
-                        let ControlFlow::Loop(loop_) = &mut ctr else { unreachable!() };
-                        emititer(lcx, loop_, expr)
-                    }
-                };
-                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, flat);
-                lcx.data.func.code.push(Ins::ADD(IRT_IDX, baseflat, j))
-            }
-        };
-        i = i.offset(1);
-    }
-    lcx.tmp.truncate(base);
-    flat
-}
-
-// compute the shape of the result of a tensor-valued VGET expressions.
-// return an instruction placeholder to be filled with the prefix if the shape of the first group
-// depends on the prefix index (see eg. tests/vget-vector-splat.t for an example)
-fn vgetshape(
+fn visitreduceintrinsic(
     lcx: &mut Lcx,
-    ctr: &mut InsId,
-    call: InsId,
-    target: &Tab,
-    base: BumpRef<IdxStruct>,
-    shape: InsId
-) -> IndexOption<InsId> {
-    let objs = Access::borrow(&lcx.objs);
-    let mut idx: BumpRef<IdxStruct> = lcx.tmp.end().cast();
-    let mut prefix: IndexOption<InsId> = None.into();
-    while idx > base {
-        let mut tail = idx;
-        idx = idx.offset(-1);
-        while idx > base && lcx.tmp[idx].oaxis == lcx.tmp[tail.offset(-1)].oaxis {
-            idx = idx.offset(-1);
-        }
-        let mut len: IndexOption<InsId> = None.into();
-        while tail > idx {
-            tail = tail.offset(-1);
-            // rectangularity should be checked earlier (TODO)
-            debug_assert!((lcx.tmp[tail].flags & IdxStruct::SCALAR_VALUE != 0) || prefix.is_none());
-            let num = match lcx.tmp[tail] {
-                IdxStruct { value, flags, idx: IdxExpr { axis, span, ..}, .. }
-                        if (flags & IdxStruct::SCALAR_VALUE) != 0 => {
-                    if let Some(p) = prefix.unpack() {
-                        let [flat] = areserve(&lcx.data.func);
-                        let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, flat);
-                        lcx.data.func.code.set(p, Ins::ADD(IRT_IDX, baseflat, value.unwrap()));
-                        prefix = Some(flat).into();
-                    }
-                    continue
-                },
-                IdxStruct { value, idx: IdxExpr { expr, .. }, .. } if value.is_some()
-                    => extractshape(objs, value.raw, &objs[objs[expr].ann.cast()]),
-                IdxStruct { idx: IdxExpr { expr, .. }, .. } if !expr.is_nil()
-                    => emitshape(lcx, ctr, expr),
-                IdxStruct { flags: IdxStruct::SCALAR_AXIS, idx: IdxExpr { axis, span, .. }, .. } => {
-                    let mut size = lcx.data.func.code.push(
-                        Ins::RES(IRT_IDX, call, target.axes[axis as usize].ret));
-                    for i in 1..span {
-                        let s = lcx.data.func.code.push(
-                            Ins::RES(IRT_IDX, call, target.axes[(axis+i) as usize].ret));
-                        size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, size, s));
-                    }
-                    size
-                },
-                IdxStruct { idx: IdxExpr { axis, span, .. }, .. } => {
-                    let [mut flat] = areserve(&lcx.data.func);
-                    let (start, end) = emitsplatbounds(lcx, target, flat, call,
-                        axis as _, (axis+span) as _);
-                    let mut num = lcx.data.func.code.push(Ins::SUB(IRT_IDX, end, start));
-                    let mut innerloop: Option<(/*init:*/ InsId, /*start:*/ Ins, /*out:*/ InsId)>
-                        = None;
-                    while tail > idx {
-                        tail = tail.offset(-1);
-                        let [nextflat] = areserve(&lcx.data.func);
-                        let j = match lcx.tmp[tail] {
-                            IdxStruct { flags, value, idx: IdxExpr  { axis, span, ..}, .. }
-                                    if (flags & IdxStruct::SCALAR_VALUE) != 0 => {
-                                let baseflat = idxftrann(lcx, target, call, axis as _,
-                                    (axis+span) as _, nextflat);
-                                Ins::ADD(IRT_IDX, baseflat, value.unwrap())
-                            },
-                            IdxStruct { value, idx: IdxExpr { expr, axis, span, .. }, .. } => {
-                                let [init] = areserve(&lcx.data.func);
-                                let mut reduce = newreducety(&lcx.data.func, [IRT_IDX], init);
-                                let j = match expr.is_nil() {
-                                    true => {
-                                        let j = emitsplatloop(lcx, &mut reduce.loop_, target,
-                                            nextflat, call, axis as _, (axis+span) as _);
-                                        Ins::MOV(IRT_IDX, j)
-                                    },
-                                    false => {
-                                        let baseflat = idxftrann(lcx, target, call,
-                                            axis as _, (axis+span) as _, nextflat);
-                                        let j = emittensorloop(lcx, &mut reduce.loop_,
-                                            &objs[objs[expr].ann.cast()], value.unwrap());
-                                        Ins::ADD(IRT_IDX, baseflat, j)
-                                    }
-                                };
-                                match innerloop {
-                                    Some((inner_init, start, out)) => {
-                                        lcx.data.func.code.set(inner_init,
-                                            Ins::MOV(IRT_IDX, reduce.value));
-                                        lcx.data.func.code.set(replace(&mut reduce.loop_.body, out),
-                                            start);
-                                    },
-                                    None => {
-                                        num = lcx.data.func.code.push(
-                                            Ins::ADD(IRT_IDX, reduce.value, num));
-                                    }
-                                }
-                                num = closereduce(&lcx.data.func, &reduce, num);
-                                innerloop = Some((init, reduce.start, reduce.loop_.out));
-                                j
-                            },
-                        };
-                        lcx.data.func.code.set(replace(&mut flat, nextflat), j);
-                    }
-                    prefix = Some(flat).into();
-                    if let Some((init, start, out)) = innerloop {
-                        lcx.data.func.code.set(init, Ins::KINT(IRT_IDX, 0));
-                        lcx.data.func.code.set(replace(ctr, out), start);
-                    }
-                    num
-                }
+    intr: Intrinsic,
+    ty: Type,
+    arg: ObjRef<EXPR>,
+    mut visit: Visit
+) {
+    match visit.reborrow_mut() {
+        Visit::Materialize(slot) if lcx.objs[lcx.objs[arg].ann].op == Obj::TTEN => {
+            let mut loop_ = newloop(&lcx.data.func);
+            let element = emitexpri(lcx, arg, &mut loop_, None);
+            slot.value = match intr {
+                Intrinsic::SUM => emitsum(&lcx.data.func, &mut loop_, element, ty),
+                Intrinsic::ANY | Intrinsic::ALL => emitanyall(&lcx.data.func, &mut loop_, element, intr),
+                _ => unreachable!()
             };
-            len = Some(match len.unpack() {
-                Some(len) => lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, num)),
-                None => num
-            }).into();
-        }
-        let len = match len.unpack() {
-            Some(len) => Ins::MOV(IRT_IDX, len),
-            None => Ins::KINT(IRT_IDX, 1)
-        };
-        lcx.data.func.code.set(shape + lcx.tmp[idx].oaxis as isize, len);
+            ctrcloseloop(&lcx.data.func, loop_, &mut slot.ctr);
+        },
+        Visit::Materialize(_) | Visit::None(_) => {
+            visitexpr(lcx, arg, visit);
+        },
+        Visit::Iterate(_) | Visit::Shape(_) => unreachable!(),
     }
-    prefix
 }
 
-struct VGetState {
-    value: InsId,  // value collected in the rectangular part
-    flat: InsId,   // **placeholder** for flat index in the current loop
-    innerloop: Option<(/*start:*/Ins, /*out:*/InsId)>, // current inner loop
-}
-
-fn vgetnonrect(
-    lcx: &mut Lcx,
-    vgs: &mut VGetState,
-    target: &Tab,
-    mut elem: ObjRef,
-    call: InsId,
-    var: ObjRef<VAR>
+fn emitwhich(
+    func: &Func,
+    loop_: &mut Loop,
+    arg_element: InsId,
+    want_value: Option<(/*out:*/&mut InsId, /*shape:*/InsId, /*anchor:*/InsId)>,
+    want_shape: Option<&mut InsId>
 ) {
+    debug_assert!(want_value.is_some() || want_shape.is_some());
+    let [merge, idx_accumulator] = areserve(func);
+    let body = replace(&mut loop_.body, merge);
+    let buf_result = match want_value { Some(_) => reserve(func, 1), None => InsId::INVALID.into() };
+    let [idx_result] = areserve(func); // must come right after buf_result
+    let next_idxphi = func.phis.push(Phi::new(IRT_IDX));
+    let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
+    let one = func.code.push(Ins::KINT(IRT_IDX, 1));
+    let next_idx_true = func.code.push(Ins::ADD(IRT_IDX, idx_accumulator, one));
+    let mut branch_true = func.code.push(Ins::JMP(next_idx_true, merge, next_idxphi));
+    let mut branch_false = func.code.push(Ins::JMP(idx_accumulator, merge, next_idxphi));
+    if let Some(out) = want_shape {
+        *out = idx_result;
+    }
+    if let Some((out, arg_shape, anchor)) = want_value {
+        *out = buf_result;
+        let idxsize = func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
+        let size = func.code.push(Ins::MUL(IRT_IDX, arg_shape, idxsize));
+        let buf = func.code.push(Ins::ALLOC(size, idxsize, anchor));
+        let [store_accumulator, store_result] = areserve(func);
+        func.code.set(buf_result, Ins::MOVF(Type::PTR, buf, store_result));
+        let nop = func.code.push(Ins::NOP(Type::FX));
+        let offset = func.code.push(Ins::MUL(IRT_IDX, idx_accumulator, idxsize));
+        let ptr = func.code.push(Ins::ADDP(buf, offset));
+        let j = emitcounter(func, loop_, IRT_IDX);
+        let store = func.code.push(Ins::STORE(ptr, j));
+        let store = func.code.push(Ins::MOVF(Type::FX, store, store_accumulator));
+        let storephi = func.phis.push(Phi::new(Type::FX));
+        branch_true = func.code.push(Ins::JMP(store, branch_true, storephi));
+        branch_false = func.code.push(Ins::JMP(store_accumulator, branch_false, storephi));
+        let next_store = func.code.push(Ins::PHI(Type::FX, merge, storephi));
+        emitreduce(func, loop_, Type::FX, nop, next_store, store_accumulator, store_result);
+    }
+    func.code.set(body, Ins::IF(arg_element, branch_true, branch_false));
+    let next_idx = func.code.push(Ins::PHI(IRT_IDX, merge, next_idxphi));
+    emitreduce(func, loop_, IRT_IDX, zero, next_idx, idx_accumulator, idx_result);
+}
+
+fn visitwhich(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
     let objs = Access::borrow(&lcx.objs);
-    let ann = objs[var].ann;
-    // we only go here if there is a non-rectangular tail part:
-    debug_assert!(ann != elem);
-    // compute non-rectangular loop nest in lcx.tmp
-    let base = lcx.tmp.end();
-    let nest = lcx.tmp.align_for::<ObjRef>();
-    while elem != ann {
-        debug_assert!(objs[elem].op == Obj::TTEN);
-        nest.push(elem);
-        elem = objs[elem.cast::<TTEN>()].elem;
-    }
-    // work through loop nest in reverse order (inside out)
-    let mut axis = target.axes.len();
-    while lcx.tmp.end().cast::<ObjRef>() > base.cast_up() {
-        let ty: &TTEN = &objs[lcx.tmp.pop().unwrap()];
-        let dim = ty.dim as usize;
-        axis -= dim;
-        let [flat] = areserve(&lcx.data.func);
-        let shape = reserve(&lcx.data.func, dim);
-        let mut start = flat;
-        for i in 0..dim {
-            let s = shape + i as isize;
-            match &target.axes[axis+i] {
-                &Axis { rank: Axis::SCALAR, ret, .. } => {
-                    lcx.data.func.code.set(s, Ins::RES(IRT_IDX, call, ret));
-                    start = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, s));
-                },
-                &Axis { /* VECTOR */ ret, .. } => {
-                    debug_assert!(i == 0);
-                    let idxsize = lcx.data.func.code.push(
-                        Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
-                    let f = lcx.data.func.code.push(Ins::RES(Type::PTR, call, ret));
-                    let ofs = lcx.data.func.code.push(Ins::MUL(IRT_IDX, start, idxsize));
-                    let fstart = lcx.data.func.code.push(Ins::ADDP(f, ofs));
-                    let fstart1 = lcx.data.func.code.push(Ins::ADDP(fstart, idxsize));
-                    start = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart));
-                    let end = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fstart1));
-                    lcx.data.func.code.set(s, Ins::SUB(IRT_IDX, end, start));
-                }
-            }
-        }
-        let len = emitshapelen(&lcx.data.func, shape, dim);
-        let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, start, len));
-        let mut col = newcollect(lcx, ty, shape);
-        let j = emitrangeloop(&lcx.data.func, &mut col.reduce.loop_, IRT_IDX, start, end);
-        lcx.data.func.code.set(replace(&mut vgs.flat, flat), Ins::MOV(IRT_IDX, j));
-        if let Some((start, out)) = vgs.innerloop {
-            lcx.data.func.code.set(replace(&mut col.reduce.loop_.body, out), start);
-        }
-        let (out, result, start) = closecollect(lcx, col, vgs.value);
-        vgs.innerloop = Some((start, out));
-        vgs.value = result;
-    }
-    lcx.tmp.truncate(base);
-}
-
-fn vgetrect(
-    lcx: &mut Lcx,
-    vgs: &mut VGetState,
-    ctr: InsId,
-    target: &Tab,
-    cty: &TTEN,
-    call: InsId,
-    eds: usize,
-    idx_base: BumpRef<IdxStruct>,
-    out: InsId
-) {
-    let objs = Access::borrow(&lcx.objs);
-    let idx_end: BumpRef<IdxStruct> = lcx.tmp.end().cast();
-    let shape = out + eds as isize;
-    let (data, esizes) = alloctensordata(lcx, ctr, cty, shape);
-    let mut idx = idx_end;
-    let mut inner: Option<(/*init:*/ InsId, /*value:*/ InsId)> = None;
-    while idx > idx_base {
-        idx = idx.offset(-1);
-        let [nextflat] = areserve(&lcx.data.func);
-        let j = match lcx.tmp[idx] {
-            IdxStruct { flags, value, idx: IdxExpr { axis, span, .. }, .. }
-                    if (flags & IdxStruct::SCALAR_VALUE) != 0 => {
-                let baseflat = idxftrann(lcx, target, call, axis as _,
-                    (axis+span) as _, nextflat);
-                Ins::ADD(IRT_IDX, baseflat, value.unwrap())
-            },
-            IdxStruct { value, idx: IdxExpr { expr, mut span, mut axis, .. }, .. } => {
-                if expr.is_nil() {
-                    while idx > idx_base && lcx.tmp[idx.offset(-1)].idx.expr.is_nil() {
-                        idx = idx.offset(-1);
-                        span += lcx.tmp[idx].idx.span;
-                        axis = lcx.tmp[idx].idx.axis;
-                    }
-                }
-                let l_phi = lcx.data.func.phis.push(Phi::new(IRT_IDX));
-                lcx.data.func.phis.extend(repeat_n(Phi::new(Type::FX), eds));
-                let r_phi = lcx.data.func.phis.push(Phi::new(IRT_IDX));
-                lcx.data.func.phis.extend(repeat_n(Phi::new(Type::FX), eds));
-                let init = reserve(&lcx.data.func, 1+eds);
-                let mut reduce = newreduce(&lcx.data.func, l_phi, r_phi, init, (1+eds) as _);
-                let j = match expr.is_nil() {
-                    true => {
-                        let j = emitsplatloop(lcx, &mut reduce.loop_, target, nextflat, call,
-                            axis as _, (axis+span) as _);
-                        Ins::MOV(IRT_IDX, j)
-                    },
-                    false => {
-                        let baseflat = idxftrann(lcx, target, call,
-                            axis as _, (axis+span) as _, nextflat);
-                        let j = match value.unpack() {
-                            Some(value) => emittensorloop(lcx, &mut reduce.loop_,
-                                &objs[objs[expr].ann.cast()], value),
-                            None => emititer(lcx, &mut reduce.loop_, expr),
-                        };
-                        Ins::ADD(IRT_IDX, baseflat, j)
-                    }
-                };
-                if let Some((start, out)) = vgs.innerloop {
-                    lcx.data.func.code.set(replace(&mut reduce.loop_.body, out), start);
-                }
-                let next = match inner {
-                    Some((init, value)) => {
-                        lcx.data.func.code.set(init, Ins::MOV(IRT_IDX, reduce.value));
-                        for i in 1..(1+eds) as isize {
-                            lcx.data.func.code.set(init+i, Ins::MOV(Type::FX, reduce.value+i));
-                        }
-                        value
-                    },
-                    None => {
-                        let stores = emitmultistore(&lcx.data.func, data, esizes, reduce.value,
-                            vgs.value, eds);
-                        let one = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
-                        let next = lcx.data.func.code.push(Ins::ADD(IRT_IDX, reduce.value, one));
-                        lcx.data.func.code.extend(
-                            (0..eds as isize)
-                            .map(|i| Ins::MOVF(Type::FX, reduce.value+1+i, stores+i))
-                        );
-                        next
-                    }
-                };
-                let result = closereduce(&lcx.data.func, &reduce, next);
-                inner = Some((init, result));
-                vgs.innerloop = Some((reduce.start, reduce.loop_.out));
-                j
-            },
-        };
-        lcx.data.func.code.set(replace(&mut vgs.flat, nextflat), j);
-    }
-    let stores = match inner {
-        Some((init, result)) => {
-            lcx.data.func.code.set(init, Ins::KINT(IRT_IDX, 0));
-            for i in 1..(1+eds) as isize {
-                lcx.data.func.code.set(init+i, Ins::NOP(Type::FX));
-            }
-            result
-        },
-        None => {
-            // no inner loop. this is a "degenerate" case, like A[(i,j)].
-            lcx.data.func.code.extend((0..eds as isize) .map(|i| Ins::STORE(data+i, vgs.value+i)))
-        }
-    };
-    for i in 0..eds as isize {
-        lcx.data.func.code.set(out+i, Ins::MOVF(Type::PTR, data+i, stores+1+i));
-    }
-}
-
-// TODO: this does not verify that the index is actually rectangular.
-// it should be checked (preferably earlier, after type inference) and an error should be raised.
-// this will return garbage values if the expression selects a non-rectangular array.
-fn materializevget(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET) -> InsId {
-    let bump = Access::borrow(&lcx.data.bump);
-    let objs = Access::borrow(&lcx.objs);
-    let var = vardata(&lcx.data.objs, vget.var);
-    let target = &bump[bump[var].tab];
-    let tcall = emittabcall(&lcx.data.func, target.func);
-    let cty = &objs[vget.ann.cast::<TTEN>()];
-    let eds = decomposition_size(objs, cty.elem);
-    let source = &bump[lcx.data.tab];
-    let nprefix = prefixlen(source.axes.len(), target.axes.len(), vget.dim as _);
-    let prefix = idxtransfer(lcx, lcx.data.tab, bump[var].tab, source.axes.len(), nprefix, INS_FLATIDX);
-    let base = lcx.tmp.end();
-    vgetidx(&lcx.data, &lcx.objs, vget, lcx.tmp.align_for());
-    vgetidxvalue(lcx, ctr, base.cast_up());
-    let ret = reserve(&lcx.data.func, eds + cty.dim as usize);
-    if let Some(p) = vgetshape(lcx, ctr, tcall, target, base.cast_up(), ret + eds as isize).unpack() {
-        lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, prefix));
-    }
-    let [flat] = areserve(&lcx.data.func);
-    let inline = isdisjointidx(&bump[lcx.data.tab], target, &vget.idx);
-    let value = emitvarload(lcx, var, flat, inline);
-    let mut vgs = VGetState { flat, value, innerloop: None };
-    if cty.elem != objs[vget.var].ann {
-        vgetnonrect(lcx, &mut vgs, target, cty.elem, tcall, vget.var);
-    }
-    vgetrect(lcx, &mut vgs, *ctr, target, cty, tcall, eds, base.cast_up(), ret);
-    lcx.tmp.truncate(base);
-    lcx.data.func.code.set(vgs.flat, Ins::MOV(IRT_IDX, prefix));
-    let (start, out) = vgs.innerloop.unwrap();
-    lcx.data.func.code.set(replace(ctr, out), start);
-    ret
-}
-
-// if ALL of the following are true...
-//   (1) the VGET variable has exactly one model,
-//   (2) VGET and VSET tables match,
-//   (3) VGET and VSET indices match,
-// then emit a direct load from the model
-fn emitfwdvget(lcx: &mut Lcx, vget: &VGET) -> IndexOption<InsId> {
-    let lower = &mut *lcx.data;
-    let bump = Access::borrow(&lower.bump);
-    let var = &bump[vardata(&lower.objs, vget.var)];
-    let [vset] = var.value else { return None.into() };
-    let vset = &bump[vset];
-    let model = &bump[vset.model];
-    // TODO: this check can be relaxed, just need to translate index.
-    if !sametab(&lcx.objs, &bump[lower.tab], &bump[model.tab]) { return None.into() }
-    if !lcx.objs.allequal(cast_args(&vget.idx), cast_args(&lcx.objs[vset.obj].idx)) {
-        return None.into();
-    }
-    let call = emitcallvm1(lower, INS_FLATIDX, model.base + Mod::SUB_VALUE);
-    let base = lower.func.code.end();
-    // scalar load of vector variable is handled separately:
-    debug_assert!(vget.ann != lcx.objs[vget.var].ann);
-    for (i, &ty) in decomposition__old(&lcx.objs, lcx.objs[vset.obj].value.erase(), &mut lower.tmp_ty)
-        .iter()
-        .enumerate()
-    {
-        lower.func.code.push(Ins::RES(ty, call, vset.ret + i as isize));
-    }
-    Some(base).into()
-}
-
-fn emitnew(lcx: &mut Lcx, ctr: &mut InsId, new: &NEW) -> InsId {
-    debug_assert!(lcx.objs[new.ann].op == Obj::TTEN);
-    let shape = emitvalues(lcx, ctr, &new.shape);
-    let len = emitshapelen(&lcx.data.func, shape, new.shape.len());
-    let base = lcx.tmp.end();
-    let deco = decomposition(&lcx.objs, lcx.objs[new.ann.cast::<TTEN>()].elem, &mut lcx.tmp);
-    let ds = deco.len();
-    let out = reserve(&lcx.data.func, deco.len() + new.shape.len());
-    for (i,&ty) in deco.iter().enumerate() {
-        let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
-        let num = lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, size));
-        lcx.data.func.code.set(out + i as isize, Ins::ALLOC(num, size, *ctr));
-    }
-    lcx.tmp.truncate(base);
-    for i in 0..0+new.shape.len() {
-        lcx.data.func.code.set(out + (ds+i) as isize, Ins::MOV(IRT_IDX, shape + i as isize));
-    }
-    out
-}
-
-// in pseudocode:
-//   (dim1, ..., dimN) = shape(expr)
-//   buf1 = alloc(dim1 * ... * dimN)
-//   ...
-//   bufN = alloc(dim1 * ... * dimN)
-//   num = 0
-//   for i1 in 0..dim1:
-//     ...
-//       for iN in 0..dimN:
-//         if next(expr):
-//           buf1[num] = i1
-//           ...
-//           bufN[num] = iN
-//           num = num+1
-//   return (buf1, ..., bufN, num)
-// (TODO: this only implements the 1D case.)
-fn emitwhich(lcx: &mut Lcx, ctr: &mut InsId, cty: &TTEN, expr: ObjRef<EXPR>) -> InsId {
-    debug_assert!(cty.dim == 1);
-    debug_assert!(lcx.objs[lcx.objs[expr].ann].op == Obj::TTEN);
-    let edim = lcx.objs[lcx.objs[expr].ann.cast::<TTEN>()].dim as usize;
-    debug_assert!(edim == 1);
-    // ND case: debug_assert!(decomposition_size(&lcx.objs, cty.elem) == edim);
-    let shape = computeshape(lcx, ctr, expr);
-    let lower = &mut *lcx.data;
-    let idxsize = lower.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
-    let size = lower.func.code.push(Ins::MUL(IRT_IDX, shape, idxsize));
-    let buf = lower.func.code.push(Ins::ALLOC(size, idxsize, *ctr));
-    let bufphi = lower.func.phis.push(Phi::new(Type::PTR));
-    let nop = lower.func.code.push(Ins::NOP(Type::FX));
-    let zero = lower.func.code.push(Ins::KINT(IRT_IDX, 0)); // must be here for num init
-    let mut reduce = newreducety(&lower.func, [Type::FX, IRT_IDX], nop);
-    let head = reserve(&lower.func, 1);
-    lower.func.code.set(reduce.loop_.head, Ins::JMP(buf, head, bufphi));
-    reduce.loop_.head = head;
-    let loop_store = reduce.value;
-    let loop_num = reduce.value+1;
-    let loop_buf = lower.func.code.push(Ins::PHI(Type::PTR, reduce.loop_.body, bufphi));
-    let i = emitrangeloop(&lower.func, &mut reduce.loop_, IRT_IDX, zero, shape);
-    let v = emititer(lcx, &mut reduce.loop_, expr);
-    let lower = &mut *lcx.data;
-    let loop_nextstore = lower.func.code.push(Ins::STORE(loop_buf, i));
-    let loop_nextbuf = lower.func.code.push(Ins::ADDP(loop_buf, idxsize));
-    let one = lower.func.code.push(Ins::KINT(IRT_IDX, 1));
-    let loop_nextnum = lower.func.code.push(Ins::ADD(IRT_IDX, loop_num, one));
-    let merge = reserve(&lower.func, 1);
-    let next_storephi = lower.func.phis.push(Phi::new(Type::FX));
-    let next_numphi = lower.func.phis.push(Phi::new(IRT_IDX));
-    let next_bufphi = lower.func.phis.push(Phi::new(Type::PTR));
-    let store_branch = lower.func.code.push(Ins::JMP(loop_nextstore, merge, next_storephi));
-    let store_branch = lower.func.code.push(Ins::JMP(loop_nextnum, store_branch, next_numphi));
-    let store_branch = lower.func.code.push(Ins::JMP(loop_nextbuf, store_branch, next_bufphi));
-    let skip_branch = lower.func.code.push(Ins::JMP(loop_store, merge, next_storephi));
-    let skip_branch = lower.func.code.push(Ins::JMP(loop_num, skip_branch, next_numphi));
-    let skip_branch = lower.func.code.push(Ins::JMP(loop_buf, skip_branch, next_bufphi));
-    lower.func.code.set(reduce.loop_.body, Ins::IF(v, store_branch, skip_branch));
-    reduce.loop_.body = merge;
-    let next = lower.func.code.push(Ins::PHI(Type::FX, merge, next_storephi));
-    lower.func.code.push(Ins::PHI(IRT_IDX, merge, next_numphi)); // next num, must be here.
-    let next_buf = lower.func.code.push(Ins::PHI(Type::PTR, merge, next_bufphi));
-    let tail = reserve(&lower.func, 1);
-    lower.func.code.set(reduce.loop_.tail, Ins::JMP(next_buf, tail, bufphi));
-    reduce.loop_.tail = tail;
-    let results = closereduce(&lower.func, &reduce, next);
-    swapctr(&lower.func, ctr, reduce.start, reduce.loop_.out);
-    let out = lower.func.code.push(Ins::MOVF(Type::PTR, buf, results));
-    lower.func.code.push(Ins::MOV(IRT_IDX, results+1)); // num, must be out+1
-    out
-}
-
-fn computevalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
-    let objs = Access::borrow(&lcx.objs);
-    let ann = objs[expr].ann;
-    match objs.get(expr.erase()) {
-        ObjectRef::GET(o) => emitget(lcx, ctr, o),
-        ObjectRef::CALLX(_) => emitcallx(lcx, ctr, expr.cast()),
-        ObjectRef::CAT(cat) => emitcat(lcx, ctr, cat),
-        o => match objs.get(ann) {
-            ObjectRef::TPRI(&TPRI { ty, .. }) => /* scalar value */ {
-                let ty = Primitive::from_u8(ty).to_ir();
-                match o {
-                    ObjectRef::KINT(&KINT { k, .. }) => lcx.data.func.code.push(
-                        Ins::KINT(ty, k as _)),
-                    ObjectRef::KINT64(&KINT64 { k, .. }) => lcx.data.func.code.push(
-                        Ins::KINT64(ty, zerocopy::transmute!(k))),
-                    ObjectRef::KFP64(&KFP64 { k, .. }) => lcx.data.func.code.push(
-                        Ins::KFP64(ty, zerocopy::transmute!(k))),
-                    ObjectRef::KSTR(&KSTR { k, .. }) => lcx.data.func.code.push(
-                        Ins::KSTR(ty, zerocopy::transmute!(k))),
-                    ObjectRef::DIM(&DIM { axis, .. }) => {
-                        debug_assert!(ty == IRT_IDX);
-                        let source = lcx.data.bump[lcx.data.tab].axes.len();
-                        axisidx(lcx, lcx.data.tab, source, (axis+1) as _, INS_FLATIDX)
-                    },
-                    ObjectRef::LEN(&LEN { axis, value, .. }) =>
-                        emitshape(lcx, ctr, value) + axis as isize,
-                    ObjectRef::VGET(o) => emitvget1(lcx, ctr, o),
-                    ObjectRef::IDX(_) => todo!(),
-                    ObjectRef::BINOP(&BINOP { binop, left, right, .. }) => {
-                        let lhs = emitvalue(lcx, ctr, left);
-                        let rhs = emitvalue(lcx, ctr, right);
-                        let pri = Primitive::from_u8(objs[objs[left].ann.cast::<TPRI>()].ty);
-                        emitscalarbinop(lcx, ctr, BinOp::from_u8(binop), pri, lhs, rhs)
-                    },
-                    ObjectRef::INTR(&INTR { func, ref args, .. }) =>
-                        scalarintrinsic(lcx, ctr, Intrinsic::from_u8(func), args, ty),
-                    ObjectRef::LOAD(&LOAD { ann, addr, ref shape, .. }) => {
-                        debug_assert!(shape.is_empty());
-                        debug_assert!(lcx.objs[ann].op == Obj::TPRI);
-                        let addr = emitvalue(lcx, ctr, addr);
-                        lcx.data.func.code.push(Ins::LOAD(ty, addr))
-                    },
-                    ObjectRef::FREF(_) => todo!(),
-                    ObjectRef::CALL(_) => todo!(),
-                    _ => unreachable!()
-                }
-            },
-            ObjectRef::TTEN(cty) => /* vector value */ {
-                if let ObjectRef::LOAD(_) = o {
-                    // note: this depends on the fact that load.addr and load.dims are consecutive
-                    // in memory.
-                    return emitvalues(lcx, ctr, cast_args_raw(
-                        &objs.get_raw(expr.erase())[obj_index_of!(LOAD,addr)..]));
-                }
-                if let ObjectRef::NEW(new) = o {
-                    return emitnew(lcx, ctr, new);
-                }
-                if let ObjectRef::INTR(&INTR { func, ref args, .. }) = o {
-                    if func == Intrinsic::WHICH as _ {
-                        return emitwhich(lcx, ctr, cty, args[0]);
-                    }
-                }
-                if let ObjectRef::VGET(vget) = o {
-                    // special case: scalar load of a vector variable is already materialized.
-                    if vget.ann == lcx.objs[vget.var].ann {
-                        return emitvget1(lcx, ctr, vget);
-                    }
-                    // special case: ref idx matches complex return
-                    if let Some(ins) = emitfwdvget(lcx, vget).unpack() {
-                        return ins;
-                    }
-                    // else: collect
-                    return materializevget(lcx, ctr, vget);
-                }
-                // else: collect iterator into array.
-                materializecollect(lcx, ctr, expr, cty)
-            },
-            _ => unreachable!()
-        }
-    }
-}
-
-fn itervalue(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
-    let objs = Access::borrow(&lcx.objs);
-    match objs.get(expr.erase()) {
-        ObjectRef::VGET(vget @ &VGET { ann, var, ref idx, .. }) => {
-            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
-            let i = emitvgetidx(lcx, ControlFlow::Loop(loop_), vget);
-            let v = vardata(&lcx.data.objs, var);
-            let inline = isdisjointidx(&lcx.data.bump[lcx.data.tab],
-                &lcx.data.bump[lcx.data.bump[v].tab], idx);
-            let mut value = emitvarload(lcx, v, i, inline);
-            if ann == lcx.objs[var].ann {
-                let objs = Access::borrow(&lcx.objs);
-                value = emittensorloop(lcx, loop_, &objs[ann.cast()], value);
-            }
-            value
-        },
-        ObjectRef::IDX(_) => todo!(),
-        ObjectRef::BINOP(&BINOP { ann, binop, left, right, .. }) => {
-            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
-            broadcastbinop(lcx, loop_, BinOp::from_u8(binop), lcx.objs[ann.cast::<TTEN>()].elem,
-                left, right)
-        },
-        ObjectRef::INTR(&INTR { ann, func, ref args, .. }) => {
-            debug_assert!(lcx.objs[ann].op == Obj::TTEN);
-            let func = Intrinsic::from_u8(func);
-            if func.is_broadcast() {
-                broadcastintrinsic(lcx, loop_, func, args, lcx.objs[ann.cast::<TTEN>()].elem)
+    let &INTR { args: [arg], .. } = &objs[expr] else { unreachable!() };
+    let is_materialize = visit.is_materialize();
+    match visit {
+        Visit::Materialize(slot) | Visit::Shape(slot) => {
+            let mut loop_ = newloop(&lcx.data.func);
+            if is_materialize {
+                let (element, shape) = emitexpris(lcx, arg, &mut loop_, &mut slot.ctr);
+                emitwhich(&lcx.data.func, &mut loop_, element,
+                    Some((&mut slot.value, shape, slot.ctr)), None);
             } else {
-                // should go through emitvalue + iterate array.
-                unreachable!()
+                let element = emitexpri(lcx, arg, &mut loop_, None);
+                emitwhich(&lcx.data.func, &mut loop_, element, None, Some(&mut slot.value));
+            };
+            ctrcloseloop(&lcx.data.func, loop_, &mut slot.ctr);
+        },
+        Visit::Iterate(iter) => {
+            iter.element = emitexprmi(lcx, expr.cast(), &mut iter.loop_, iter.shape.as_mut());
+        },
+        Visit::None(ctr) => {
+            visitexpr(lcx, arg, Visit::None(ctr));
+        }
+    }
+}
+
+// TODO: split these into their own nodes?
+fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &INTR { ann, func, ref args, .. } = &objs[expr];
+    let func = Intrinsic::from_u8(func);
+    match func {
+        Intrinsic::UNM | Intrinsic::NOT | Intrinsic::EXP | Intrinsic::LOG => {
+            visitbroadcastintrinsic(lcx, expr, visit);
+        },
+        Intrinsic::SUM | Intrinsic::ANY | Intrinsic::ALL => {
+            let &[arg] = args else { unreachable!() };
+            let ObjectRef::TPRI(&TPRI { ty, .. }) = objs.get(ann) else { unreachable!() };
+            visitreduceintrinsic(lcx, func, Primitive::from_u8(ty).to_ir(), arg, visit);
+        },
+        Intrinsic::WHICH => visitwhich(lcx, expr, visit),
+        Intrinsic::CONV => todo!(),
+        Intrinsic::REP => todo!()
+    }
+}
+
+fn visitload(lcx: &mut Lcx, expr: ObjRef<LOAD>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &LOAD { ann, addr, ref shape, .. } = &objs[expr];
+    let is_materialize = visit.is_materialize();
+    match visit {
+        Visit::Materialize(slot) if shape.is_empty() => {
+            debug_assert!(objs[ann].op == Obj::TPRI);
+            let value = emitexprv(lcx, addr, &mut slot.ctr);
+            let ty = Primitive::from_u8(objs[ann.cast::<TPRI>()].ty).to_ir();
+            slot.value = lcx.data.func.code.push(Ins::LOAD(ty, value));
+        },
+        Visit::Materialize(slot) | Visit::Shape(slot) => {
+            debug_assert!(!shape.is_empty());
+            debug_assert!(objs[ann].op == Obj::TTEN);
+            let buf = reserve(&lcx.data.func, is_materialize as _);
+            let nums = reserve(&lcx.data.func, shape.len()); // must come right after buf
+            if is_materialize {
+                slot.value = buf;
+                let v = emitexprv(lcx, addr, &mut slot.ctr);
+                lcx.data.func.code.set(buf, Ins::MOV(Type::PTR, v));
+            } else {
+                slot.value = nums;
+                visitexpr(lcx, addr, Visit::None(&mut slot.ctr));
+            }
+            for (i, &e) in shape.iter().enumerate() {
+                let ev = emitexprv(lcx, e, &mut slot.ctr);
+                lcx.data.func.code.set(nums + i as isize, Ins::MOV(IRT_IDX, ev));
             }
         },
-        ObjectRef::LOAD(&LOAD { ann, addr, shape: ref dims, .. }) => {
-            debug_assert!(objs[ann].op == Obj::TTEN);
-            debug_assert!(objs[objs[ann.cast::<TTEN>()].elem].op == Obj::TPRI);
-            let addr = emitvalue(lcx, &mut loop_.head, addr);
-            let shape = emitvalues(lcx, &mut loop_.head, dims);
-            emittensordataloop(lcx, loop_, &objs[ann.cast()], addr, shape)
+        _ => unreachable!() // short-circuited in emitexpr
+    }
+}
+
+fn visitnew(lcx: &mut Lcx, expr: ObjRef<NEW>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &NEW { ann, ref shape, .. } = &objs[expr];
+    debug_assert!(objs[ann].op == Obj::TTEN);
+    let is_materialize = visit.is_materialize();
+    match visit {
+        Visit::Materialize(slot) | Visit::Shape(slot) => {
+            let eds = match is_materialize {
+                true => decomposition_size(objs, objs[ann.cast::<TTEN>()].elem),
+                false => 0
+            };
+            let res = reserve(&lcx.data.func, eds + shape.len());
+            slot.value = res;
+            for (i, &e) in shape.iter().enumerate() {
+                let ev = emitexprv(lcx, e, &mut slot.ctr);
+                lcx.data.func.code.set(res + (eds + i) as isize, Ins::MOV(IRT_IDX, ev));
+            }
+            if is_materialize {
+                let base = lcx.tmp.end();
+                let deco = decomposition(&lcx.objs, lcx.objs[ann.cast::<TTEN>()].elem, &mut lcx.tmp);
+                let len = emitshapelen(&lcx.data.func, res + eds as isize, shape.len());
+                for (i,&ty) in deco.iter().enumerate() {
+                    let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, ty.size() as _));
+                    let num = lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, size));
+                    lcx.data.func.code.set(res + i as isize, Ins::ALLOC(num, size, slot.ctr));
+                }
+                lcx.tmp.truncate(base);
+            }
         },
-        ObjectRef::GET(_) => todo!(),
-        ObjectRef::CALL(_) => todo!(),
-        ObjectRef::CALLX(_) => todo!(),
         _ => unreachable!()
     }
 }
 
-fn emitvalue(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
-    // this is saved here even if it only has one reference, because for non-iterable objects
-    // the value may be used multiple times per reference, eg. when a caller does
-    // emitshape+emititer
-    if let Some(&ins) = lcx.data.expr.get(&expr) {
-        return ins;
-    }
-    let ins = computevalue(lcx, ctr, expr);
-    lcx.data.expr.insert_unique_unchecked(expr, ins);
-    ins
-}
-
-fn emitvalues(lcx: &mut Lcx, ctr: &mut InsId, exprs: &[ObjRef<EXPR>]) -> InsId {
-    match exprs {
-        &[] => InsId::INVALID.into(),
-        &[v] => emitvalue(lcx, ctr, v),
-        vs => {
-            let base = reserve(&lcx.data.func, vs.len());
-            for (i,&v) in vs.iter().enumerate() {
-                let vv = emitvalue(lcx, ctr, v);
-                lcx.data.func.code.set(base + i as isize,
-                    Ins::MOV(lcx.data.func.code.at(vv).type_(), vv));
+fn visitget(lcx: &mut Lcx, expr: ObjRef<GET>, visit: Visit) {
+    let GET { ann, value, idx, .. } = lcx.objs[expr];
+    debug_assert!(lcx.objs[lcx.objs[value].ann].op == Obj::TTUP);
+    let is_materialize = visit.is_materialize();
+    match visit {
+        Visit::Materialize(slot) | Visit::Shape(slot) => {
+            let mut v = emitexprv(lcx, value, &mut slot.ctr);
+            let offset: usize = lcx.objs[lcx.objs[value].ann.cast::<TTUP>()].elems[..idx as usize]
+                .iter()
+                .map(|&e| decomposition_size(&lcx.objs, e))
+                .sum();
+            v += offset as isize;
+            if !is_materialize {
+                v = extractshape(&lcx.objs, v, &lcx.objs[ann.cast()]);
             }
-            base
-        }
-    }
-}
-
-fn emitshape(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef<EXPR>) -> InsId {
-    // XXX: the isiterable condition is here because all callers that want the shape will
-    // eventually want to iterate as well. if the object is non-iterable then iteration requires
-    // materializing the value anyway.
-    // a better way to do this would be eg. emit both the shape and iterator at the same time, but
-    // that requires careful handling of the control flow
-    if lcx.objs[expr].mark == EXPR_ONE && isiterable(lcx, expr) {
-        computeshape(lcx, ctr, expr)
-    } else {
-        let value = emitvalue(lcx, ctr, expr);
-        let ty = &lcx.objs[lcx.objs[expr].ann.cast()];
-        extractshape(&lcx.objs, value, ty)
-    }
-}
-
-fn isiterable(lcx: &Lcx, expr: ObjRef<EXPR>) -> bool {
-    let obj = lcx.objs[expr.erase()];
-    match obj.op {
-        Obj::INTR => Intrinsic::from_u8(obj.data).is_broadcast(),
-        Obj::CAT  => false,
-        Obj::VGET => {
-            let vget: &VGET = &lcx.objs[expr.cast()];
-            let v = vardata(&lcx.data.objs, vget.var);
-            !isnestedloopidx(lcx, &lcx.data.bump[lcx.data.tab],
-                &lcx.data.bump[lcx.data.bump[v].tab], &vget.idx)
+            slot.value = v;
         },
-        _ => true
+        _ => unreachable!()
     }
 }
 
-fn emititer(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
-    match lcx.objs[expr].mark {
-        EXPR_ONE if isiterable(lcx, expr) => itervalue(lcx, loop_, expr),
-        _ => {
-            let objs = Access::borrow(&lcx.objs);
-            debug_assert!(objs[objs[expr].ann].op == Obj::TTEN);
-            let value = emitvalue(lcx, &mut loop_.head, expr);
-            emittensorloop(lcx, loop_, &objs[objs[expr].ann.cast()], value)
-        }
-    }
-}
-
-fn emitbroadcast(lcx: &mut Lcx, loop_: &mut LoopState, expr: ObjRef<EXPR>) -> InsId {
-    match lcx.objs[lcx.objs[expr].ann].op {
-        Obj::TPRI => emitvalue(lcx, &mut loop_.head, expr),
-        _ => emititer(lcx, loop_, expr)
-    }
-}
-
-fn emitvgetcheck(lcx: &mut Lcx, ctr: &mut InsId, vget: &VGET, fail: InsId) {
-    let bump = Access::borrow(&lcx.data.bump);
+fn visitcallx(lcx: &mut Lcx, expr: ObjRef<CALLX>, visit: Visit) {
     let objs = Access::borrow(&lcx.objs);
-    let var = vardata(&lcx.data.objs, vget.var);
-    let tab = bump[var].tab;
-    let target = &bump[tab];
-    let sdim = bump[lcx.data.tab].axes.len();
-    let tdim = target.axes.len();
-    let prefix = prefixlen(sdim, tdim, vget.dim as _);
-    let mut flat = idxtransfer(lcx, lcx.data.tab, tab, sdim, prefix, INS_FLATIDX);
-    let call = emittabcall(&lcx.data.func, target.func);
-    let base = lcx.tmp.end();
-    pushflatidx(objs, sdim, tdim, vget.dim as _, &vget.idx, lcx.tmp.align_for());
-    let mut i: BumpRef<IdxExpr> = base.cast_up();
-    let end: BumpRef<IdxExpr> = lcx.tmp.end().cast();
-    let mut loop_: Option<(
-        /*current inner loop:*/ LoopState,
-        /*inner loop body start:*/ InsId,
-        /*inner loop tail start:*/ InsId,
-        /*outer loop head start:*/ InsId,
-        /*outer loop out:*/ InsId
-    )> = None;
-    while i < end {
-        flat = match lcx.tmp[i] {
-            IdxExpr { expr, axis, span, .. } if isscalarann(objs, expr.erase()) => {
-                let j = emitvalue(lcx, ctr, expr);
-                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, flat);
-                lcx.data.func.code.push(Ins::ADD(IRT_IDX, baseflat, j))
-            },
-            IdxExpr { expr, axis, span, .. } => {
-                let (newloop, outermost) = match &mut loop_ {
-                    Some((state, body, tail, _, _)) => {
-                        lcx.data.func.code.set(state.head, Ins::GOTO(*body));
-                        lcx.data.func.code.set(state.tail, Ins::GOTO(*body));
-                        state.head = state.body;
-                        state.out = *tail;
-                        [state.body, state.tail] = areserve(&lcx.data.func);
-                        *body = state.body;
-                        *tail = state.tail;
-                        (state, false)
-                    },
-                    None => {
-                        let [head, tail, body, out] = areserve(&lcx.data.func);
-                        (&mut loop_.insert((LoopState { head, tail, body, out }, body, tail, head, out)).0,
-                            true)
-                    }
-                };
-                match expr.is_nil() {
-                    true => emitsplatloop(lcx, newloop, target, flat, call, axis as _,
-                        (axis+span) as _),
-                    false => {
-                        let j = match outermost {
-                            true => emititer(lcx, newloop, expr),
-                            false => {
-                                let value = emitvalue(lcx, ctr, expr);
-                                emittensorloop(lcx, newloop, &objs[objs[expr].ann.cast()], value)
-                            }
-                        };
-                        let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, flat);
-                        lcx.data.func.code.push(Ins::ADD(IRT_IDX, baseflat, j))
-                    }
-                }
+    let &CALLX { ann, lang, ref inputs, .. } = &objs[expr];
+    let is_materialize = visit.is_materialize();
+    match visit {
+        Visit::Materialize(slot) | Visit::Shape(slot) => {
+            let base = lcx.data.tmp_ins.len();
+            for &input in inputs {
+                let value = emitexprv(lcx, input, &mut slot.ctr);
+                lcx.data.tmp_ins.push(value);
             }
-        };
-        i = i.offset(1);
-    }
-    let inline = isdisjointidx(&bump[lcx.data.tab], &bump[bump[var].tab], &vget.idx);
-    match loop_ {
-        Some((mut state, body, tail, outer_head, outer_out)) => {
-            emitvarcheck(lcx, &mut state.body, var, flat, inline, fail);
-            lcx.data.func.code.set(state.head, Ins::GOTO(body));
-            lcx.data.func.code.set(state.tail, Ins::GOTO(body));
-            lcx.data.func.code.set(state.body, Ins::GOTO(tail));
-            lcx.data.func.code.set(replace(ctr, outer_out), Ins::GOTO(outer_head));
+            let lang = Lang::from_u8(lang);
+            let mut value = {
+                // safety: this casts (ignoring newtype wrappers):
+                //   &mut Ccx<Lower> -> &mut Ccx<UnsafeCell<Lower>>
+                let lcx: &mut CLcx = unsafe { core::mem::transmute(&mut *lcx) };
+                let lower = Access::borrow(&lcx.data);
+                lang.lower(lcx, slot.ctr, expr, &lower.func, &lower.tmp_ins[base..])
+            };
+            lcx.data.tmp_ins.truncate(base);
+            if !is_materialize {
+                value = extractshape(objs, value, &objs[ann.cast()]);
+            }
+            slot.value = value;
         },
-        None => emitvarcheck(lcx, ctr, var, flat, inline, fail)
-    }
-}
-
-fn emitcheck(lcx: &mut Lcx, ctr: &mut InsId, expr: ObjRef, fail: InsId) {
-    let objs = Access::borrow(&lcx.objs);
-    let raw = objs.get_raw(expr.erase());
-    for i in objs[expr.erase()].ref_params() {
-        // only recurse into exprs, other objects are in their own chunks.
-        let o: ObjRef = zerocopy::transmute!(raw[i+1]);
-        if Operator::is_expr_raw(objs[o].op) {
-            emitcheck(lcx, ctr, o, fail);
-        }
-    }
-    if let ObjectRef::VGET(vget) = objs.get(expr.erase()) {
-        emitvgetcheck(lcx, ctr, vget, fail);
+        _ => unreachable!()
     }
 }
 
@@ -2536,7 +2635,7 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
         if size.is_nil() {
             nils += 1;
         } else {
-            emitcheck(lcx, &mut ctr, size.erase(), fail);
+            emitexprc(lcx, size, &mut ctr, fail);
         }
     }
     let mut nils = reserve(&lcx.data.func, nils);
@@ -2551,10 +2650,10 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
                         nils += 1;
                         n
                     },
-                    false => emitvalue(lcx, &mut ctr, size)
+                    false => emitexprv(lcx, size, &mut ctr)
                 };
                 let [next] = areserve(&lcx.data.func);
-                swapctr(&lcx.data.func, &mut ctr, Ins::JMP(n, next, ret), next);
+                lcx.data.func.code.set(replace(&mut ctr, next), Ins::JMP(n, next, ret));
                 len = Some(match len.unpack() {
                     Some(len) => lcx.data.func.code.push(Ins::MUL(IRT_IDX, len, n)),
                     None      => n
@@ -2584,74 +2683,77 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
                 debug_assert!(xlen != InsId::INVALID.into()); // first axis cannot be vector.
                 let dim = lcx.objs[lcx.objs[size].ann.cast::<TTEN>()].dim as usize;
                 if dim != i { /* not first axis */ todo!() }
-                let shape = emitshape(lcx, &mut ctr, size);
-                for j in 0..dim as isize {
-                    lcx.data.func.code.set((nils - dim as isize) + j, Ins::MOV(IRT_IDX, shape + j));
-                }
                 let idxsize = lcx.data.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
                 // emit F loop
                 let (f, n) = {
+                    let mut loop_ = newloop(&lcx.data.func);
+                    let (element, shape) = emitexpris(lcx, size, &mut loop_, &mut ctr);
+                    for j in 0..dim as isize {
+                        lcx.data.func.code.set((nils-dim as isize)+j, Ins::MOV(IRT_IDX, shape+j));
+                    }
                     let one = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
                     let flen = lcx.data.func.code.push(Ins::ADD(IRT_IDX, xlen, one));
                     let fbytes = lcx.data.func.code.push(Ins::MUL(IRT_IDX, flen, idxsize));
                     let alloc = lcx.data.func.code.push(Ins::ALLOC(fbytes, idxsize, ctr));
-                    let init = lcx.data.func.code.push(Ins::STORE(alloc, zero));
-                    lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0)); // cursor init, must be here
-                    let mut reduce = newreducety(&lcx.data.func, [Type::FX, IRT_IDX], init);
-                    let p_phi = lcx.data.func.phis.push(Phi::new(Type::PTR));
-                    let [head] = areserve(&lcx.data.func);
-                    lcx.data.func.code.set(reduce.loop_.head, Ins::JMP(alloc, head, p_phi));
-                    reduce.loop_.head = head;
-                    let v = emititer(lcx, &mut reduce.loop_, size);
-                    let ptr = lcx.data.func.code.push(Ins::PHI(Type::PTR, reduce.loop_.body, p_phi));
-                    let [next_store, next_cursor] = areserve(&lcx.data.func);
-                    lcx.data.func.code.set(next_cursor, Ins::ADD(IRT_IDX, reduce.value+1, v));
-                    let next_ptr = lcx.data.func.code.push(Ins::ADDP(ptr, idxsize));
-                    let store = lcx.data.func.code.push(Ins::STORE(next_ptr, next_cursor));
-                    lcx.data.func.code.set(next_store, Ins::MOVF(Type::FX, reduce.value, store));
-                    let [tail] = areserve(&lcx.data.func);
-                    lcx.data.func.code.set(reduce.loop_.tail, Ins::JMP(next_ptr, tail, p_phi));
-                    reduce.loop_.tail = tail;
-                    let effect = closereduce(&lcx.data.func, &reduce, next_store);
-                    swapctr(&lcx.data.func, &mut ctr, reduce.start, reduce.loop_.out);
-                    let f = lcx.data.func.code.push(Ins::MOVF(Type::PTR, alloc, effect));
-                    (f, effect+1)
+                    let alloc1 = lcx.data.func.code.push(Ins::ADDP(alloc, idxsize));
+                    let [cursor_accumulator, cursor_result] = areserve(&lcx.data.func);
+                    let cursor_init = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+                    let cursor_next = lcx.data.func.code.push(
+                        Ins::ADD(IRT_IDX, cursor_accumulator, element));
+                    emitreduce(&lcx.data.func, &mut loop_, IRT_IDX, cursor_init, cursor_next,
+                        cursor_accumulator, cursor_result);
+                    let store_result = emitloopstore(&lcx.data.func, &mut loop_, cursor_next,
+                        idxsize, alloc1, 1);
+                    let store_first = lcx.data.func.code.push(Ins::STORE(alloc, zero));
+                    let store_result = lcx.data.func.code.push(Ins::MOVF(Type::FX, store_result,
+                            store_first));
+                    let buf_result = lcx.data.func.code.push(Ins::MOVF(Type::PTR, alloc, store_result));
+                    ctrcloseloop(&lcx.data.func, loop_, &mut ctr);
+                    (buf_result, cursor_result)
                 };
                 // emit B loop
                 let b = {
+                    let mut outerloop = newloop(&lcx.data.func);
+                    let mut innerloop = newloop(&lcx.data.func);
                     // skip first element of f (zero)
                     let f = lcx.data.func.code.push(Ins::ADDP(f, idxsize));
                     let bbytes = lcx.data.func.code.push(Ins::MUL(IRT_IDX, n, idxsize));
                     let alloc = lcx.data.func.code.push(Ins::ALLOC(bbytes, idxsize, ctr));
-                    // alloc must become a phi here to prevent the scheduler from sinking it inside
-                    // the loop (TODO: actually this is true for the above loop, too)
-                    let mut reduce = newreducety(&lcx.data.func, [Type::PTR], alloc);
                     let start_phi = lcx.data.func.phis.push(Phi::new(IRT_IDX));
-                    let [head] = areserve(&lcx.data.func);
-                    lcx.data.func.code.set(reduce.loop_.head, Ins::JMP(zero, head, start_phi));
-                    reduce.loop_.head = head;
-                    let i = emitrangeloop(&lcx.data.func, &mut reduce.loop_, IRT_IDX, zero, xlen);
+                    emitloopinit(&lcx.data.func, &mut outerloop, start_phi, zero);
+                    let i = emitrangeloop(&lcx.data.func, &mut outerloop, IRT_IDX, zero, xlen);
                     let fi = emitarrayptr(&lcx.data.func, f, i, IRT_IDX);
                     let end = lcx.data.func.code.push(Ins::LOAD(IRT_IDX, fi));
                     let start = lcx.data.func.code.push(
-                        Ins::PHI(IRT_IDX, reduce.loop_.body, start_phi));
-                    let mut inner = newreducety(&lcx.data.func, [Type::PTR], reduce.value);
-                    let j = emitrangeloop(&lcx.data.func, &mut inner.loop_, IRT_IDX, start, end);
-                    let bj = emitarrayptr(&lcx.data.func, inner.value, j, IRT_IDX);
-                    let store = lcx.data.func.code.push(Ins::STORE(bj, i));
-                    let next = lcx.data.func.code.push(Ins::MOVF(Type::PTR, inner.value, store));
-                    let ptr = closereduce(&lcx.data.func, &inner, next);
-                    swapctr(&lcx.data.func, &mut reduce.loop_.body, inner.start, inner.loop_.out);
-                    let [tail] = areserve(&lcx.data.func);
-                    lcx.data.func.code.set(reduce.loop_.tail, Ins::JMP(end, tail, start_phi));
-                    reduce.loop_.tail = tail;
-                    let result = closereduce(&lcx.data.func, &reduce, ptr);
-                    swapctr(&lcx.data.func, &mut ctr, reduce.start, reduce.loop_.out);
-                    result
+                        Ins::PHI(IRT_IDX, outerloop.body_entry, start_phi));
+                    let j = emitrangeloop(&lcx.data.func, &mut innerloop, IRT_IDX, start, end);
+                    let bj = emitarrayptr(&lcx.data.func, alloc, j, IRT_IDX);
+                    let inner_store = lcx.data.func.code.push(Ins::STORE(bj, i));
+                    let [
+                        inner_store_accumulator,
+                        inner_store_result,
+                        outer_store_accumulator,
+                        outer_store_result,
+                        outer_tail
+                    ] = areserve(&lcx.data.func);
+                    let store_init = lcx.data.func.code.push(Ins::NOP(Type::FX));
+                    let inner_store_next = lcx.data.func.code.push(
+                        Ins::MOVF(Type::FX, inner_store, inner_store_accumulator));
+                    emitreduce(&lcx.data.func, &mut innerloop, Type::FX, store_init, inner_store_next,
+                        inner_store_accumulator, inner_store_result);
+                    ctrcloseloop(&lcx.data.func, innerloop, &mut outerloop.body);
+                    lcx.data.func.code.set(replace(&mut outerloop.tail, outer_tail),
+                        Ins::JMP(end, outer_tail, start_phi));
+                    let outer_store_next = lcx.data.func.code.push(
+                        Ins::MOVF(Type::FX, outer_store_accumulator, inner_store_result));
+                    emitreduce(&lcx.data.func, &mut outerloop, Type::FX, store_init,
+                        outer_store_next, outer_store_accumulator, outer_store_result);
+                    ctrcloseloop(&lcx.data.func, outerloop, &mut ctr);
+                    lcx.data.func.code.push(Ins::MOVF(Type::PTR, alloc, outer_store_result))
                 };
                 let [next] = areserve(&lcx.data.func);
                 let jump = lcx.data.func.code.push(Ins::JMP(f, next, ret));
-                swapctr(&lcx.data.func, &mut ctr, Ins::JMP(b, jump, ret+1), next);
+                lcx.data.func.code.set(replace(&mut ctr, next), Ins::JMP(b, jump, ret+1));
                 len = Some(n).into();
             }
         };
@@ -2681,18 +2783,19 @@ fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
     let mut ctr = INS_ENTRY;
     let ret = lcx.data.func.code.push(Ins::RET());
     let bump = Access::borrow(&lcx.data.bump);
+    let objs = Access::borrow(&lcx.objs);
     for (i, &setter) in bump[var].value.iter().enumerate() {
         let vset = &bump[setter];
         let model = &bump[vset.model];
-        let next = reserve(&lcx.data.func, 1);
+        let [next] = areserve(&lcx.data.func);
         match vset.vst {
             VSet::SIMPLE => {
-                if !model.guard.is_nil() {
-                    emitcheck(lcx, &mut ctr, model.guard.erase(), next);
-                    let cond = emitvalue(lcx, &mut ctr, model.guard);
+                let mobj = &objs[model.obj];
+                if !mobj.guard.is_nil() {
+                    let cond = emitexprcv(lcx, mobj.guard, &mut ctr, next);
                     emitjumpifnot(&lcx.data.func, &mut ctr, cond, next);
                 }
-                emitcheck(lcx, &mut ctr, lcx.objs[vset.obj].value.erase(), next);
+                emitexprc(lcx, mobj.value, &mut ctr, next);
             },
             VSet::PREFIX => {
                 let var = &bump[vset.var];
@@ -2719,6 +2822,7 @@ fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
 fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
     let mut ctr = INS_ENTRY;
     let bump = Access::borrow(&lcx.data.bump);
+    let objs = Access::borrow(&lcx.objs);
     let var = &bump[var];
     lcx.data.tmp_vty.clear();
     pushdeco__old(&lcx.objs, var.obj.erase(), &mut lcx.data.tmp_vty);
@@ -2735,15 +2839,14 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
         lcx.data.func.code.set(ctr, Ins::IF(check, tru, fal));
         ctr = tru;
         let vset = &bump[setter];
+        let model = &bump[vset.model];
         let value = match vset.vst {
-            VSet::SIMPLE => emitvalue(lcx, &mut ctr, lcx.objs[vset.obj].value),
+            VSet::SIMPLE => emitexprv(lcx, objs[model.obj].value, &mut ctr),
             VSet::PREFIX => {
-                let model = &bump[vset.model];
                 let modeldim = bump[model.tab].n as usize;
-                let idx = idxtransfer(lcx, var.tab, model.tab, vardim, modeldim,
-                    INS_FLATIDX);
+                let idx = idxtransfer(lcx, var.tab, model.tab, vardim, modeldim, INS_FLATIDX);
                 let call = emitcallvm1(&lcx.data, idx, model.base + Mod::SUB_VALUE);
-                if lcx.objs[lcx.objs[vset.obj].value].ann == lcx.objs[var.obj].ann {
+                if vsettype(objs, model.obj, vset.idx as _) == lcx.objs[var.obj].ann {
                     // model returns scalar of var type -> we just forward the value
                     debug_assert!(modeldim == vardim);
                     lcx.data.func.code.extend(
@@ -2785,43 +2888,6 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
     lcx.data.func.code.set(ctr, Ins::UB());
 }
 
-fn emitvarload(lcx: &mut Lcx, var: BumpRef<Var>, idx: InsId, inline: bool) -> InsId {
-    let lower = &mut *lcx.data;
-    let Var { base, obj, .. } = lower.bump[var];
-    let call = emitcallvm(lower, idx, base + Var::SUB_VALUE, inline);
-    lower.func.code.extend(
-        decomposition__old(&lcx.objs, obj.erase(), &mut lower.tmp_ty)
-        .iter()
-        .enumerate()
-        .map(|(i,&ty)| Ins::RES(ty, call, i.into()))
-    )
-}
-
-fn emitvarloadshape(lcx: &mut Lcx, var: BumpRef<Var>, idx: InsId, inline: bool) -> InsId {
-    let Var { base, obj, .. } = lcx.data.bump[var];
-    debug_assert!(lcx.objs[lcx.objs[obj].ann].op == Obj::TTEN);
-    let call = emitcallvm(&lcx.data, idx, base + Var::SUB_VALUE, inline);
-    let TTEN { dim, elem, ..} = lcx.objs[lcx.objs[obj].ann.cast()];
-    let esz = decomposition_size(&lcx.objs, elem);
-    lcx.data.func.code.extend((esz..esz+dim as usize).map(|i| Ins::RES(IRT_IDX, call, i.into())))
-}
-
-fn emitvarcheck(
-    lcx: &mut Lcx,
-    ctr: &mut InsId,
-    var: BumpRef<Var>,
-    idx: InsId,
-    inline: bool,
-    fail: InsId
-) {
-    let base = lcx.data.bump[var].base;
-    let call = emitcallvm(&lcx.data, idx, base + Var::SUB_ARM, inline);
-    let arm = lcx.data.func.code.push(Ins::RES(IRT_ARM, call, 0.into()));
-    let none = lcx.data.func.code.push(Ins::KINT(IRT_ARM, !0));
-    let check = lcx.data.func.code.push(Ins::NE(arm, none));
-    emitjumpifnot(&lcx.data.func, ctr, check, fail);
-}
-
 /* ---- Models -------------------------------------------------------------- */
 
 // only non-simple models are handled here.
@@ -2829,18 +2895,20 @@ fn emitvarcheck(
 
 fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
     let mut ctr = INS_ENTRY;
-    let bump = Access::borrow(&lcx.data.bump);
-    let model = &bump[model];
+    let objs = Access::borrow(&lcx.objs);
+    let mobj = &objs[lcx.data.bump[model].obj];
     let ret = lcx.data.func.code.push(Ins::RET());
     let kfal = lcx.data.func.code.push(Ins::KINT(Type::B1, 0));
     let jfal = lcx.data.func.code.push(Ins::JMP(kfal, ret, 0.into()));
-    if !model.guard.is_nil() {
-        emitcheck(lcx, &mut ctr, model.guard.erase(), jfal);
-        let cond = emitvalue(lcx, &mut ctr, model.guard);
+    if !mobj.guard.is_nil() {
+        let cond = emitexprcv(lcx, mobj.guard, &mut ctr, jfal);
         emitjumpifnot(&lcx.data.func, &mut ctr, cond, jfal);
     }
-    for setter in &model.value {
-        emitcheck(lcx, &mut ctr, setter.obj.erase(), jfal);
+    emitexprc(lcx, mobj.value, &mut ctr, jfal);
+    for &setter in &mobj.outputs {
+        for &e in &objs[setter].idx {
+            emitexprc(lcx, e, &mut ctr, jfal);
+        }
     }
     let ktru = lcx.data.func.code.push(Ins::KINT(Type::B1, 1));
     lcx.data.func.code.set(ctr, Ins::JMP(ktru, ret, 0.into()));
@@ -2848,18 +2916,15 @@ fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
 
 fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
     let mut ctr = INS_ENTRY;
-    let bump = Access::borrow(&lcx.data.bump);
-    let model = &bump[model];
-    for vset in &model.value {
-        let value = lcx.objs[vset.obj].value;
-        // TODO: optimization: for full table VSET (ie. empty idx) return only the pointer,
-        // and on use load the shape from the tab instead
-        let v = emitvalue(lcx, &mut ctr, value);
-        for i in 0..decomposition_size(&lcx.objs, value.erase()) {
-            let next = reserve(&lcx.data.func, 1);
-            lcx.data.func.code.set(ctr, Ins::JMP(v + i as isize, next, vset.ret + i as isize));
-            ctr = next;
-        }
+    let objs = Access::borrow(&lcx.objs);
+    let mobj = &objs[lcx.data.bump[model].obj];
+    // TODO: optimization: for full table VSET (ie. empty idx) return only the pointer,
+    // and on use load the shape from the tab instead
+    let value = emitexprv(lcx, mobj.value, &mut ctr);
+    for i in 0..decomposition_size(objs, mobj.value.erase()) {
+        let [next] = areserve(&lcx.data.func);
+        lcx.data.func.code.set(ctr, Ins::JMP(value + i as isize, next, i.into()));
+        ctr = next;
     }
     lcx.data.func.code.set(ctr, Ins::RET());
 }
@@ -2872,10 +2937,7 @@ fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
     let objs = Access::borrow(&lcx.objs);
     let fail = lcx.data.func.code.push(Ins::ABORT());
     for &value in &objs[query].value {
-        emitcheck(lcx, &mut ctr, value.erase(), fail);
-    }
-    for &value in &objs[query].value {
-        let mut v = emitvalue(lcx, &mut ctr, value);
+        let mut v = emitexprcv(lcx, value, &mut ctr, fail);
         for _ in 0..decomposition_size(&lcx.objs, value.erase()) {
             let next = reserve(&lcx.data.func, 1);
             lcx.data.func.code.set(ctr, Ins::JMP(v, next, ret.into()));
@@ -2902,7 +2964,6 @@ enum Template {
 fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) {
     swap(&mut *lcx.data.func, &mut lcx.ir.funcs[id]);
     debug_assert!(lcx.data.func.code.is_empty());
-    lcx.data.expr.clear();
     // start:
     lcx.data.func.entry = INS_ENTRY;
     reserve(&lcx.data.func, 1);
@@ -3043,7 +3104,7 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
                         let base = match model.mt {
                             Mod::SIMPLE => {
                                 // simple model: reset the variable
-                                ccx.data.bump[model.value[0].var].base
+                                ccx.data.bump[model.outputs[0].var].base
                             },
                             _ /* COMPLEX */ => {
                                 // complex model: reset the model
@@ -3106,25 +3167,26 @@ impl Stage for Lower {
         Ok(Lower {
             bump: Default::default(),
             objs: Default::default(),
-            expr: Default::default(),
+            locals: Default::default(),
             tmp_ins: Default::default(),
             tmp_vty: Default::default(),
             tmp_ty: Default::default(),
             func: Access::new(Func::new(FuncKind::User(),
                 DebugSource::new(ObjRef::NIL, EnumSet::empty()))),
-            tab: BumpRef::zero()
+            tab: BumpRef::zero(),
+            check: None.into()
         })
     }
 
     fn run(ccx: &mut Ccx<Lower>) -> compile::Result {
         collectobjs(ccx);
         emitobjs(unsafe { core::mem::transmute(&mut *ccx) });
-        ccx.freeze_graph(computereset);
         if trace!(LOWER) {
             let mut tmp = Default::default();
             dump_ir(&mut tmp, &ccx.ir, &ccx.intern, &ccx.objs);
             trace!("{}", core::str::from_utf8(tmp.as_slice()).unwrap());
         }
+        ccx.freeze_graph(computereset);
         Ok(())
     }
 

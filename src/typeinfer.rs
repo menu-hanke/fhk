@@ -4,6 +4,7 @@ use core::cmp::min;
 use core::fmt::Debug;
 use core::hash::Hasher;
 use core::iter::zip;
+use core::mem::replace;
 
 use alloc::collections::vec_deque::VecDeque;
 use enumset::{enum_set, EnumSet};
@@ -14,7 +15,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::trace_objs;
 use crate::hash::HashMap;
 use crate::index::{index, IndexSlice, IndexVec};
-use crate::obj::{obj_index_of, BinOp, Intrinsic, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, LEN, LOAD, MOD, NEW, QUERY, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, LEN, LET, LGET, LOAD, MOD, NEW, QUERY, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, PRI_IDX};
@@ -104,9 +105,9 @@ enum Constraint {
 
 pub struct TypeInfer {
     sub: IndexVec<TypeVar, Type>,
+    locals: IndexVec<LocalId, TypeVar>,
     con: VecDeque<Constraint>,
     tobj: HashTable<ObjRef>,
-    ann: HashMap<ObjRef, Type>,
     tab: ObjRef<TAB>,
     dim: (TypeVar, u8)
 }
@@ -164,40 +165,6 @@ fn newpairlist(sub: &mut IndexVec<TypeVar, Type>, fields: &[Type]) -> Type {
     for &f in fields.iter().rev() {
         ty = newpairtype(sub, f, ty);
     }
-    ty
-}
-
-fn shapetype(tcx: &mut Tcx, idx: &[ObjRef<EXPR>]) -> Type {
-    let base = tcx.tmp.end();
-    let fields = tcx.tmp.align_for::<Type>();
-    let mut nils = 0;
-    for &i in idx {
-        let ety = if i.is_nil() {
-            nils += 1;
-            Type::UNIT
-        } else if nils > 0 {
-            // TODO: more generally, this should allow the dimension to have any nesting
-            // and only constrain the sum of dimensions.
-            // eg. consider
-            //   table A[global.N]
-            //   table B[:,A.N]
-            //   table C[:,:,B.N]
-            // here
-            //   A has 1 scalar axis
-            //   B has 1 scalar axis and 1 vector axis
-            //   C has 1 scalar axis (of size global.N) and 2 vector axes (of sizes A.N and B.N)
-            // ie. nested vector axes "spill" into the preceding `:`s
-            let dim = createdimtype(&mut tcx.data, nils);
-            nils = 0;
-            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Type::pri(PRI_IDX), dim])
-        } else {
-            Type::pri(PRI_IDX)
-        };
-        fields.push(ety);
-    }
-    debug_assert!(nils == 0);
-    let ty = newpairlist(&mut tcx.data.sub, &fields[base.cast_up()..]);
-    tcx.tmp.truncate(base);
     ty
 }
 
@@ -478,17 +445,6 @@ fn createtypeobj(objs: &mut Objects, ty: TypeRepr, work: &[u32]) -> ObjRef {
     }
 }
 
-fn isconcretetype(tvar: &IndexSlice<TypeVar, Type>, ty: Type) -> bool {
-    use TypeRepr::*;
-    match ty.unpack() {
-        Var(j) if ty == Type::var(j) => false,
-        Var(j) => isconcretetype(tvar, tvar[j]),
-        Con(c, base) => (0..Constructor::from_u8(c).arity() as isize)
-            .all(|i| isconcretetype(tvar, tvar[base+i])),
-        Pri(p) => p.len() <= 1,
-    }
-}
-
 fn createdimtype(ts: &mut TypeInfer, dim: u8) -> Type {
     let (mut tv, mut d) = ts.dim;
     while dim < d {
@@ -504,151 +460,6 @@ fn createdimtype(ts: &mut TypeInfer, dim: u8) -> Type {
     ts.sub[tv]
 }
 
-fn createtype(tcx: &mut Tcx, idx: ObjRef) -> Type {
-    if let Some(&ty) = tcx.data.ann.get(&idx) {
-        return ty;
-    }
-    let objs = Access::borrow(&tcx.objs);
-    let o = objs.get(idx);
-    let ty = match o {
-        ObjectRef::TVAR(_) => Type::var(newtypevar(&mut tcx.data.sub)),
-        ObjectRef::TPRI(&TPRI { ty, .. }) => Type::pri(EnumSet::from_u16_truncated(1 << ty)),
-        ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
-            let e = match elem.is_nil() {
-                true  => Type::var(newtypevar(&mut tcx.data.sub)),
-                false => createtype(tcx, elem)
-            };
-            let d = createdimtype(&mut tcx.data, dim);
-            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[e, d])
-        },
-        ObjectRef::TTUP(&TTUP { ref elems, .. }) => {
-            let mut ty = Type::UNIT;
-            for &e in elems.iter().rev() {
-                let ety = createtype(tcx, e);
-                ty = newpairtype(&mut tcx.data.sub, ety, ty);
-            }
-            ty
-        },
-        _ => unreachable!()
-    };
-    if isconcretetype(&tcx.data.sub, ty) {
-        let hash = hashtypeobj(o);
-        if let hash_table::Entry::Vacant(e) = tcx.data.tobj.entry(
-            hash,
-            |&t| objs.equal(t, idx),
-            |&t| hashtypeobj(objs.get(t))
-        ) {
-            e.insert(idx);
-        }
-    }
-    tcx.data.ann.insert_unique_unchecked(idx, ty);
-    ty
-}
-
-fn sametype(a: ObjectRef, b: TypeRepr, work: &[u32]) -> bool {
-    match (a, b) {
-        (ObjectRef::TPRI(&TPRI { ty, .. }), TypeRepr::Pri(p)) => p.as_u16_truncated() == 1 << ty,
-        (ObjectRef::TTEN(&TTEN { elem, dim, .. }), TypeRepr::Con(Constructor::TENSOR, _))
-            => work == &[zerocopy::transmute!(elem), dim as _],
-        (ObjectRef::TTUP(TTUP { elems, .. }), TypeRepr::Con(Constructor::PAIR|Constructor::UNIT, _))
-            => work.len() == elems.len()
-            && zip(work.iter(), elems.iter()).all(|(&ea,&eb)| ea == zerocopy::transmute!(eb)),
-        _ => false
-    }
-}
-
-fn typeobj(ccx: &mut Ccx<TypeInfer>, ty: Type) -> ObjRef {
-    match ty.unpack() {
-        TypeRepr::Var(tv) => return typeobj(ccx, ccx.data.sub[tv]),
-        type_ => {
-            let base = ccx.tmp.end();
-            let hash = hashtype(ccx, type_);
-            let tx = &mut *ccx.data;
-            let args: &[u32] = &ccx.tmp[base.cast_up()..];
-            let o = match tx.tobj.entry(
-                hash,
-                |&t| sametype(ccx.objs.get(t), type_, args),
-                |&t| hashtypeobj(ccx.objs.get(t))
-            ) {
-                hash_table::Entry::Vacant(e)
-                    => *e.insert(createtypeobj(&mut ccx.objs, type_, args)).get(),
-                hash_table::Entry::Occupied(e) => *e.get()
-            };
-            ccx.tmp.truncate(base);
-            o
-        }
-    }
-}
-
-// must match hashtypeobj
-// stores type params in ccx.tmp
-fn hashtype(ccx: &mut Ccx<TypeInfer>, ty: TypeRepr) -> u64 {
-    use TypeRepr::*;
-    let mut hash = FxHasher::default();
-    match ty {
-        Pri(p) => hash.write_u16(p.as_u16_truncated()),
-        Con(Constructor::TENSOR, base) => {
-            let elem = typeobj(ccx, Type::var(base));
-            let dim = dimension(&ccx.data.sub, Type::var(base+1)).unwrap();
-            debug_assert!(dim > 0);
-            hash.write_u32(zerocopy::transmute!(elem));
-            hash.write_u8(dim);
-            ccx.tmp.push(elem);
-            ccx.tmp.push(dim as u32);
-        },
-        Con(Constructor::PAIR, mut t) => {
-            loop {
-                let e = typeobj(ccx, Type::var(t));
-                hash.write_u32(zerocopy::transmute!(e));
-                ccx.tmp.push(e);
-                let TypeRepr::Con(c, tt) = ccx.data.sub[t+1].unpack() else { unreachable!() };
-                if c == Constructor::UNIT { break }
-                t = tt;
-            }
-        },
-        Con(Constructor::UNIT, _) => { /* NOP */ },
-        _ => unreachable!()
-    }
-    hash.finish()
-}
-
-// must match hashtype
-fn hashtypeobj(o: ObjectRef) -> u64 {
-    let mut hash = FxHasher::default();
-    match o {
-        ObjectRef::TPRI(&TPRI { ty, .. }) => hash.write_u16(1 << ty),
-        ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
-            hash.write_u32(zerocopy::transmute!(elem));
-            hash.write_u8(dim);
-        },
-        ObjectRef::TTUP(TTUP { elems, ..  }) => {
-            for &e in elems {
-                hash.write_u32(zerocopy::transmute!(e));
-            }
-        },
-        _ => unreachable!()
-    }
-    hash.finish()
-}
-
-fn vartype(tcx: &mut Tcx, var: ObjRef<VAR>) -> TypeVar {
-    let ts = &mut *tcx.data;
-    let tv = match ts.ann.entry(var.erase()) {
-        hash_map::Entry::Occupied(e) => return zerocopy::transmute!(*e.get()),
-        hash_map::Entry::Vacant(e) => {
-            let tv = newtypevar(&mut ts.sub);
-            e.insert(Type::var(tv));
-            tv
-        }
-    };
-    let ann = tcx.objs[var].ann;
-    if !ann.is_nil() {
-        let ty = createtype(tcx, ann);
-        unifyvar(&mut tcx.data.sub, tv, ty);
-    }
-    tv
-}
-
 fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: usize) -> Type {
     let objs = Access::borrow(&tcx.objs);
     let axes = &objs[objs[objs[var].tab].shape].fields;
@@ -659,7 +470,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
     }
     let prefix = min(objs.dim(tcx.data.tab), need-have);
     have += prefix;
-    let mut ty = Type::var(vartype(tcx, var));
+    let mut ty = Type::var(zerocopy::transmute!(objs[var].ann));
     let mut dim = 0;
     if have < need {
         for i in (have..need).rev() {
@@ -676,7 +487,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
         // special case: exact dimension known
         dim += idx.len();
         for &e in idx {
-            exprtype(tcx, e);
+            visitexpr(tcx, e);
         }
         if dim > 0 {
             let d = createdimtype(&mut tcx.data, dim as _);
@@ -708,7 +519,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
                 Obj::FLAT => {
                     // dimension can't go to zero here because this behaves like a 1D tensor index,
                     // so we don't need a constraint.
-                    exprtype(tcx, e);
+                    visitexpr(tcx, e);
                     let m = objs[e.cast::<FLAT>()].idx.len();
                     if m > 1 {
                         let (_, dim) = unpacktensor(&mut tcx.data.sub, v);
@@ -720,7 +531,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
                     }
                 },
                 _ => {
-                    let ety = exprtype(tcx, e);
+                    let ety = visitexpr(tcx, e);
                     let (elem, edim) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
                     unifyvar(&mut tcx.data.sub, elem, Type::pri(PRI_IDX));
                     let vnext = newtypevar(&mut tcx.data.sub);
@@ -785,7 +596,7 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Type
     use Intrinsic::*;
     let base = tcx.tmp.end();
     for &a in args {
-        let ety = exprtype(tcx, a);
+        let ety = visitexpr(tcx, a);
         tcx.tmp.push(ety);
     }
     let aty: &[TypeVar] = &tcx.tmp[base.cast_up()..];
@@ -805,15 +616,20 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Type
     ty
 }
 
-fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
+fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
     let objs = Access::borrow(&tcx.objs);
-    match objs.get(idx.erase()) {
+    let tv: TypeVar = zerocopy::transmute!(objs[idx].ann);
+    if idx.is_builtin() {
+        // skip for KINT logic for TRUE and FALSE
+        return tv;
+    }
+    let ty = match objs.get(idx.erase()) {
         ObjectRef::SPEC(_) => Some(Type::UNIT),
-        ObjectRef::SPLAT(&SPLAT { value, .. }) => Some(Type::var(exprtype(tcx, value))),
+        ObjectRef::SPLAT(&SPLAT { value, .. }) => Some(Type::var(visitexpr(tcx, value))),
         ObjectRef::FLAT(FLAT { idx, .. }) => {
             for &i in idx {
                 if objs[i].op != Obj::SPEC {
-                    let ety = exprtype(tcx, i);
+                    let ety = visitexpr(tcx, i);
                     let (e, _) = unpacktensor(&mut tcx.data.sub, Type::var(ety));
                     unifyvar(&mut tcx.data.sub, e, Type::pri(PRI_IDX));
                 }
@@ -827,24 +643,32 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::DIM(_) => Some(Type::pri(PRI_IDX)),
         ObjectRef::LEN(&LEN { value, .. }) => {
             // TODO: make sure here that it has at least as many dimensions as our axis.
-            let _ety = exprtype(tcx, value);
+            let _ety = visitexpr(tcx, value);
             Some(Type::pri(PRI_IDX))
         },
         ObjectRef::TUPLE(TUPLE { fields, .. }) => {
             let mut ty = Type::UNIT;
             for &e in fields.iter().rev() {
-                let ety = exprtype(tcx, e);
+                let ety = visitexpr(tcx, e);
                 ty = newpairtype(&mut tcx.data.sub, Type::var(ety), ty);
             }
             Some(ty)
         },
+        ObjectRef::LET(&LET { value, expr, .. }) => {
+            let vty = visitexpr(tcx, value);
+            tcx.data.locals.push(vty);
+            let ety = visitexpr(tcx, expr);
+            tcx.data.locals.raw.pop();
+            Some(Type::var(ety))
+        },
+        ObjectRef::LGET(&LGET { slot, .. }) => Some(Type::var(tcx.data.locals[slot])),
         ObjectRef::VGET(&VGET { dim, var, ref idx, .. }) => Some(visitvref(tcx, var, idx, dim as _)),
         ObjectRef::CAT(CAT { elems, .. } ) => {
             let e = newtypevar(&mut tcx.data.sub);
             let d = newtypevar(&mut tcx.data.sub);
             let ty = Type::con(Constructor::TENSOR, e);
             for &v in elems {
-                let ety = exprtype(tcx, v);
+                let ety = visitexpr(tcx, v);
                 if objs[v].op == Obj::SPLAT {
                     unifyvar(&mut tcx.data.sub, ety, ty);
                 } else {
@@ -857,14 +681,14 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         },
         ObjectRef::IDX(_) => todo!(),
         ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
-            let aty = exprtype(tcx, addr);
+            let aty = visitexpr(tcx, addr);
             unify(&mut tcx.data.sub, Type::var(aty), Type::pri(Primitive::PTR));
             for &d in shape {
                 // TODO: this should support all types of integers, but currently lower
                 // assumes all lengths are IRT_IDX (this is hardcoded in return slots).
                 // this should probably convert to IRT_IDX because there's not much benefit
                 // in supporting other length sizes.
-                let dty = exprtype(tcx, d);
+                let dty = visitexpr(tcx, d);
                 unify(&mut tcx.data.sub, Type::var(dty), Type::pri(PRI_IDX));
             }
             // result type annotation is generated by parser
@@ -873,7 +697,7 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::NEW(NEW { shape, .. }) => {
             for &s in shape {
                 // nb. see TODO comment in LOAD
-                let sty = exprtype(tcx, s);
+                let sty = visitexpr(tcx, s);
                 unify(&mut tcx.data.sub, Type::var(sty), Type::pri(PRI_IDX));
             }
             let elem = newtypevar(&mut tcx.data.sub);
@@ -881,7 +705,7 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
             Some(newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Type::var(elem), dim]))
         },
         ObjectRef::GET(&GET { value, mut idx, .. }) => {
-            let mut vty = exprtype(tcx, value);
+            let mut vty = visitexpr(tcx, value);
             loop {
                 let e = newtypevar(&mut tcx.data.sub);
                 let next = newtypevar(&mut tcx.data.sub);
@@ -899,8 +723,8 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::BINOP(&BINOP { binop, left, right, .. }) => {
             use BinOp::*;
             let td = newtypevar(&mut tcx.data.sub);
-            let lty = exprtype(tcx, left);
-            let rty = exprtype(tcx, right);
+            let lty = visitexpr(tcx, left);
+            let rty = visitexpr(tcx, right);
             let (le, ld) = unpacktensor(&mut tcx.data.sub, Type::var(lty));
             let (re, rd) = unpacktensor(&mut tcx.data.sub, Type::var(rty));
             unifyvar(&mut tcx.data.sub, le, Type::var(re));
@@ -933,76 +757,16 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> Option<Type> {
         ObjectRef::CALL(_) => todo!(),
         ObjectRef::CALLX(CALLX { inputs, .. }) => {
             for &input in inputs {
-                exprtype(tcx, input);
+                visitexpr(tcx, input);
             }
             None
         },
         _ => unreachable!()
-    }
-}
-
-fn exprtype(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
-    let ts = &mut *tcx.data;
-    let tv = match ts.ann.entry(idx.erase()) {
-        hash_map::Entry::Occupied(e) => return zerocopy::transmute!(*e.get()),
-        hash_map::Entry::Vacant(e) => {
-            let tv = newtypevar(&mut ts.sub);
-            e.insert(Type::var(tv));
-            tv
-        }
     };
-    if let Some(ty) = visitexpr(tcx, idx) {
-        tcx.data.sub[tv] = ty;
-    }
-    let ann = tcx.objs[idx.cast::<EXPR>()].ann;
-    if !ann.is_nil() {
-        let ty = createtype(tcx, ann);
+    if let Some(ty) = ty {
         unifyvar(&mut tcx.data.sub, tv, ty);
     }
     tv
-}
-
-fn visitall(tcx: &mut Tcx) {
-    tcx.data.ann.insert_unique_unchecked(ObjRef::NIL, Type::var(TypeVar::UNIT));
-    tcx.data.ann.insert_unique_unchecked(ObjRef::SLURP, Type::var(TypeVar::UNIT));
-    let b1 = tcx.data.sub.push(Type::pri(Primitive::B1));
-    tcx.data.ann.insert_unique_unchecked(ObjRef::TRUE.erase(), Type::var(b1));
-    tcx.data.ann.insert_unique_unchecked(ObjRef::FALSE.erase(), Type::var(b1));
-    let objs = Access::borrow(&tcx.objs);
-    for (idx, o) in objs.pairs() {
-        match o {
-            ObjectRef::TAB(&TAB { shape, .. }) => {
-                trace!(TYPE "tab {:?}", idx);
-                tcx.data.tab = ObjRef::GLOBAL;
-                let ty = shapetype(tcx, &objs[shape].fields);
-                let ety = exprtype(tcx, shape.cast());
-                unifyvar(&mut tcx.data.sub, ety, ty);
-            },
-            ObjectRef::MOD(&MOD { tab, guard, ref value, .. }) => {
-                trace!(TYPE "mod {:?}", idx);
-                tcx.data.tab = tab;
-                if !guard.is_nil() {
-                    let ety = exprtype(tcx, guard);
-                    unifyvar(&mut tcx.data.sub, ety, Type::pri(Primitive::B1));
-                }
-                for &vset in value.iter() {
-                    let &VSET { dim, var, value, ref idx, .. } = &objs[vset];
-                    let vty = visitvref(tcx, var, idx, dim as _);
-                    let ety = exprtype(tcx, value);
-                    unifyvar(&mut tcx.data.sub, ety, vty);
-                }
-            },
-            ObjectRef::FUNC(_) => todo!(),
-            ObjectRef::QUERY(&QUERY { tab, ref value, .. }) => {
-                trace!(TYPE "query {:?}", idx);
-                tcx.data.tab = tab;
-                for &v in value {
-                    exprtype(tcx, v);
-                }
-            },
-            _ => {}
-        }
-    }
 }
 
 fn canondim(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
@@ -1075,33 +839,279 @@ fn canonty(sub: &mut IndexSlice<TypeVar, Type>, tv: TypeVar) -> Type {
     ty
 }
 
-fn fixvars(tcx: &mut Tcx) {
-    for idx in tcx.objs.keys() {
-        if tcx.objs[idx].op == Obj::VAR {
-            let ty = tcx.data.ann[&idx];
-            canonty(&mut tcx.data.sub, zerocopy::transmute!(ty));
+// must match hashtypeobj
+// stores type params in ccx.tmp
+fn hashtype(ccx: &mut Ccx<TypeInfer>, ty: TypeRepr) -> u64 {
+    use TypeRepr::*;
+    let mut hash = FxHasher::default();
+    match ty {
+        Pri(p) => hash.write_u16(p.as_u16_truncated()),
+        Con(Constructor::TENSOR, base) => {
+            let elem = typeobj(ccx, Type::var(base));
+            let dim = dimension(&ccx.data.sub, Type::var(base+1)).unwrap();
+            debug_assert!(dim > 0);
+            hash.write_u32(zerocopy::transmute!(elem));
+            hash.write_u8(dim);
+            ccx.tmp.push(elem);
+            ccx.tmp.push(dim as u32);
+        },
+        Con(Constructor::PAIR, mut t) => {
+            loop {
+                let e = typeobj(ccx, Type::var(t));
+                hash.write_u32(zerocopy::transmute!(e));
+                ccx.tmp.push(e);
+                let TypeRepr::Con(c, tt) = ccx.data.sub[t+1].unpack() else { unreachable!() };
+                if c == Constructor::UNIT { break }
+                t = tt;
+            }
+        },
+        Con(Constructor::UNIT, _) => { /* NOP */ },
+        _ => unreachable!()
+    }
+    hash.finish()
+}
+
+// must match hashtype
+fn hashtypeobj(o: ObjectRef) -> u64 {
+    let mut hash = FxHasher::default();
+    match o {
+        ObjectRef::TPRI(&TPRI { ty, .. }) => hash.write_u16(1 << ty),
+        ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
+            hash.write_u32(zerocopy::transmute!(elem));
+            hash.write_u8(dim);
+        },
+        ObjectRef::TTUP(TTUP { elems, ..  }) => {
+            for &e in elems {
+                hash.write_u32(zerocopy::transmute!(e));
+            }
+        },
+        _ => unreachable!()
+    }
+    hash.finish()
+}
+
+fn sametype(a: ObjectRef, b: TypeRepr, work: &[u32]) -> bool {
+    match (a, b) {
+        (ObjectRef::TPRI(&TPRI { ty, .. }), TypeRepr::Pri(p)) => p.as_u16_truncated() == 1 << ty,
+        (ObjectRef::TTEN(&TTEN { elem, dim, .. }), TypeRepr::Con(Constructor::TENSOR, _))
+            => work == &[zerocopy::transmute!(elem), dim as _],
+        (ObjectRef::TTUP(TTUP { elems, .. }), TypeRepr::Con(Constructor::PAIR|Constructor::UNIT, _))
+            => work.len() == elems.len()
+            && zip(work.iter(), elems.iter()).all(|(&ea,&eb)| ea == zerocopy::transmute!(eb)),
+        _ => false
+    }
+}
+
+fn typeobj(ccx: &mut Ccx<TypeInfer>, ty: Type) -> ObjRef {
+    match ty.unpack() {
+        TypeRepr::Var(tv) => return typeobj(ccx, ccx.data.sub[tv]),
+        type_ => {
+            let base = ccx.tmp.end();
+            let hash = hashtype(ccx, type_);
+            let tx = &mut *ccx.data;
+            let args: &[u32] = &ccx.tmp[base.cast_up()..];
+            let o = match tx.tobj.entry(
+                hash,
+                |&t| sametype(ccx.objs.get(t), type_, args),
+                |&t| hashtypeobj(ccx.objs.get(t))
+            ) {
+                hash_table::Entry::Vacant(e)
+                    => *e.insert(createtypeobj(&mut ccx.objs, type_, args)).get(),
+                hash_table::Entry::Occupied(e) => *e.get()
+            };
+            ccx.tmp.truncate(base);
+            o
         }
     }
 }
 
-fn annotate(ccx: &mut Ccx<TypeInfer>) {
-    let mut idx = ObjRef::NIL;
-    while let Some(i) = ccx.objs.next(idx) {
-        idx = i;
-        let op = ccx.objs[idx].op;
-        if op == Obj::VAR || Operator::is_expr_raw(op) {
-            let mut ann = ccx.data.ann[&idx];
-            if op != Obj::VAR {
-                ann = canonty(&mut ccx.data.sub, zerocopy::transmute!(ann));
+fn isconcretetype(tvar: &IndexSlice<TypeVar, Type>, ty: Type) -> bool {
+    use TypeRepr::*;
+    match ty.unpack() {
+        Var(j) if ty == Type::var(j) => false,
+        Var(j) => isconcretetype(tvar, tvar[j]),
+        Con(c, base) => (0..Constructor::from_u8(c).arity() as isize)
+            .all(|i| isconcretetype(tvar, tvar[base+i])),
+        Pri(p) => p.len() <= 1,
+    }
+}
+
+fn createtype(tcx: &mut Tcx, ann: &mut HashMap<ObjRef, TypeVar>, idx: ObjRef) -> Type {
+    let objs = Access::borrow(&tcx.objs);
+    let o = objs.get(idx);
+    let ty = match o {
+        ObjectRef::SPEC(&SPEC { what: SPEC::NIL, .. }) => Type::var(newtypevar(&mut tcx.data.sub)),
+        ObjectRef::TVAR(_) => return Type::var(match ann.entry(idx) {
+            hash_map::Entry::Vacant(e) => *e.insert(newtypevar(&mut tcx.data.sub)),
+            hash_map::Entry::Occupied(e) => *e.get()
+        }),
+        ObjectRef::TPRI(&TPRI { ty, .. }) => Type::pri(EnumSet::from_u16_truncated(1 << ty)),
+        ObjectRef::TTEN(&TTEN { elem, dim, .. }) => {
+            let e = match elem.is_nil() {
+                true  => Type::var(newtypevar(&mut tcx.data.sub)),
+                false => createtype(tcx, ann, elem)
+            };
+            let d = createdimtype(&mut tcx.data, dim);
+            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[e, d])
+        },
+        ObjectRef::TTUP(&TTUP { ref elems, .. }) => {
+            let mut ty = Type::UNIT;
+            for &e in elems.iter().rev() {
+                let ety = createtype(tcx, ann, e);
+                ty = newpairtype(&mut tcx.data.sub, ety, ty);
             }
-            trace!(TYPE "ann {:?}: {:?}", idx, ann.unpack());
-            let ann = typeobj(ccx, ann);
+            ty
+        },
+        _ => unreachable!()
+    };
+    if isconcretetype(&tcx.data.sub, ty) {
+        let hash = hashtypeobj(o);
+        if let hash_table::Entry::Vacant(e) = tcx.data.tobj.entry(
+            hash,
+            |&t| objs.equal(t, idx),
+            |&t| hashtypeobj(objs.get(t))
+        ) {
+            e.insert(idx);
+        }
+    }
+    ty
+}
+
+fn deannotate(ccx: &mut Ccx<TypeInfer>) {
+    let mut idx = ObjRef::NIL;
+    let mut anntv: HashMap<ObjRef, TypeVar> = Default::default();
+    loop {
+        'body: {
+            let op = ccx.objs[idx].op;
             let ofs = match op {
                 Obj::VAR => obj_index_of!(VAR, ann),
-                _ /* EXPR */ => obj_index_of!(EXPR, ann),
+                _ if Operator::is_expr_raw(op) => obj_index_of!(EXPR, ann),
+                _ => break 'body
             };
-            ccx.objs.get_raw_mut(idx)[ofs] = zerocopy::transmute!(ann);
+            let tv = newtypevar(&mut ccx.data.sub);
+            let ann: ObjRef = zerocopy::transmute!(
+                replace(&mut ccx.objs.get_raw_mut(idx)[ofs], zerocopy::transmute!(tv)));
+            if !ann.is_nil() {
+                let ty = ccx.freeze_graph(|ccx| createtype(ccx, &mut anntv, ann));
+                ccx.data.sub[tv] = ty;
+            }
+            trace!(TYPE "{:?} -> {:?} ({:?})", idx, tv, ccx.data.sub[tv].unpack());
         }
+        let Some(i) = ccx.objs.next(idx) else { return };
+        idx = i;
+    }
+}
+
+fn shapetype(tcx: &mut Tcx, idx: &[ObjRef<EXPR>]) -> Type {
+    let base = tcx.tmp.end();
+    let fields = tcx.tmp.align_for::<Type>();
+    let mut nils = 0;
+    for &i in idx {
+        let ety = if i.is_nil() {
+            nils += 1;
+            Type::UNIT
+        } else if nils > 0 {
+            // TODO: more generally, this should allow the dimension to have any nesting
+            // and only constrain the sum of dimensions.
+            // eg. consider
+            //   table A[global.N]
+            //   table B[:,A.N]
+            //   table C[:,:,B.N]
+            // here
+            //   A has 1 scalar axis
+            //   B has 1 scalar axis and 1 vector axis
+            //   C has 1 scalar axis (of size global.N) and 2 vector axes (of sizes A.N and B.N)
+            // ie. nested vector axes "spill" into the preceding `:`s
+            let dim = createdimtype(&mut tcx.data, nils);
+            nils = 0;
+            newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Type::pri(PRI_IDX), dim])
+        } else {
+            Type::pri(PRI_IDX)
+        };
+        fields.push(ety);
+    }
+    debug_assert!(nils == 0);
+    let ty = newpairlist(&mut tcx.data.sub, &fields[base.cast_up()..]);
+    tcx.tmp.truncate(base);
+    ty
+}
+
+fn modeltype(tcx: &mut Tcx, vsets: &[ObjRef<VSET>]) -> Type {
+    let objs = Access::borrow(&tcx.objs);
+    let base = tcx.tmp.end();
+    for &vset in vsets {
+        let &VSET { dim, var, ref idx, .. } = &objs[vset];
+        let vty = visitvref(tcx, var, idx, dim as _);
+        tcx.tmp.push(vty);
+    }
+    let ty = match &tcx.tmp[base.cast_up()..] {
+        &[ty] => ty,
+        fields => newpairlist(&mut tcx.data.sub, fields)
+    };
+    tcx.tmp.truncate(base);
+    ty
+}
+
+fn visitglobals(tcx: &mut Tcx) {
+    let objs = Access::borrow(&tcx.objs);
+    for (idx, o) in objs.pairs() {
+        match o {
+            ObjectRef::TAB(&TAB { shape, .. }) => {
+                trace!(TYPE "tab {:?}", idx);
+                tcx.data.tab = ObjRef::GLOBAL;
+                let ty = shapetype(tcx, &objs[shape].fields);
+                let ety = visitexpr(tcx, shape.cast());
+                unifyvar(&mut tcx.data.sub, ety, ty);
+            },
+            ObjectRef::MOD(&MOD { tab, guard, value, ref outputs, .. }) => {
+                trace!(TYPE "mod {:?}", idx);
+                tcx.data.tab = tab;
+                if !guard.is_nil() {
+                    let ety = visitexpr(tcx, guard);
+                    unifyvar(&mut tcx.data.sub, ety, Type::pri(Primitive::B1));
+                }
+                let ty = modeltype(tcx, outputs);
+                let ety = visitexpr(tcx, value);
+                unifyvar(&mut tcx.data.sub, ety, ty);
+            },
+            ObjectRef::QUERY(&QUERY { tab, ref value, .. }) => {
+                trace!(TYPE "query {:?}", idx);
+                tcx.data.tab = tab;
+                for &v in value {
+                    visitexpr(tcx, v);
+                }
+            },
+            _ => {}
+        }
+    }
+}
+
+fn fixvars(tcx: &mut Tcx) {
+    for (_,o) in tcx.objs.pairs() {
+        if let ObjectRef::VAR(&VAR { ann, .. }) = o {
+            canonty(&mut tcx.data.sub, zerocopy::transmute!(ann));
+        }
+    }
+}
+
+fn reannotate(ccx: &mut Ccx<TypeInfer>) {
+    let mut idx = ObjRef::NIL;
+    loop {
+        'body: {
+            let op = ccx.objs[idx].op;
+            let ofs = match op {
+                Obj::VAR => obj_index_of!(VAR, ann),
+                _ if Operator::is_expr_raw(op) => {
+                    canonty(&mut ccx.data.sub, zerocopy::transmute!(ccx.objs[idx.cast::<EXPR>()].ann));
+                    obj_index_of!(EXPR, ann)
+                },
+                _ => break 'body
+            };
+            let tobj = typeobj(ccx, Type::var(zerocopy::transmute!(ccx.objs.get_raw(idx)[ofs])));
+            ccx.objs.get_raw_mut(idx)[ofs] = zerocopy::transmute!(tobj);
+        }
+        let Some(i) = ccx.objs.next(idx) else { return };
+        idx = i;
     }
 }
 
@@ -1114,23 +1124,24 @@ impl Stage for TypeInfer {
         sub.push(Type::V1D);
         Ok(TypeInfer {
             sub,
+            locals: Default::default(),
             con: Default::default(),
             tobj: Default::default(),
-            ann: Default::default(),
             tab: ObjRef::NIL.cast(),
             dim: (TypeVar::V1D, 1)
         })
     }
 
     fn run(ccx: &mut Ccx<Self>) -> compile::Result {
+        deannotate(ccx);
         ccx.freeze_graph(|ccx| {
-            visitall(ccx);
+            visitglobals(ccx);
             simplify(&mut ccx.data);
             fixvars(ccx);
             simplify(&mut ccx.data);
         });
         debug_assert!(ccx.data.con.is_empty());
-        annotate(ccx);
+        reannotate(ccx);
         // TODO: check for errors
         if trace!(TYPE) {
             trace_objs(&ccx.intern, &ccx.objs, ObjRef::NIL);

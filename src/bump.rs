@@ -130,6 +130,10 @@ impl<T: ?Sized + Aligned> BumpRef<T> {
         Self((ofs/T::ALIGN) as u32, PhantomData)
     }
 
+    fn from_align_idx(idx: u32) -> Self {
+        Self(idx, PhantomData)
+    }
+
     pub fn ptr(self) -> usize {
         self.0 as usize * T::ALIGN
     }
@@ -664,6 +668,15 @@ impl BumpPtr {
 }
 
 /* ---- Operators ----------------------------------------------------------- */
+
+pub fn iter_range<T>(range: Range<BumpRef<T>>) -> core::iter::Map<
+    core::iter::StepBy<Range<u32>>,
+    impl Fn(u32) -> BumpRef<T>
+> {
+    (range.start.0..range.end.0)
+        .step_by((size_of::<T>() / T::ALIGN) as _)
+        .map(BumpRef::from_align_idx)
+}
 
 impl<T> core::ops::Index<BumpRef<T>> for BumpPtr
     where T: ?Sized + Get
