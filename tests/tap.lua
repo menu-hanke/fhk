@@ -56,7 +56,7 @@ local function prettyprint(x)
 	return tostring(buf)
 end
 
-local function check(computed, true_, tol)
+local function check(computed, true_, tol, expr)
 	for i,t in ipairs(true_) do
 		local c = computed[i]
 		if type(c) == "cdata" then
@@ -69,8 +69,13 @@ local function check(computed, true_, tol)
 			ok = equal(t,c,tol)
 		end
 		if not ok then
-			error(string.format("bad result!\ncomputed: %s\ntrue    : %s\n",
-				prettyprint(c), prettyprint(t)))
+			local msg = { "bad result!" }
+			if expr then
+				table.insert(msg, string.format("expression: %s", expr[i]))
+			end
+			table.insert(msg, string.format("computed  : %s", prettyprint(c)))
+			table.insert(msg, string.format("true      : %s", prettyprint(t)))
+			error(table.concat(msg, "\n"))
 		end
 	end
 end
@@ -98,13 +103,14 @@ end
 
 local function test_result(T, results)
 	local query = T.G:newquery("global")
-	local true_ = {}
+	local true_, expr = {}, {}
 	for e,v in pairs(results) do
 		query:add(e)
 		table.insert(true_, v)
+		table.insert(expr, e)
 	end
 	local inst = test_newinstance(T)
-	check({query.query(inst):unpack()}, true_)
+	check({query.query(inst):unpack()}, true_, nil, expr)
 end
 
 local function pcallfail(message, f, ...)
