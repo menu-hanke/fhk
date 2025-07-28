@@ -29,7 +29,7 @@ use crate::{compile, dl};
 use crate::intern::IRef;
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
-use crate::obj::{ObjRef, ObjectRef, CALLX, TTUP};
+use crate::obj::{ObjRef, ObjectRef, CALL, TTUP};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, Pcx};
 
@@ -207,7 +207,7 @@ const LOP_OUTPUT: u8 = 2;
 
 /* ---- Parsing ------------------------------------------------------------- */
 
-fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALLX>> {
+fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALL>> {
     consume(pcx, Token::LBracket)?;
     let (source, expr) = {
         let lit: IRef<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
@@ -228,7 +228,7 @@ fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALLX>> {
     }
     consume(pcx, Token::RParen)?;
     let callx = pcx.objs.push_args(
-        CALLX::new(Lang::R as _, ObjRef::NIL, zerocopy::transmute!(rf)),
+        CALL::new(Lang::R as _, ObjRef::NIL, zerocopy::transmute!(rf)),
         &pcx.tmp[base.cast_up()..]
     );
     pcx.tmp.truncate(base);
@@ -240,7 +240,7 @@ fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALLX>> {
 fn lower_call(
     lcx: &mut CLcx,
     ctr: InsId,
-    obj: ObjRef<CALLX>,
+    obj: ObjRef<CALL>,
     func: &Func,
     inputs: &[InsId]
 ) -> InsId {
@@ -740,14 +740,14 @@ impl Drop for RFinalizer {
 
 impl Language for R {
 
-    fn parse(pcx: &mut Pcx, _: usize) -> compile::Result<ObjRef<CALLX>> {
+    fn parse(pcx: &mut Pcx, _: usize) -> compile::Result<ObjRef<CALL>> {
         parse_call(pcx)
     }
 
     fn lower(
         lcx: &mut CLcx,
         ctr: InsId,
-        obj: ObjRef<CALLX>,
+        obj: ObjRef<CALL>,
         func: &Func,
         inputs: &[InsId]
     ) -> InsId {

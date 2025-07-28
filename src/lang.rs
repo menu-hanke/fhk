@@ -12,12 +12,12 @@ use crate::emit::{Ecx, Emit, InsValue};
 use crate::foreach_lang;
 use crate::ir::{Func, InsId};
 use crate::lower::CLcx;
-use crate::obj::{ObjRef, CALLX};
+use crate::obj::{ObjRef, CALL};
 use crate::parser::Pcx;
 
 pub trait Language: Sized {
-    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>>;
-    fn lower(lcx: &mut CLcx, ctr: InsId, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId;
+    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>>;
+    fn lower(lcx: &mut CLcx, ctr: InsId, obj: ObjRef<CALL>, func: &Func, inputs: &[InsId]) -> InsId;
     fn begin_emit(ccx: &mut Ccx) -> compile::Result<Self>;
     fn emit(ecx: &mut Ecx, id: InsId, lop: u8) -> compile::Result<InsValue>;
     #[allow(unused_variables)]
@@ -100,7 +100,7 @@ impl Lang {
         unsafe { core::mem::transmute(raw) }
     }
 
-    pub fn parse(self, pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    pub fn parse(self, pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
         dispatch!(self, Lang => Lang::parse(pcx, n))
     }
 
@@ -108,7 +108,7 @@ impl Lang {
         self,
         lcx: &mut CLcx,
         ctr: InsId,
-        obj: ObjRef<CALLX>,
+        obj: ObjRef<CALL>,
         func: &Func,
         inputs: &[InsId]
     ) -> InsId {

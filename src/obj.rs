@@ -288,19 +288,17 @@ define_ops! {
     // named objects. name must be first. tab must be second for VAR and MOD.
     VAR         { name: Name, tab: ObjRef<TAB>, ann: ObjRef/*TY*/};
     TAB         { name: Name, shape: ObjRef<TUPLE> };
-    FUNC        { name: Name, value: ObjRef<EXPR> };
+    FUNC.arity  { name: Name, expr: ObjRef<EXPR>, args: ObjRef/*TTUP*/ };
+    FPROT.arity { name: Name, expr: ObjRef<EXPR>, unused: u32 };
     // non-named objects.
     MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR>, value: ObjRef<EXPR> } outputs: [ObjRef<VSET>];
     QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
     RESET.id    { mlo: u32, mhi: u32 /* TODO: use 32-bit offset instead */ } objs: [ObjRef/*VAR|MOD*/];
-    FNI         { func: ObjRef<FUNC> } generics: [ObjRef/*TY*/];
     VSET.dim    { var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     // types
-    TVAR        {};
     TPRI.ty     {};
     TTEN.dim    { elem: ObjRef/*TY*/ };
     TTUP        {} elems: [ObjRef/*TY*/];
-    // (TFUNC for functions + generic type annotations TPAR/TCON etc)
     // expressions. ann must be first.
     SPEC.what   { ann: ObjRef<TTUP/*UNIT*/> };
     FLAT        { ann: ObjRef<TTUP/*UNIT*/> } idx: [ObjRef<EXPR>];
@@ -309,11 +307,13 @@ define_ops! {
     KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
     KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
     KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
-    DIM.axis    { ann: ObjRef/*TPRI.IDX*/ };
     LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
+    TGET.idx    { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     LET         { ann: ObjRef/*TY*/, value: ObjRef<EXPR>, expr: ObjRef<EXPR> };
     LGET        { ann: ObjRef/*TY*/, slot: LocalId };
+    APPLY       { ann: ObjRef/*TY*/, func: ObjRef<FUNC> } args: [ObjRef<EXPR>];
+    PGET.idx    { ann: ObjRef/*TY*/ };
     VGET.dim    { ann: ObjRef/*TY*/, var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     CAT         { ann: ObjRef/*TY*/ } elems: [ObjRef<EXPR>];
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
@@ -321,10 +321,7 @@ define_ops! {
     INTR.func   { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
     LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } shape: [ObjRef<EXPR>];
     NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
-    GET.idx     { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
-    FREF        { ann: ObjRef/*TY*/, func: ObjRef/*FUNC|FNI*/ };
-    CALL        { ann: ObjRef/*TY*/, func: ObjRef<EXPR> } args: [ObjRef<EXPR>];
-    CALLX.lang  { ann: ObjRef/*TY*/, func: u32 } inputs: [ObjRef<EXPR>];
+    CALL.lang   { ann: ObjRef/*TY*/, func: u32 } inputs: [ObjRef<EXPR>];
 }
 
 define_ops!(@struct (EXPR ann:ObjRef;) (data));
@@ -356,7 +353,7 @@ impl Operator {
 
     pub fn is_type_raw(op: u8) -> bool {
         use Operator::*;
-        (TVAR|TPRI|TTEN|TTUP).as_u64_truncated() & (1 << op) != 0
+        (TPRI|TTEN|TTUP).as_u64_truncated() & (1 << op) != 0
     }
 
 }
@@ -505,6 +502,10 @@ impl Objects {
         pushobj(&mut self.bump, obj)
     }
 
+    pub fn push_raw(&mut self, raw: &[u32]) -> ObjRef {
+        ObjRef { raw: self.bump.write(raw).cast() }
+    }
+
     pub fn push_args<T>(&mut self, head: T::Head, items: &[T::Item]) -> ObjRef<T>
         where T: ?Sized + ObjType + bump::PackedSliceDst,
               T::Head: bump::FromBytes + bump::IntoBytes,
@@ -579,7 +580,6 @@ impl Objects {
         use ObjectRef::*;
         // note: this only does types and expressions. add other objects if needed.
         match (self.get(a.erase()), self.get(b.erase())) {
-            (TVAR(_),  TVAR(_))   => false,
             (TPRI(a),  TPRI(b))   => a.ty == b.ty,
             (TTEN(a),  TTEN(b))   => a.dim == b.dim && self.equal(a.elem, b.elem),
             (TTUP(a),  TTUP(b))   => self.allequal(cast_args(&a.elems), cast_args(&b.elems)),
@@ -590,7 +590,6 @@ impl Objects {
             (KINT64(a),KINT64(b)) => a.k == b.k,
             (KFP64(a), KFP64(b))  => a.k == b.k,
             (KSTR(a),  KSTR(b))   => a.k == b.k,
-            (DIM(a),   DIM(b))    => a.axis == b.axis,
             (TUPLE(a), TUPLE(b))  => self.allequal(cast_args(&a.fields), cast_args(&b.fields)),
             (VGET(a),  VGET(b))   => a.var == b.var
                 && self.allequal(cast_args(&a.idx), cast_args(&b.idx)),
@@ -605,10 +604,8 @@ impl Objects {
             (LOAD(a),  LOAD(b))   => a.addr == b.addr
                 && self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
-            (GET(a),   GET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
-            (FREF(_),  FREF(_))   => todo!(),
-            (CALL(_),  CALL(_))   => todo!(),
-            (CALLX(_), CALLX(_))  => todo!(),
+            (TGET(a),  TGET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
+            (CALL(_),  CALL(_))  => todo!(),
             _ => false
         }
     }
@@ -638,6 +635,20 @@ impl Objects {
                 // inference.
                 todo!()
             }
+        }
+    }
+
+    pub fn references(&self, o: ObjRef) -> core::iter::Map<RefParamIter, impl FnMut(usize) -> ObjRef> {
+        let raw = self.get_raw(o);
+        self[o].ref_params().map(|i| zerocopy::transmute!(raw[i+1]))
+    }
+
+    pub fn clear_marks(&mut self) {
+        let mut idx = ObjRef::NIL;
+        loop {
+            self[idx].mark = 0;
+            let Some(i) = self.next(idx) else { break };
+            idx = i;
         }
     }
 
@@ -751,6 +762,20 @@ impl Objects {
             Entry::Vacant(entry) => {
                 let bump = &mut self.bump;
                 let create = move || pushobj(bump, TAB::new(name, ObjRef::NIL.cast()));
+                LookupEntry::Vacant(VacantLookupEntry { entry, create })
+            }
+        }
+    }
+
+    pub fn func(
+        &mut self,
+        name: IRef<[u8]>
+    ) -> LookupEntry<'_, FUNC, impl FnMut() -> ObjRef<FUNC> + '_> {
+        match entry(&mut self.lookup, self.bump.as_slice(), (Operator::FUNC as _, name)) {
+            Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
+            Entry::Vacant(entry) => {
+                let bump = &mut self.bump;
+                let create = move || pushobj(bump, FUNC::new(0, name, ObjRef::NIL.cast(), ObjRef::NIL));
                 LookupEntry::Vacant(VacantLookupEntry { entry, create })
             }
         }

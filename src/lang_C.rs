@@ -19,7 +19,7 @@ use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::CLcx;
-use crate::obj::{Obj, ObjRef, CALLX, EXPR, TPRI, TTEN};
+use crate::obj::{Obj, ObjRef, CALL, EXPR, TPRI, TTEN};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
 use crate::typing::{Primitive, IRT_IDX};
@@ -473,7 +473,7 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
                 false => Sym { lib: IRef::EMPTY, sym: s }
             };
             let sym = pcx.intern.intern(&sym).to_bump();
-            pcx.objs.push(CALLX::new(Lang::C as _, ObjRef::PTR.erase(), newsymref(sym))).cast()
+            pcx.objs.push(CALL::new(Lang::C as _, ObjRef::PTR.erase(), newsymref(sym))).cast()
         },
         _ => {
             let ptr = parse_expr(pcx)?;
@@ -525,7 +525,7 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
     Ok(())
 }
 
-fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALLX> {
+fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALL> {
     let args = pcx.perm.write(ps.args.as_slice(&pcx.tmp));
     let stores = pcx.perm.write(ps.stores.as_slice(&pcx.tmp));
     let inputs = pcx.perm.write(ps.inputs_ctype.as_slice(&pcx.tmp));
@@ -545,7 +545,7 @@ fn collect_call(pcx: &mut Pcx, ps: &ParseState) -> ObjRef<CALLX> {
     });
     // TODO: nonscalar out parameters need annotations
     pcx.objs.push_args(
-        CALLX::new(Lang::C as _, ObjRef::NIL, newcallref(call)),
+        CALL::new(Lang::C as _, ObjRef::NIL, newcallref(call)),
         ps.inputs.as_slice(&pcx.tmp)
     )
 }
@@ -576,7 +576,7 @@ fn lower_value(lower: &LowerState, tmp: &BumpPtr, func: &Func, value: Value) -> 
 fn lower_call(
     lcx: &mut CLcx,
     ctr: InsId,
-    obj: ObjRef<CALLX>,
+    obj: ObjRef<CALL>,
     func: &Func,
     inputs: &[InsId]
 ) -> InsId {
@@ -798,7 +798,7 @@ fn emit_res(ecx: &mut Ecx, id: InsId) -> InsValue {
 
 impl Language for C {
 
-    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
         let base = pcx.tmp.end();
         let (outputs, _) = pcx.tmp.reserve_dst::<[Output]>(n);
         let mut ps = ParseState {
@@ -827,7 +827,7 @@ impl Language for C {
     fn lower(
         lcx: &mut CLcx,
         ctr: InsId,
-        obj: ObjRef<CALLX>,
+        obj: ObjRef<CALL>,
         func: &Func,
         inputs: &[InsId]
     ) -> InsId {

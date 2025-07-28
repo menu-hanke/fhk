@@ -6,7 +6,7 @@ use crate::bitmap::{BitMatrix, Bitmap};
 use crate::controlflow::{BlockId, ControlFlow, DataflowSystem, Schedule};
 use crate::emit::InsValue;
 use crate::index::{self, IndexSet, IndexVec};
-use crate::ir::{Func, Ins, InsId, Opcode, PhiId, Type};
+use crate::ir::{Func, FuncKind, Ins, InsId, Opcode, PhiId, Type};
 
 #[derive(Default)]
 pub struct Gcm {
@@ -35,21 +35,25 @@ fn compute_blockparams(gcm: &mut Gcm, func: &Func, phis: &mut BitMatrix<BlockId,
     phis.clear_all();
     if func.phis.is_empty() { return }
     // init dataflow system
-    for (_, ins) in func.code.pairs() {
+    for (id, ins) in func.code.pairs() {
         match ins.opcode() {
             Opcode::PHI => {
                 let (ctr, phi) = ins.decode_PHI();
                 let Some(&[block]) = gcm.control.get_blocks(ctr) else { unreachable!() };
                 phis[block].set(phi);
             },
-            // TODO: this should be done for user funcs because they return values in RET, but not
-            // for chunks and queries
-            // Opcode::RET => {
-            //     let block = values[id].block();
-            //     for r in index::iter_range(func.returns()) {
-            //         phis[block].set(r);
-            //     }
-            // },
+            Opcode::RET => {
+                // user funcs behave as if they had an implicit PHI instruction for each return
+                // value in the RET block.
+                // this is not true chunks or queries, which store the value in memory at the
+                // JMP instruction.
+                // (TODO: this should only be done when there is one return value; multiple returns
+                // should go through memory just like chunk/query)
+                if let FuncKind::User = func.kind {
+                    let Some(&[block]) = gcm.control.get_blocks(id) else { unreachable!() };
+                    phis[block].set_range(func.returns());
+                }
+            }
             _ => {}
         }
     }
@@ -57,9 +61,7 @@ fn compute_blockparams(gcm: &mut Gcm, func: &Func, phis: &mut BitMatrix<BlockId,
     let blocks = &gcm.control.blocks;
     solver.resize(blocks.end());
     solver.queue_all(blocks.end());
-    for arg in index::iter_range(func.params()) {
-        phis[BlockId::START].set(arg);
-    }
+    phis[BlockId::START].set_range(func.params());
     // mask out FX phis
     gcm.control.work_bitmap.resize(func.phis.end().into());
     let work: &mut Bitmap<PhiId> = gcm.control.work_bitmap.cast_mut();

@@ -112,7 +112,7 @@ fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugS
     let flags = src.flags();
     if flags.contains(DebugFlag::VALUE) {
         buf.write(".value");
-    } else if (Operator::VAR|Operator::MOD).contains(op) {
+    } else if (Operator::VAR|Operator::MOD|Operator::FUNC).contains(op) {
         buf.write(".avail");
     }
     if flags.contains(DebugFlag::INIT) {

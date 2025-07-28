@@ -70,7 +70,7 @@ pub struct Parser<L=Absent> {
     pub undef_base: usize,
     pub this: ObjRef,
     pub rec: bool,
-    pub binddim: u8,
+    pub bindparams: u8,
     macros: IndexVec<MacroId, Macro>,
     chain: HashMap<(IRef<[u8]>, Namespace), (MacroId, MacroId)>, // stem -> (head, tail)
     stack: Vec<Frame>,
@@ -792,7 +792,7 @@ impl Stage for Parser {
             captures: Default::default(),
             snippet: Default::default(),
             rec: false,
-            binddim: 0
+            bindparams: 0
         })
     }
 

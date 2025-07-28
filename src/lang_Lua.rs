@@ -19,7 +19,7 @@ use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::lower::{decompose, decomposition, decomposition_size, reserve, CLcx};
 use crate::mmap::{Mmap, Prot};
-use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALLX, EXPR, NEW, TPRI, TTEN, TTUP};
+use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALL, EXPR, NEW, TPRI, TTEN, TTUP};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
 use crate::support::SuppFunc;
@@ -258,7 +258,7 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
     Ok(())
 }
 
-fn collect_call(pcx: &mut Pcx, ps: &ParseState, n: usize) -> ObjRef<CALLX> {
+fn collect_call(pcx: &mut Pcx, ps: &ParseState, n: usize) -> ObjRef<CALL> {
     let lf = &mut pcx.perm[ps.lf];
     lf.template.set(pcx.intern.intern(ps.template.as_slice(&pcx.tmp)));
     // all remaining outputs are return values
@@ -282,12 +282,12 @@ fn collect_call(pcx: &mut Pcx, ps: &ParseState, n: usize) -> ObjRef<CALLX> {
     } else {
         ObjRef::NIL
     };
-    pcx.objs.push_args(CALLX::new(Lang::Lua as _, ann, zerocopy::transmute!(ps.lf)), inputs)
+    pcx.objs.push_args(CALL::new(Lang::Lua as _, ann, zerocopy::transmute!(ps.lf)), inputs)
 }
 
 /* ---- Lowering ------------------------------------------------------------ */
 
-fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALLX>, func: &Func, inputs: &[InsId]) -> InsId {
+fn lower_call(lcx: &mut CLcx, obj: ObjRef<CALL>, func: &Func, inputs: &[InsId]) -> InsId {
     let callx = &lcx.objs[obj];
     let mut args = func.code.push(Ins::NOP(Type::LSV));
     for (&i,&o) in zip(inputs, &callx.inputs).rev() {
@@ -610,7 +610,7 @@ impl Drop for LuaFinalizer {
 
 impl Language for Lua {
 
-    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+    fn parse(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
         let (lf, lfp) = pcx.perm.reserve_dst::<LuaFunc>(n);
         lfp.no = n as _;
         let mut ps = ParseState {
@@ -630,7 +630,7 @@ impl Language for Lua {
     fn lower(
         lcx: &mut CLcx,
         _ctr: InsId,
-        obj: ObjRef<CALLX>,
+        obj: ObjRef<CALL>,
         func: &Func,
         inputs: &[InsId]
     ) -> InsId {

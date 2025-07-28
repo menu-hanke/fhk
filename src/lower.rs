@@ -2,6 +2,7 @@
 
 use core::cmp:: min;
 use core::iter::{repeat_n, zip};
+use core::marker::PhantomData;
 use core::mem::{replace, swap};
 
 use alloc::vec::Vec;
@@ -12,64 +13,84 @@ use crate::bump::{self, Bump, BumpRef};
 use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
-use crate::index::{IndexOption, IndexVec, InvalidValue};
-use crate::ir::{self, Chunk, DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, SignatureBuilder, Type, IR};
+use crate::index::{self, index, IndexOption, IndexVec, InvalidValue};
+use crate::ir::{Chunk, DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, Opcode, Phi, PhiId, Query, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass};
-use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KFP64, KINT, KINT64, KSTR, LEN, LET, LGET, LOAD, MOD, NEW, QUERY, RESET, SPEC, SPLAT, TAB, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, KSTR, LEN, LET, LGET, LOAD, MOD, NEW, PGET, QUERY, RESET, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::trace::trace;
-use crate::typestate::{Absent, Access, R, RW};
+use crate::typestate::{Absent, Access, R};
 use crate::typing::{Primitive, IRT_IDX};
 
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C)]
+index!(struct TabId(u16) debug("tab{}"));
+index!(struct AxisId(u32));
+index!(struct ModId(u32) debug("mod{}"));
+index!(struct VSetId(u32) invalid(!0));
+index!(struct VarId(u32) debug("var{}"));
+index!(struct ParamId(u32));
+index!(struct UFuncId(u32) invalid(!0) debug("ufunc{}"));
+index!(struct QueryId(u32));
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rank {
+    Scalar,
+    Vector
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModType {
+    Simple,
+    Complex
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VSetType {
+    // this is the only vset of the model, and it has no indices
+    Simple,
+    // the model instance [i1, ..., iN] returns the variable instance(s) [i1, ..., iN, :, ... :]
+    Prefix,
+    // the model returns some arbitrary indices
+    Complex
+}
+
 struct Axis {
     size: ObjRef<EXPR>,
     ret: PhiId,
-    rank: u8,
-    _pad: u8
+    rank: Rank
 }
 
-bump::vla_struct! {
-    struct Tab {
-        func: FuncId,
-        n: u8,
-        _pad: u8
-    } axes: [Axis; |t| t.n as usize]
+struct Mod {
+    obj: ObjRef<MOD>,
+    tab: TabId,
+    base: FuncId,
+    mt: ModType
 }
 
-bump::vla_struct! {
-    struct Mod {
-        obj: ObjRef<MOD>,
-        tab: BumpRef<Tab>,
-        base: FuncId,
-        n: u8,
-        mt: u8
-    } outputs: [VSet; |m| m.n as usize]
-}
-
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(C)]
 struct VSet {
-    model: BumpRef<Mod>,
-    var: BumpRef<Var>,
+    model: ModId,
+    var: VarId,
     ret: PhiId,
-    vst: u8,
-    idx: u8
+    vst: VSetType,
 }
 
-bump::vla_struct! {
-    struct Var {
-        obj: ObjRef<VAR>,
-        tab: BumpRef<Tab>,
-        base: FuncId,
-        n: u8,
-        _pad: u8
-    } value: [BumpRef<VSet>; |v| v.n as usize]
+struct Var {
+    obj: ObjRef<VAR>,
+    tab: TabId,
+    base: FuncId,
 }
 
-impl Tab {
-    const GLOBAL: BumpRef<Tab> = zerocopy::transmute!(0);
+struct Param {
+    value: PhiId,
+    avail: IndexOption<PhiId>,
+}
+
+struct UserFunc {
+    expr: ObjRef<EXPR>,
+    base: FuncId,
+}
+
+impl TabId {
+    const GLOBAL: TabId = TabId(0);
 }
 
 impl Var {
@@ -80,22 +101,11 @@ impl Var {
 impl Mod {
     const SUB_VALUE: isize = 0;
     const SUB_AVAIL: isize = 2;
-    const SIMPLE: u8 = 0;
-    const COMPLEX: u8 = 1;
 }
 
-impl Axis {
-    const SCALAR: u8 = 0;
-    const VECTOR: u8 = 1;
-}
-
-impl VSet {
-    // this is the only vset of the model, and it has no indices
-    const SIMPLE: u8 = 0;
-    // the model instance [i1, ..., iN] returns the variable instance(s) [i1, ..., iN, :, ... :]
-    const PREFIX: u8 = 1;
-    // the model returns some arbitrary indices
-    const COMPLEX: u8 = 2;
+impl UserFunc {
+    const SUB_VALUE: isize = 0;
+    const SUB_AVAIL: isize = 1;
 }
 
 pub fn decomposition_size(objs: &Objects, idx: ObjRef) -> usize {
@@ -130,24 +140,6 @@ fn pushdeco<'o,'d>(objs: &'o Objects, idx: ObjRef, deco: &'d mut [Type]) -> &'d 
     }
 }
 
-fn pushdeco__old(objs: &Objects, idx: ObjRef, deco: &mut Vec<Type>) {
-    match objs.get(objs.totype(idx)) {
-        ObjectRef::TPRI(&TPRI { ty, ..  }) => {
-            deco.push(Primitive::from_u8(ty).to_ir());
-        },
-        ObjectRef::TTEN(&TTEN { dim, elem, .. }) => {
-            deco.extend(repeat_n(Type::PTR, decomposition_size(objs, elem)));
-            deco.extend(repeat_n(IRT_IDX, dim as _));
-        },
-        ObjectRef::TTUP(TTUP { elems, .. }) => {
-            for &e in elems {
-                pushdeco__old(objs, e, deco);
-            }
-        },
-        _ => unreachable!()
-    }
-}
-
 pub fn decomposition<'objs, 'bump>(
     objs: &'objs Objects,
     idx: ObjRef,
@@ -157,16 +149,6 @@ pub fn decomposition<'objs, 'bump>(
     let (_, deco) = bump.reserve_slice_init(decos, Type::FX);
     pushdeco(objs, idx, deco);
     deco
-}
-
-fn decomposition__old<'objs, 'work>(
-    objs: &'objs Objects,
-    idx: ObjRef,
-    work: &'work mut Vec<Type>
-) -> &'work [Type] {
-    work.clear();
-    pushdeco__old(objs, idx, work);
-    &*work
 }
 
 fn elementtype(objs: &Objects, idx: ObjRef) -> Primitive {
@@ -197,22 +179,35 @@ struct LocalSlot {
 }
 
 #[repr(C)] // need repr(C) for transmuting references
-pub struct Lower<O=RW, F=RW> {
-    bump: Access<Bump<u32>, O>,
-    objs: Access<HashMap<ObjRef, BumpRef<()>>, O>,
+pub struct Lower {
+    tab_func: IndexVec<TabId, FuncId>,
+    tab_axes: IndexVec<TabId, AxisId>,
+    axes: IndexVec<AxisId, Axis>,
+    models: IndexVec<ModId, Mod>,
+    model_outputs: IndexVec<ModId, VSetId>,
+    vsets: IndexVec<VSetId, VSet>,
+    vars: IndexVec<VarId, Var>,
+    var_vsets_idx: IndexVec<VarId, u32>,
+    var_vsets: Vec<VSetId>,
+    params: IndexVec<ParamId, Param>,
+    ufuncs: IndexVec<UFuncId, UserFunc>,
+    ufunc_params: IndexVec<UFuncId, ParamId>,
+    queries: IndexVec<QueryId, ObjRef<QUERY>>,
     locals: IndexVec<LocalId, LocalSlot>,
+    objs: HashMap<ObjRef, u32>,
     // TODO: remove the following tmp_* fields and use ccx.tmp instead:
     tmp_ins: Vec<InsId>,
     tmp_vty: Vec<Type>, // for emitvarvalue
     tmp_ty: Vec<Type>, // for expressions
     // current function:
-    func: Access<Func, F>,
-    tab: BumpRef<Tab>,
+    func: Func,
+    ufunc: IndexOption<UFuncId>,
+    tab: TabId,
     check: IndexOption<InsId>
 }
 
 // for emit*
-pub type Lcx<'a, 'b, 'c> = Ccx<Lower<R<'a>, R<'b>>, R<'c>>;
+pub type Lcx<'a> = Ccx<Lower, R<'a>>;
 
 // for callx (&mut Lcx -> &mut CLcx is ok because &mut T -> &mut UnsafeCell<T> is ok).
 // the point of this is to tell the compiler that emitcallx won't replace the current stage data.
@@ -229,6 +224,63 @@ const INS_ENTRY: InsId = zerocopy::transmute!(0u16);
 const INS_FLATIDX: InsId = zerocopy::transmute!(1u16);
 
 /* ---- Initialization ------------------------------------------------------ */
+
+struct Returns;
+struct Args;
+struct SignatureBuilder<'a, State> {
+    pub func: &'a mut Func,
+    _marker: PhantomData<fn(&State)>
+}
+
+impl SignatureBuilder<'_, Returns> {
+
+    fn new(func: &mut Func) -> SignatureBuilder<'_, Returns> {
+        debug_assert!(func.phis.is_empty());
+        SignatureBuilder { func, _marker: PhantomData }
+    }
+
+}
+
+impl<T> SignatureBuilder<'_, T> {
+
+    fn add(self, ty: Type) -> Self {
+        self.func.phis.push(Phi::new(ty));
+        self
+    }
+
+    fn maybe_add_idx(self, scl: SizeClass) -> Self {
+        match scl {
+            SizeClass::GLOBAL => self,
+            _ => self.add(IRT_IDX)
+        }
+    }
+
+    fn add_decomposition(self, objs: &Objects, idx: ObjRef, work: &mut Bump) -> Self {
+        let base = work.end();
+        let deco = decomposition(objs, idx, work);
+        self.func.phis.extend(deco.iter().cloned().map(Phi::new));
+        work.truncate(base);
+        self
+    }
+
+}
+
+impl<'a> SignatureBuilder<'a, Returns> {
+
+    fn finish_returns(self) -> SignatureBuilder<'a, Args> {
+        self.func.ret = self.func.phis.end();
+        SignatureBuilder { func: self.func, _marker: PhantomData }
+    }
+
+}
+
+impl<'a> SignatureBuilder<'a, Args> {
+
+    fn finish_args(self) {
+        self.func.arg = self.func.phis.end();
+    }
+
+}
 
 fn sizeclass(objs: &Objects, tab: ObjRef<TAB>) -> SizeClass {
     match objs.dim(tab) {
@@ -249,32 +301,26 @@ fn isscalarann(objs: &Objects, ann: ObjRef) -> bool {
     objs[toann(objs, ann)].op == Obj::TPRI
 }
 
-fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
+fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) -> TabId {
     let axes = &ctx.objs[obj.shape].fields;
-    ctx.data.bump.push(Tab {
-        func: ctx.ir.funcs.end(),
-        n: axes.len() as _,
-        _pad: 0,
-        axes: []
-    });
     let mut ret: PhiId = 1.into();
     let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)),
         DebugSource::new(idx, EnumSet::empty()));
-    let mut sig = func.build_signature().add_return(IRT_IDX);
+    let mut sig = SignatureBuilder::new(&mut func).add(IRT_IDX);
     for &size in axes {
         let rank = match ctx.objs[ctx.objs[size].ann].op {
-            Obj::TPRI | Obj::TTUP => Axis::SCALAR,
-            _ => Axis::VECTOR
+            Obj::TPRI | Obj::TTUP => Rank::Scalar,
+            _ => Rank::Vector
         };
-        ctx.data.bump.push(Axis { size, ret, rank, _pad: 0 });
+        ctx.data.axes.push(Axis { size, ret, rank });
         match rank {
-            Axis::SCALAR => {
-                sig = sig.add_return(IRT_IDX);
+            Rank::Scalar => {
+                sig = sig.add(IRT_IDX);
                 ret += 1;
             },
-            _ /* VECTOR */ => {
+            Rank::Vector => {
                 // forward + backward lookup tables:
-                sig = sig.add_return(Type::PTR).add_return(Type::PTR);
+                sig = sig.add(Type::PTR).add(Type::PTR);
                 ret += 2;
             }
         }
@@ -282,61 +328,61 @@ fn createtab(ctx: &mut Ccx<Lower, R>, idx: ObjRef<TAB>, obj: &TAB) {
     sig.finish_returns().finish_args();
     let fid = ctx.ir.funcs.push(func);
     trace!(LOWER "TAB {:?} func: {:?}", idx, fid);
+    let axes_end = ctx.data.axes.end();
+    ctx.data.tab_axes.push(axes_end);
+    ctx.data.tab_func.push(fid)
 }
 
 fn makeinitfunc(ir: &mut IR, obj: ObjRef, flags: EnumSet<DebugFlag>) {
     let mut func = Func::new(FuncKind::Chunk(Chunk::new(SizeClass::GLOBAL)),
         DebugSource::new(obj, flags | DebugFlag::INIT));
-    func.build_signature().add_return(Type::FX).finish_returns().finish_args();
+    SignatureBuilder::new(&mut func)
+        .add(Type::FX)
+        .finish_returns()
+        .finish_args();
     ir.funcs.push(func);
 }
 
-fn maybeidxarg(
-    mut sig: SignatureBuilder<'_, ir::Args>,
-    scl: SizeClass
-) -> SignatureBuilder<'_, ir::Args> {
-    if scl != SizeClass::GLOBAL {
-        sig = sig.add_arg(IRT_IDX);
-    }
-    sig
-}
-
-fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) {
+fn createvar(ctx: &mut Ccx<Lower, R>, idx: ObjRef<VAR>, var: &VAR) -> VarId {
     let lower = &mut *ctx.data;
-    let base = ctx.ir.funcs.end();
-    lower.bump.push(Var {
+    let fbase = ctx.ir.funcs.end();
+    let id = lower.vars.push(Var {
         obj: idx.cast(),
-        tab: lower.objs[&var.tab.erase()].cast(),
-        base,
-        n: 0, // will be used as a counter for vsets
-        _pad: 0,
-        value: []
+        tab: zerocopy::transmute!(lower.objs[&var.tab.erase()] as u16),
+        base: fbase
     });
-    lower.bump.reserve_dst::<[VSet]>(var.mark as _);
+    // reserve vset lists, updated in createmod
+    lower.var_vsets_idx.push(lower.var_vsets.len() as _);
+    lower.var_vsets.extend(repeat_n::<VSetId>(VSetId::INVALID.into(), var.mark as _));
     let scl = sizeclass(&ctx.objs, var.tab);
     // value:
-    {
+    ctx.ir.funcs.push({
         let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
             DebugSource::new(idx, DebugFlag::VALUE));
-        let mut sig = func.build_signature();
-        for &ty in decomposition__old(&ctx.objs, var.ann, &mut lower.tmp_ty) {
-            sig = sig.add_return(ty);
-        }
-        maybeidxarg(sig.finish_returns(), scl).finish_args();
-        ctx.ir.funcs.push(func);
-    }
+        SignatureBuilder::new(&mut func)
+            .add_decomposition(&ctx.objs, var.ann, &mut ctx.tmp)
+            .finish_returns()
+            .maybe_add_idx(scl)
+            .finish_args();
+        func
+    });
     // value.init:
     makeinitfunc(&mut ctx.ir, idx.erase(), DebugFlag::VALUE.into());
     // arm:
-    {
+    ctx.ir.funcs.push({
         let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
             DebugSource::new(idx, EnumSet::empty()));
-        maybeidxarg(func.build_signature().add_return(IRT_ARM).finish_returns(), scl).finish_args();
-        ctx.ir.funcs.push(func);
-    }
+        SignatureBuilder::new(&mut func)
+            .add(IRT_ARM)
+            .finish_returns()
+            .maybe_add_idx(scl)
+            .finish_args();
+        func
+    });
     // arm.init
     makeinitfunc(&mut ctx.ir, idx.erase(), EnumSet::empty());
-    trace!(LOWER "VAR {:?} value: {:?}[{:?}] arm: {:?}[{:?}]", idx, base, base+1, base+2, base+3);
+    trace!(LOWER "VAR {:?} value: {:?}[{:?}] arm: {:?}[{:?}]", idx, fbase, fbase+1, fbase+2, fbase+3);
+    id
 }
 
 fn iterflatidx<'a>(
@@ -381,123 +427,178 @@ fn isprefixidx(objs: &Objects, source: ObjRef<TAB>, vset: &VSET) -> bool {
     objs.allequal(cast_args(sax), cast_args(&tax[..sdim]))
 }
 
-fn issimplemod(objs: &Objects, model: &MOD) -> bool {
-    let &[vset] = &model.outputs else { return false };
+fn issimplemod(objs: &Objects, model: &MOD) -> ModType {
+    let &[vset] = &model.outputs else { return ModType::Complex };
     let vset = &objs[vset];
-    if !vset.idx.is_empty() { return false };
-    objs[vset.var].tab == model.tab
+    if !vset.idx.is_empty() { return ModType::Complex };
+    if objs[vset.var].tab != model.tab { return ModType::Complex };
+    ModType::Simple
 }
 
-fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) {
+fn createmod(ctx: &mut Ccx<Lower, R>, idx: ObjRef<MOD>, obj: &MOD) -> ModId {
     let lower = &mut *ctx.data;
-    let mt = match issimplemod(&ctx.objs, obj) { true => Mod::SIMPLE, false => Mod::COMPLEX };
-    let base = ctx.ir.funcs.end();
-    let model: BumpRef<Mod> = lower.bump.push(Mod {
+    let mt = issimplemod(&ctx.objs, obj);
+    let fbase = ctx.ir.funcs.end();
+    let id = lower.models.push(Mod {
         obj: idx,
-        tab: lower.objs[&obj.tab.erase()].cast(),
-        base,
-        n: obj.outputs.len() as _,
+        tab: zerocopy::transmute!(lower.objs[&obj.tab.erase()] as u16),
+        base: fbase,
         mt,
-        outputs: []
-    }).cast();
+    });
     // create vsets
     let mut ret: PhiId = 0.into();
     for (i, &setter) in obj.outputs.iter().enumerate() {
         let vset = &ctx.objs[setter];
-        let var = lower.objs[&vset.var.erase()].cast();
+        let var: VarId = zerocopy::transmute!(lower.objs[&vset.var.erase()]);
         let ann = vsettype(&ctx.objs, idx, i);
-        let vst = if mt == Mod::SIMPLE {
-            VSet::SIMPLE
-        } else if isprefixidx(&ctx.objs, obj.tab, vset) && {
-            // TODO: the current code assumes that the value is rectangular,
-            // but the optimization itself doesn't necessarily require it, non-rectangular values
-            // just require more logic when storing/loading.
-            let vann = ctx.objs[vset.var].ann;
-            ann == vann
-                || (ctx.objs[ann].op == Obj::TTEN && ctx.objs[ann.cast::<TTEN>()].elem == vann)
-        } {
-            VSet::PREFIX
-        } else {
-            VSet::COMPLEX
+        let vst = match mt {
+            ModType::Simple => VSetType::Simple,
+            ModType::Complex => {
+                if isprefixidx(&ctx.objs, obj.tab, vset) && {
+                    // TODO: the current code assumes that the value is rectangular,
+                    // but the optimization itself doesn't necessarily require it, non-rectangular values
+                    // just require more logic when storing/loading.
+                    let vann = ctx.objs[vset.var].ann;
+                    ann == vann
+                        || (ctx.objs[ann].op == Obj::TTEN && ctx.objs[ann.cast::<TTEN>()].elem == vann)
+                } {
+                    VSetType::Prefix
+                } else {
+                    VSetType::Complex
+                }
+            }
         };
-        let ptr = lower.bump.push(VSet { model, var, ret, vst, idx: i as _ });
-        let vn = lower.bump[var].n;
-        lower.bump[var].n = vn+1;
-        lower.bump[
-            var.cast::<Var<()>>()
-                .offset(1)
-                .cast::<BumpRef<VSet>>()
-                .offset(vn as _)
-        ] = ptr;
+        let vsetid = lower.vsets.push(VSet { model: id, var, ret, vst });
+        lower.var_vsets[lower.var_vsets_idx[var+1] as usize] = vsetid;
+        lower.var_vsets_idx[var+1] += 1;
         // note: for var definitions we don't actually need the last dimension sizes (at least for
         // PREFIX models), but they are included here for simpler codegen when forwarding to the
         // model. the optimizer is going to delete them anyway.
         ret += decomposition_size(&ctx.objs, ann) as isize;
     }
+    lower.model_outputs.push(lower.vsets.end());
     // create functions for complex models only
-    if mt == Mod::COMPLEX {
+    if mt == ModType::Complex {
         let scl = sizeclass(&ctx.objs, obj.tab);
         // value:
-        {
+        ctx.ir.funcs.push({
             let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
                 DebugSource::new(idx, DebugFlag::VALUE));
-            let mut sig = func.build_signature();
-            let base = ctx.tmp.end();
-            for &mut ty in decomposition(&ctx.objs, ctx.objs[obj.value].ann, &mut ctx.tmp) {
-                sig = sig.add_return(ty);
-            }
-            ctx.tmp.truncate(base);
-            maybeidxarg(sig.finish_returns(), scl).finish_args();
-            ctx.ir.funcs.push(func);
-        }
+            SignatureBuilder::new(&mut func)
+                .add_decomposition(&ctx.objs, ctx.objs[obj.value].ann, &mut ctx.tmp)
+                .finish_returns()
+                .maybe_add_idx(scl)
+                .finish_args();
+            func
+        });
         // value.init:
         makeinitfunc(&mut ctx.ir, idx.erase(), DebugFlag::VALUE.into());
         // avail
-        {
+        ctx.ir.funcs.push({
             let mut func = Func::new(FuncKind::Chunk(Chunk::new(scl)),
                 DebugSource::new(idx, EnumSet::empty()));
-            maybeidxarg(func.build_signature().add_return(Type::B1).finish_returns(), scl)
+            SignatureBuilder::new(&mut func)
+                .add(Type::B1)
+                .finish_returns()
+                .maybe_add_idx(scl)
                 .finish_args();
-            ctx.ir.funcs.push(func);
-        }
+            func
+        });
         // avail.init:
         makeinitfunc(&mut ctx.ir, idx.erase(), EnumSet::empty());
         trace!(LOWER "MOD {:?} value: {:?}[{:?}] avail: {:?}[{:?}]",
-            idx, base, base+1, base+2, base+3);
+            idx, fbase, fbase+1, fbase+2, fbase+3);
+    }
+    id
+}
+
+fn createufunc(ctx: &mut Ccx<Lower>, idx: ObjRef<FUNC>) -> UFuncId {
+    let lower = &mut *ctx.data;
+    let FUNC { expr, arity, args, .. } = ctx.objs[idx];
+    let fbase = ctx.ir.funcs.end();
+    let id = lower.ufuncs.push(UserFunc { expr, base: ctx.ir.funcs.end(), });
+    let mut ofs: PhiId = decomposition_size(&ctx.objs, expr.erase()).into();
+    for i in 0..arity as usize {
+        lower.params.push(Param { value: ofs, avail: None.into() });
+        ofs += decomposition_size(&ctx.objs, ctx.objs[args.cast::<TTUP>()].elems[i]) as isize;
+    }
+    lower.ufunc_params.push(lower.params.end());
+    // value:
+    ctx.ir.funcs.push({
+        let mut func = Func::new(FuncKind::User, DebugSource::new(idx, DebugFlag::VALUE));
+        SignatureBuilder::new(&mut func)
+            .add_decomposition(&ctx.objs, expr.erase(), &mut ctx.tmp)
+            .finish_returns()
+            .add_decomposition(&ctx.objs, args, &mut ctx.tmp)
+            .finish_args();
+        func
+    });
+    // avail:
+    ctx.ir.funcs.push({
+        let mut func = Func::new(FuncKind::User, DebugSource::new(idx, EnumSet::empty()));
+        SignatureBuilder::new(&mut func)
+            .add(Type::B1)
+            .finish_returns()
+            .finish_args();
+        // reserve space for args
+        func.phis.extend(repeat_n(Phi::new(Type::FX), decomposition_size(&ctx.objs, args)));
+        func
+    });
+    trace!(LOWER "FUNC {:?} value: {:?} avail: {:?}", idx, fbase, fbase+1);
+    id
+}
+
+fn ftoposort(ctx: &mut Ccx<Lower>, idx: ObjRef) {
+    let o = ctx.objs[idx];
+    if o.mark != 0 || (o.op != Obj::FUNC && !Operator::is_expr_raw(o.op)) {
+        return
+    }
+    ctx.objs[idx].mark = 1;
+    for i in o.ref_params() {
+        ftoposort(ctx, zerocopy::transmute!(ctx.objs.get_raw(idx)[1+i]));
+    }
+    if o.op == Obj::FUNC {
+        let p = createufunc(ctx, idx.cast());
+        ctx.data.objs.insert(idx, zerocopy::transmute!(p));
     }
 }
 
 fn collectobjs(ctx: &mut Ccx<Lower>) {
-    // pass 1: count vsets in var.mark
+    ctx.objs.clear_marks();
+    // pass 1: count vsets and toposort functions
     let mut idx = ObjRef::NIL;
     while let Some(i) = ctx.objs.next(idx) {
         idx = i;
-        let obj = ctx.objs[idx];
-        if obj.op == Obj::VSET {
-            let var = ctx.objs[idx.cast::<VSET>()].var;
-            ctx.objs[var].mark += 1;
+        match ctx.objs[idx].op {
+            Obj::VSET => {
+                let var = ctx.objs[idx.cast::<VSET>()].var;
+                ctx.objs[var].mark += 1;
+            },
+            Obj::FUNC => ftoposort(ctx, idx),
+            _ => {}
         }
     }
-    // pass 2: allocate objs and functions (note: depends on objs being in topo order)
+    // pass 2: allocate objs and ir functions (note: depends on objs being in topo order).
     ctx.freeze_graph(|ctx| {
         let objs = Access::borrow(&ctx.objs);
         for (idx, obj) in objs.pairs() {
-            let bp = ctx.data.bump.end().cast_up();
-            match obj {
-                ObjectRef::TAB(tab)   => createtab(ctx, idx.cast(), tab),
-                ObjectRef::VAR(var)   => createvar(ctx, idx.cast(), var),
-                ObjectRef::MOD(model) => createmod(ctx, idx.cast(), model),
-                ObjectRef::FUNC(_)    => todo!(),
+            let p = match obj {
+                ObjectRef::TAB(tab)   => {
+                    let tabid: u16 = zerocopy::transmute!(createtab(ctx, idx.cast(), tab));
+                    tabid as _
+                },
+                ObjectRef::VAR(var)   => zerocopy::transmute!(createvar(ctx, idx.cast(), var)),
+                ObjectRef::MOD(model) => zerocopy::transmute!(createmod(ctx, idx.cast(), model)),
                 ObjectRef::QUERY(_)   => {
-                    // NOP: don't need query data, but include it in the hashmap so that all
-                    // emitted objects can be found by iterating the hashmap.
+                    ctx.data.queries.push(idx.cast());
+                    continue
                 },
                 _ => continue
-            }
-            ctx.data.objs.insert(idx, bp);
+            };
+            ctx.data.objs.insert(idx, p);
         }
     });
-    debug_assert!(ctx.data.objs[&ObjRef::GLOBAL.erase()] == Tab::GLOBAL.cast());
+    debug_assert!(ctx.data.objs[&ObjRef::GLOBAL.erase()] == 0);
 }
 
 /* ---- Emit helpers -------------------------------------------------------- */
@@ -551,16 +652,17 @@ fn newcall(idx: InsId, init: InsId, node: FuncId, inline: bool) -> Ins {
         .set_c(zerocopy::transmute!(node))
 }
 
-fn emitcallvm(lower: &Lower<R, R>, idx: InsId, node: FuncId, inline: bool) -> InsId {
+fn emitcallvm(lower: &Lower, idx: InsId, node: FuncId, inline: bool) -> InsId {
     let func = &lower.func;
     let zero = func.code.push(Ins::KINT(IRT_IDX, 0));
     let knop = func.code.push(Ins::NOP(Type::FX));
-    let callinit = func.code.push(newcall(zero, knop, node+1, lower.bump[lower.tab].n == 0));
+    let tdim = lower.tab_axes[lower.tab+1] - lower.tab_axes[lower.tab];
+    let callinit = func.code.push(newcall(zero, knop, node+1, tdim == 0));
     let init = func.code.push(Ins::RES(Type::FX, callinit, 0.into()));
     func.code.push(newcall(idx, init, node, inline))
 }
 
-fn emitcallvm1(lower: &Lower<R, R>, idx: InsId, node: FuncId) -> InsId {
+fn emitcallvm1(lower: &Lower, idx: InsId, node: FuncId) -> InsId {
     emitcallvm(lower, idx, node, idx == INS_FLATIDX)
 }
 
@@ -604,9 +706,9 @@ fn emitmultistore(
     store
 }
 
-fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var> {
-    objs[&var.erase()].cast()
-}
+// fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var> {
+//     objs[&var.erase()].cast()
+// }
 
 fn alloctensordata(
     lcx: &mut Lcx,
@@ -790,31 +892,31 @@ fn emitloopstore(
 // emit the flat index
 //   tab[i1, ..., iN, 0]
 fn idxftran(
-    lcx: &mut Lcx,
-    tab: &Tab,         // *target* table being indexed
+    lower: &Lower,
+    tab: TabId,        // *target* table being indexed
     call: InsId,       // CALLC(I) of tab
     axis: usize,       // current axis (N)
     flat: InsId        // flat index for current axis (N)
 ) -> InsId {
     // note: if axis=0, then flat is either zero (the only valid index), or one (one past the last
     // valid index)
-    match &tab.axes[axis] {
-        &Axis { rank: Axis::SCALAR, ret, .. } => {
-            let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, call, ret));
-            lcx.data.func.code.push(Ins::MUL(IRT_IDX, flat, size))
+    match &lower.axes[lower.tab_axes[tab] + axis as isize] {
+        &Axis { rank: Rank::Scalar, ret, .. } => {
+            let size = lower.func.code.push(Ins::RES(IRT_IDX, call, ret));
+            lower.func.code.push(Ins::MUL(IRT_IDX, flat, size))
         },
-        &Axis { /* VECTOR */ ret, .. } => {
-            let f = lcx.data.func.code.push(Ins::RES(Type::PTR, call, ret));
-            let ptr = emitarrayptr(&lcx.data.func, f, flat, IRT_IDX);
-            lcx.data.func.code.push(Ins::LOAD(IRT_IDX, ptr))
+        &Axis { rank: Rank::Vector, ret, .. } => {
+            let f = lower.func.code.push(Ins::RES(Type::PTR, call, ret));
+            let ptr = emitarrayptr(&lower.func, f, flat, IRT_IDX);
+            lower.func.code.push(Ins::LOAD(IRT_IDX, ptr))
         }
     }
 }
 
 // forward transform multiple times
 fn idxftrann(
-    lcx: &mut Lcx,
-    tab: &Tab,
+    lower: &Lower,
+    tab: TabId,
     call: InsId,
     start_axis: usize,
     end_axis: usize,
@@ -822,7 +924,7 @@ fn idxftrann(
 ) -> InsId {
     debug_assert!(start_axis <= end_axis);
     for axis in start_axis..end_axis {
-        flat = idxftran(lcx, tab, call, axis, flat);
+        flat = idxftran(lower, tab, call, axis, flat);
     }
     flat
 }
@@ -833,8 +935,8 @@ fn idxftrann(
 //   tab[i1, ..., iN]
 // (the index i{N+1} can be obtained by doing a forward transform and taking the difference)
 fn idxbtran(
-    lcx: &mut Lcx,
-    tab: &Tab,         // *target* table being indexed
+    lower: &Lower,
+    tab: TabId,        // *target* table being indexed
     call: InsId,       // CALLC(I) of tab
     axis: usize,       // current axis (N+1)
     flat: InsId        // flat index for current axis (N+1)
@@ -843,26 +945,27 @@ fn idxbtran(
     if axis == 1 {
         // the only valid flat index for the zeroth axis is zero,
         // therefore back transforming anything to the zeroth axis yields zero.
-        return lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+        return lower.func.code.push(Ins::KINT(IRT_IDX, 0));
     }
-    let Axis { rank, ret, .. } = tab.axes[axis-1];
+    let Axis { rank, ret, .. } = lower.axes[lower.tab_axes[tab] + axis as isize - 1];
     match rank {
-        Axis::SCALAR => {
-            let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, call, ret));
-            lcx.data.func.code.push(Ins::DIV(IRT_IDX, flat, size))
+        Rank::Scalar => {
+            let size = lower.func.code.push(Ins::RES(IRT_IDX, call, ret));
+            lower.func.code.push(Ins::DIV(IRT_IDX, flat, size))
         },
-        _ /* VECTOR */ => {
-            let b = lcx.data.func.code.push(Ins::RES(Type::PTR, call, ret+1));
-            let ptr = emitarrayptr(&lcx.data.func, b, flat, IRT_IDX);
-            lcx.data.func.code.push(Ins::LOAD(IRT_IDX, ptr))
+        Rank::Vector => {
+            let b = lower.func.code.push(Ins::RES(Type::PTR, call, ret+1));
+            let ptr = emitarrayptr(&lower.func, b, flat, IRT_IDX);
+            lower.func.code.push(Ins::LOAD(IRT_IDX, ptr))
         }
     }
 }
 
-fn commonprefixobj(objs: &Objects, a: &Tab, b: &Tab) -> usize {
-    zip(a.axes.iter(), b.axes.iter())
-        .take_while(|(aa, ab)| objs.equal(aa.size.erase(), ab.size.erase()))
-        .count()
+fn commonprefixobj(lcx: &Lcx, a: TabId, b: TabId) -> usize {
+    zip(
+        lcx.data.axes.get_range(lcx.data.tab_axes[a]..lcx.data.tab_axes[a+1]),
+        lcx.data.axes.get_range(lcx.data.tab_axes[b]..lcx.data.tab_axes[b+1]),
+    ) .take_while(|(aa, ab)| lcx.objs.equal(aa.size.erase(), ab.size.erase())).count()
 }
 
 // given tables
@@ -870,35 +973,40 @@ fn commonprefixobj(objs: &Objects, a: &Tab, b: &Tab) -> usize {
 //   B[j1, ..., jM]
 // returns the largest K such that
 //   ik = jk for all 0 <= k < K
-fn commonprefix(lcx: &Lcx, mut a: BumpRef<Tab>, b: BumpRef<Tab>) -> usize {
-    let mut ta = &lcx.data.bump[a];
-    if a == b { return ta.axes.len() };
-    let mut tb = &lcx.data.bump[b];
-    if tb.axes.len() < ta.axes.len() {
-        (a, ta, tb) = (b, tb, ta);
+fn commonprefix(lcx: &Lcx, mut a: TabId, b: TabId) -> usize {
+    let mut da = (lcx.data.tab_axes[a+1] - lcx.data.tab_axes[a]) as usize;
+    if a == b { return da; }
+    let mut db = (lcx.data.tab_axes[b+1] - lcx.data.tab_axes[b]) as usize;
+    if db < da {
+        (a, da, db) = (b, db, da);
     }
-    let adim = ta.axes.len();
-    let bdim = tb.axes.len();
-    if bdim == adim+1 && tb.axes[..adim].iter().all(|x| x.size.is_nil()) {
+    if db == da+1 && lcx.data.axes.get_range(lcx.data.tab_axes[b]..lcx.data.tab_axes[b+1])
+        .iter().all(|a| a.size.is_nil())
+    {
         // explicitly detect:
         //   table A[...]
         //   table B[;...,:,A.var]
         // TODO more sophisticated analysis for this
-        if let ObjectRef::VGET(&VGET { var, idx: [], .. }) = lcx.objs.get(tb.axes[adim].size.erase()) {
+        if let ObjectRef::VGET(&VGET { var, idx: [], .. })
+                = lcx.objs.get(lcx.data.axes[lcx.data.tab_axes[b + da as isize]].size.erase())
+        {
             if let Some(v) = lcx.data.objs.get(&var.erase()) {
-                if lcx.data.bump[v.cast::<Var>()].tab == a {
-                    return adim;
+                if lcx.data.vars[zerocopy::transmute!(*v)].tab == a {
+                    return da;
                 }
             }
         }
     }
-    commonprefixobj(&lcx.objs, ta, tb)
+    commonprefixobj(lcx, a, b)
 }
 
 // do A and B have the exact same shape?
-fn sametab(objs: &Objects, a: &Tab, b: &Tab) -> bool {
-    (a as *const Tab as *const () == b as *const Tab as *const ())
-        || (a.n == b.n && a.n as usize == commonprefixobj(objs, a, b))
+fn sametab(lcx: &Lcx, a: TabId, b: TabId) -> bool {
+    if a == b { return true }
+    let da = (lcx.data.tab_axes[a+1] - lcx.data.tab_axes[a]) as usize;
+    let db = (lcx.data.tab_axes[b+1] - lcx.data.tab_axes[b]) as usize;
+    if da != db { return false }
+    commonprefixobj(lcx, a, b) == da
 }
 
 fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
@@ -914,8 +1022,8 @@ fn emittabcall(func: &Func, tabf: FuncId) -> InsId {
 // (source and target may be equal. if target_axis > source_axis, additional indices are zeros)
 fn idxtransfer(
     lcx: &mut Lcx,
-    source: BumpRef<Tab>,
-    target: BumpRef<Tab>,
+    source: TabId,
+    target: TabId,
     mut source_axis: usize,
     target_axis: usize,
     mut flat: InsId
@@ -924,19 +1032,16 @@ fn idxtransfer(
         return lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
     }
     let prefix = commonprefix(lcx, source, target);
-    let bump = Access::borrow(&lcx.data.bump);
-    let source = &bump[source];
-    let target = &bump[target];
     let sourcecall = match source_axis > min(target_axis, prefix) {
-        true  => emittabcall(&lcx.data.func, source.func),
+        true  => emittabcall(&lcx.data.func, lcx.data.tab_func[source]),
         false => InsId::INVALID.into()
     };
     let targetcall = match target_axis > min(source_axis, prefix) {
-        true  => emittabcall(&lcx.data.func, target.func),
+        true  => emittabcall(&lcx.data.func, lcx.data.tab_func[target]),
         false => InsId::INVALID.into()
     };
     while source_axis > target_axis {
-        flat = idxbtran(lcx, source, sourcecall, source_axis, flat);
+        flat = idxbtran(&lcx.data, source, sourcecall, source_axis, flat);
         source_axis -= 1;
     }
     if source_axis > prefix {
@@ -947,9 +1052,9 @@ fn idxtransfer(
         let source_axis0 = source_axis;
         let mut base = reserve(&lcx.data.func, source_axis-prefix);
         while source_axis > prefix {
-            let prev = idxbtran(lcx, source, sourcecall, source_axis, flat);
+            let prev = idxbtran(&lcx.data, source, sourcecall, source_axis, flat);
             source_axis -= 1;
-            let start = idxftran(lcx, source, sourcecall, source_axis, prev);
+            let start = idxftran(&lcx.data, source, sourcecall, source_axis, prev);
             lcx.data.func.code.set(
                 base + (source_axis-prefix) as isize,
                 Ins::SUB(IRT_IDX, flat, start)
@@ -957,14 +1062,14 @@ fn idxtransfer(
             flat = prev;
         }
         while source_axis < source_axis0 {
-            flat = idxftran(lcx, target, targetcall, source_axis, flat);
+            flat = idxftran(&lcx.data, target, targetcall, source_axis, flat);
             flat = lcx.data.func.code.push(Ins::ADD(IRT_IDX, flat, base));
             base += 1;
             source_axis += 1;
         }
     }
     if source_axis < target_axis {
-        flat = idxftrann(lcx, target, targetcall, source_axis, target_axis, flat);
+        flat = idxftrann(&lcx.data, target, targetcall, source_axis, target_axis, flat);
     }
     flat
 }
@@ -975,7 +1080,7 @@ fn idxtransfer(
 //   i{target_axis}
 fn axisidx(
     lcx: &mut Lcx,
-    tab: BumpRef<Tab>,
+    tab: TabId,
     source_axis: usize,
     target_axis: usize,
     flat: InsId
@@ -986,20 +1091,20 @@ fn axisidx(
         // 1: index is `flat-0`
         return flat;
     }
-    let bump = Access::borrow(&lcx.data.bump);
-    let tab = &bump[tab];
-    let call = emittabcall(&lcx.data.func, tab.func);
-    let back = idxbtran(lcx, tab, call, target_axis, flat);
-    let fwd = idxftran(lcx, tab, call, target_axis-1, back);
+    let call = emittabcall(&lcx.data.func, lcx.data.tab_func[tab]);
+    let back = idxbtran(&lcx.data, tab, call, target_axis, flat);
+    let fwd = idxftran(&lcx.data, tab, call, target_axis-1, back);
     lcx.data.func.code.push(Ins::SUB(IRT_IDX, flat, fwd))
 }
 
 // given a target table and an index expression
 //   tab[i1, ..., iN]
 // return true iff instances of the source table will NOT select overlapping indices.
-fn isdisjointidx(source: &Tab, target: &Tab, idx: &[ObjRef<EXPR>]) -> bool {
+fn isdisjointidx(lower: &Lower, source: TabId, target: TabId, idx: &[ObjRef<EXPR>]) -> bool {
     // TODO: analyze explicit indices
-    source.n <= target.n && idx.len() <= (target.n-source.n) as usize
+    let dsource = (lower.tab_axes[source+1] - lower.tab_axes[source]) as usize;
+    let dtarget = (lower.tab_axes[target+1] - lower.tab_axes[target]) as usize;
+    dsource <= dtarget && idx.len() <= dtarget-dsource
 }
 
 // return the number of implicit prefix dimensions when indexing from a `source_dim`-dimensional
@@ -1020,31 +1125,31 @@ fn emitshapelen(func: &Func, base: InsId, dim: usize) -> InsId {
 }
 
 fn emitsplatbounds(
-    lcx: &mut Lcx,
-    tab: &Tab,
+    lower: &Lower,
+    tab: TabId,
     flat: InsId,
     call: InsId,
     start_axis: usize,
     end_axis: usize,
 ) -> (InsId, InsId) {
-    let one = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 1));
-    let end = lcx.data.func.code.push(Ins::ADD(IRT_IDX, flat, one));
-    let start = idxftrann(lcx, tab, call, start_axis, end_axis, flat);
-    let end = idxftrann(lcx, tab, call, start_axis, end_axis, end);
+    let one = lower.func.code.push(Ins::KINT(IRT_IDX, 1));
+    let end = lower.func.code.push(Ins::ADD(IRT_IDX, flat, one));
+    let start = idxftrann(lower, tab, call, start_axis, end_axis, flat);
+    let end = idxftrann(lower, tab, call, start_axis, end_axis, end);
     (start, end)
 }
 
 fn emitsplatloop(
-    lcx: &mut Lcx,
+    lower: &Lower,
     loop_: &mut Loop,
-    tab: &Tab,
+    tab: TabId,
     flat: InsId,
     call: InsId,
     axis: usize,
     endaxis: usize,
 ) -> InsId {
-    let (start, end) = emitsplatbounds(lcx, tab, flat, call, axis, endaxis);
-    emitrangeloop(&lcx.data.func, loop_, IRT_IDX, start, end)
+    let (start, end) = emitsplatbounds(lower, tab, flat, call, axis, endaxis);
+    emitrangeloop(&lower.func, loop_, IRT_IDX, start, end)
 }
 
 /* ---- Expressions --------------------------------------------------------- */
@@ -1124,9 +1229,14 @@ impl<'b> Visit<'_, 'b> {
 }
 
 fn isnoniterable(op: u8) -> bool {
+    use Operator::*;
     // TODO: make LET/LGET iterable
-    (Operator::CAT|Operator::LET|Operator::LGET|Operator::GET|Operator::LOAD|Operator::CALLX)
-        .as_u64_truncated() & (1 << op) != 0
+    (CAT|LET|LGET|APPLY|PGET|LOAD|CALL).as_u64_truncated() & (1 << op) != 0
+}
+
+fn alwaysmaterialize(op: u8) -> bool {
+    use Operator::*;
+    (PGET|APPLY|TGET).as_u64_truncated() & (1 << op) != 0
 }
 
 fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
@@ -1143,8 +1253,14 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         visitexpr(lcx, expr, Visit::None(&mut slot.ctr));
         return
     }
+    if let Visit::Shape(slot) = visit.reborrow_mut() && alwaysmaterialize(lcx.objs[expr].op) {
+        let value = emitexprv(lcx, expr, &mut slot.ctr);
+        slot.value = extractshape(&lcx.objs, value, &lcx.objs[lcx.objs[expr].ann.cast()]);
+        return
+    }
     if let Visit::None(ctr) = visit.reborrow_mut()
-        && (Operator::VGET|Operator::LET).as_u64_truncated() & (1 << lcx.objs[expr].op) == 0
+        && (Operator::VGET|Operator::LET|Operator::APPLY).as_u64_truncated()
+            & (1 << lcx.objs[expr].op) == 0
     {
         let objs = Access::borrow(&lcx.objs);
         let raw = objs.get_raw(expr.erase());
@@ -1161,9 +1277,6 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         Obj::KINT|Obj::KINT64|Obj::KFP64|Obj::KSTR => {
             visit.unwrap_materialize().value = emitk(lcx, expr)
         },
-        Obj::DIM => {
-            visit.unwrap_materialize().value = emitdim(lcx, expr.cast())
-        },
         Obj::LEN => {
             let slot = visit.unwrap_materialize();
             slot.value = emitlen(lcx, expr.cast(), &mut slot.ctr);
@@ -1171,14 +1284,16 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         Obj::LET => visitlet(lcx, expr.cast(), visit),
         Obj::LGET => visitlget(lcx, expr.cast(), visit),
         Obj::VGET => visitvget(lcx, expr.cast(), visit),
+        Obj::APPLY => visitapply(lcx, expr.cast(), visit),
+        Obj::PGET => visit.unwrap_materialize().value = emitpget(lcx, expr.cast()),
         Obj::CAT => visitcat(lcx, expr.cast(), visit),
         Obj::IDX => todo!(),
         Obj::BINOP => visitbinop(lcx, expr.cast(), visit),
         Obj::INTR => visitintrinsic(lcx, expr.cast(), visit),
         Obj::LOAD => visitload(lcx, expr.cast(), visit),
         Obj::NEW => visitnew(lcx, expr.cast(), visit),
-        Obj::GET => visitget(lcx, expr.cast(), visit),
-        Obj::CALLX => visitcallx(lcx, expr.cast(), visit),
+        Obj::TGET => visittget(lcx, expr.cast(), visit.unwrap_materialize()),
+        Obj::CALL => visitcallx(lcx, expr.cast(), visit),
         _ => unreachable!()
     }
 }
@@ -1335,10 +1450,9 @@ fn emitk(lcx: &mut Lcx, expr: ObjRef<EXPR>) -> InsId {
     }
 }
 
-fn emitdim(lcx: &mut Lcx, expr: ObjRef<DIM>) -> InsId {
-    let source = lcx.data.bump[lcx.data.tab].axes.len();
-    let axis = lcx.objs[expr].axis;
-    axisidx(lcx, lcx.data.tab, source, (axis+1) as _, INS_FLATIDX)
+fn emitdim(lcx: &mut Lcx, axis: usize) -> InsId {
+    let source = lcx.data.tab_axes[lcx.data.tab+1] - lcx.data.tab_axes[lcx.data.tab];
+    axisidx(lcx, lcx.data.tab, source as _, (axis+1) as _, INS_FLATIDX)
 }
 
 fn emitlen(lcx: &mut Lcx, expr: ObjRef<LEN>, ctr: &mut InsId) -> InsId {
@@ -1434,11 +1548,13 @@ struct VGETIdx {
     _pad: [u8; 2]
 }
 
-fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<VGETIdx>) {
+fn vgetidx(lower: &Lower, objs: &Objects, vget: &VGET, buf: &mut Bump<VGETIdx>) {
     let base = buf.end();
-    let var = vardata(&lower.objs, vget.var);
-    let target = &lower.bump[lower.bump[var].tab];
-    let mut taxis = prefixlen(lower.bump[lower.tab].axes.len(), target.axes.len(), vget.dim as _);
+    let var: VarId = zerocopy::transmute!(lower.objs[&vget.var.erase()]);
+    let target = lower.vars[var].tab;
+    let source_dim = (lower.tab_axes[lower.tab+1] - lower.tab_axes[lower.tab]) as usize;
+    let target_dim = (lower.tab_axes[target+1] - lower.tab_axes[target]) as usize;
+    let mut taxis = prefixlen(source_dim, target_dim, vget.dim as _);
     let mut span = 0;
     let mut oaxis = 0;
     for &expr in &vget.idx {
@@ -1490,7 +1606,7 @@ fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<VGET
         }
     }
     debug_assert!(span == 0);
-    while taxis < target.axes.len() {
+    while taxis < target_dim {
         let (_, idx) = buf.reserve::<VGETIdx>();
         idx.expr = ObjRef::NIL.cast();
         idx.value = None.into();
@@ -1509,9 +1625,11 @@ fn vgetidx(lower: &Lower<R, R>, objs: &Objects, vget: &VGET, buf: &mut Bump<VGET
         let mut onest = 0;
         debug_assert!(oaxis >= ann.dim as _);
         for i in &mut buf[base..] {
-            let scalar = target.axes[i.axis as usize..(i.axis+i.span) as usize]
+            let axes = lower.tab_axes[target] + i.axis as isize
+                ..(lower.tab_axes[target] + (i.axis+i.span) as isize);
+            let scalar = lower.axes.get_range(axes)
                 .iter()
-                .all(|a| a.rank == Axis::SCALAR);
+                .all(|a| a.rank == Rank::Scalar);
             i.scalar_axis = scalar as _;
             if i.oaxis == offset+ann.dim {
                 offset = i.oaxis;
@@ -1581,7 +1699,7 @@ fn emitvgets(
     mut end: BumpRef<VGETIdx>,
     outshape: InsId, // must have reserved one slot per `oaxis`
     call: InsId,
-    target: &Tab,
+    target: TabId
 ) -> IndexOption<InsId> {
     debug_assert!(start < end);
     debug_assert!(lcx.tmp[start..end].iter().all(|i| i.nest == lcx.tmp[start].nest));
@@ -1601,7 +1719,7 @@ fn emitvgets(
                 (None, &VGETIdx { scalar_expr: 1, .. }) => continue,
                 (Some((flat, _)), &VGETIdx { value, axis, span, scalar_expr: 1, .. }) => {
                     let [nextflat] = areserve(&lcx.data.func);
-                    let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, nextflat);
+                    let baseflat = idxftrann(&lcx.data, target, call, axis as _, (axis+span) as _, nextflat);
                     lcx.data.func.code.set(replace(flat, nextflat),
                         Ins::ADD(IRT_IDX, baseflat, value.unwrap()));
                     continue
@@ -1610,11 +1728,12 @@ fn emitvgets(
                 (None, &VGETIdx { expr, value, .. }) if value.is_some() =>
                     extractshape(objs, value.raw, &objs[objs[expr].ann.cast()]),
                 (None, &VGETIdx { axis, span, scalar_axis: 1, .. }) => {
+                    let target_axes = lcx.data.tab_axes[target];
                     let mut size = lcx.data.func.code.push(
-                        Ins::RES(IRT_IDX, call, target.axes[axis as usize].ret));
+                        Ins::RES(IRT_IDX, call, lcx.data.axes[target_axes+axis as isize].ret));
                     for i in 1..span {
                         let s = lcx.data.func.code.push(
-                            Ins::RES(IRT_IDX, call, target.axes[(axis+i) as usize].ret));
+                            Ins::RES(IRT_IDX, call, lcx.data.axes[target_axes + i as isize].ret));
                         size = lcx.data.func.code.push(Ins::MUL(IRT_IDX, size, s));
                     }
                     size
@@ -1623,7 +1742,7 @@ fn emitvgets(
                     debug_assert!(innerloop.is_none());
                     debug_assert!(oaxis == 0);
                     let [flat] = areserve(&lcx.data.func);
-                    let (start, end) = emitsplatbounds(lcx, target, flat, call, axis as _,
+                    let (start, end) = emitsplatbounds(&lcx.data, target, flat, call, axis as _,
                         (axis+span) as _);
                     let num = lcx.data.func.code.push(Ins::SUB(IRT_IDX, end, start));
                     prefix = Some((flat, num));
@@ -1635,13 +1754,13 @@ fn emitvgets(
                     let mut loop_ = newloop(&lcx.data.func);
                     let j = match expr.is_nil() {
                         true => {
-                            let j = emitsplatloop(lcx, &mut loop_, target, nextflat, call, axis as _,
-                                (axis+span) as _);
+                            let j = emitsplatloop(&lcx.data, &mut loop_, target, nextflat, call,
+                                axis as _, (axis+span) as _);
                             Ins::MOV(IRT_IDX, j)
                         },
                         false => {
-                            let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _,
-                                nextflat);
+                            let baseflat = idxftrann(&lcx.data, target, call, axis as _,
+                                (axis+span) as _, nextflat);
                             let j = emittensorloop(lcx, &mut loop_, &objs[objs[expr].ann.cast()],
                                 value.unwrap());
                             Ins::ADD(IRT_IDX, baseflat, j)
@@ -1697,7 +1816,7 @@ fn emitvgetvc(
     flat: &mut InsId,
     innerloop: &mut Option<(/*start:*/Ins, /*out:*/InsId)>,
     call: InsId,
-    target: &Tab,
+    target: TabId
 ) {
     debug_assert!(start < end);
     let objs = Access::borrow(&lcx.objs);
@@ -1715,7 +1834,7 @@ fn emitvgetvc(
         let [nextflat] = areserve(&lcx.data.func);
         let j = match lcx.tmp[end] {
             VGETIdx { value, axis, span, scalar_expr: 1, .. } => {
-                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _, nextflat);
+                let baseflat = idxftrann(&lcx.data, target, call, axis as _, (axis+span) as _, nextflat);
                 Ins::ADD(IRT_IDX, baseflat, value.unwrap())
             },
             VGETIdx { value, expr, scalar_expr, mut axis, mut span, .. } => {
@@ -1731,13 +1850,13 @@ fn emitvgetvc(
                         let mut loop_ = newloop(&lcx.data.func);
                         let j = match expr.is_nil() {
                             true => {
-                                let j = emitsplatloop(lcx, &mut loop_, target, nextflat, call, axis as _,
-                                    (axis+span) as _);
+                                let j = emitsplatloop(&lcx.data, &mut loop_, target, nextflat, call,
+                                    axis as _, (axis+span) as _);
                                 Ins::MOV(IRT_IDX, j)
                             },
                             false => {
-                                let baseflat = idxftrann(lcx, target, call, axis as _, (axis+span) as _,
-                                nextflat);
+                                let baseflat = idxftrann(&lcx.data, target, call, axis as _,
+                                    (axis+span) as _, nextflat);
                                 let j = emittensorloop(lcx, &mut loop_, &objs[objs[expr].ann.cast()],
                                     value.raw);
                                 Ins::ADD(IRT_IDX, baseflat, j)
@@ -1819,21 +1938,21 @@ fn emitvgetvc(
 //   (3) VGET and VSET indices match,
 //   (4) the model is COMPLEX
 // then the VGET can be forwarded to load directly from the VSET
-fn maybefwdvget(lcx: &Lcx, vget: &VGET) -> Option<BumpRef<VSet>> {
+fn maybefwdvget(lcx: &Lcx, vget: &VGET) -> IndexOption<VSetId> {
     let lower = &*lcx.data;
-    let var = &lower.bump[vardata(&lower.objs, vget.var)];
-    let [vv] = var.value else { return None };
-    let vset = &lower.bump[vv];
-    let model = &lower.bump[vset.model];
-    if lower.bump[vset.model].mt != Mod::COMPLEX { return None };
+    let var: VarId = zerocopy::transmute!(lower.objs[&vget.var.erase()]);
+    if lower.var_vsets_idx[var+1] != lower.var_vsets_idx[var]+1 { return None.into() }
+    let vset = lower.var_vsets[lower.var_vsets_idx[var] as usize];
+    let mid = lower.vsets[vset].model;
+    let model = &lower.models[mid];
+    if model.mt != ModType::Complex { return None.into() }
     // TODO: this check can be relaxed, just need to translate index.
-    if !sametab(&lcx.objs, &lower.bump[lower.tab], &lower.bump[model.tab])
-        || !lcx.objs.allequal(cast_args(&vget.idx),
-            cast_args(&lcx.objs[lcx.objs[model.obj].outputs[vset.idx as usize]].idx))
+    if !sametab(lcx, lower.tab, model.tab) || !lcx.objs.allequal(cast_args(&vget.idx),
+            cast_args(&lcx.objs[lcx.objs[model.obj].outputs[(vset-lower.model_outputs[mid]) as usize]].idx))
     {
-        return None
+        return None.into()
     }
-    Some(vv)
+    Some(vset).into()
 }
 
 fn maybefusevget(idx: &[VGETIdx]) -> Option<usize> {
@@ -1859,26 +1978,25 @@ fn visitvgetinner(
     ann: ObjRef,
     var: ObjRef<VAR>,
     inline: bool,
-    fwdload: Option<BumpRef<VSet>> // TODO: deduce it here
+    fwdload: IndexOption<VSetId> // TODO: deduce it here
 ) -> InsId {
     debug_assert!(!visit.is_iterate());
-    let bump = Access::borrow(&lcx.data.bump);
     let objs = Access::borrow(&lcx.objs);
-    let vdata = vardata(&lcx.data.objs, var);
-    let target = &bump[bump[vdata].tab];
+    let vid: VarId = zerocopy::transmute!(lcx.data.objs[&var.erase()]);
+    let target = lcx.data.vars[vid].tab;
     let isscalarload = ann == objs[var].ann;
     let mut outerloop = None;
     emitvgetidx(lcx, visit.head(), start, end, &mut outerloop);
     let [mut flat] = areserve(&lcx.data.func);
-    let mut cc: IndexOption<InsId> = match (lcx.data.check.is_some(), fwdload) {
+    let mut cc: IndexOption<InsId> = match (lcx.data.check.is_some(), fwdload.unpack()) {
         (true, Some(vset)) => {
-            let base = bump[bump[vset].model].base;
+            let base = lcx.data.models[lcx.data.vsets[vset].model].base;
             let call = emitcallvm(&lcx.data, flat, base + Mod::SUB_AVAIL, inline);
             let cond = lcx.data.func.code.push(Ins::RES(Type::B1, call, 0.into()));
             Some(cond)
         },
         (true, None) => {
-            let base = bump[vdata].base;
+            let base = lcx.data.vars[vid].base;
             let call = emitcallvm(&lcx.data, flat, base + Var::SUB_ARM, inline);
             let arm = lcx.data.func.code.push(Ins::RES(IRT_ARM, call, 0.into()));
             let none = lcx.data.func.code.push(Ins::KINT(IRT_ARM, !0));
@@ -1895,13 +2013,15 @@ fn visitvgetinner(
         || (visit.is_shape() && isscalarload && eds > 0)
     {
         true => {
-            let (func, ty, ret) = match fwdload {
+            let (func, ty, ret) = match fwdload.unpack() {
                 Some(vset) => {
-                    let VSet { ret, idx, model, .. } = bump[vset];
-                    (bump[model].base + Mod::SUB_VALUE, vsettype(objs, bump[model].obj, idx as _), ret)
+                    let VSet { ret, model, .. } = lcx.data.vsets[vset];
+                    let Mod { base, obj, .. } = lcx.data.models[model];
+                    let idx = vset - lcx.data.model_outputs[model];
+                    ( base + Mod::SUB_VALUE, vsettype(objs, obj, idx as _), ret)
                 },
                 None => {
-                    let Var { base, obj, .. } = bump[vdata];
+                    let Var { base, obj, .. } = lcx.data.vars[vid];
                     (base + Var::SUB_VALUE, obj.erase(), 0.into())
                 }
             };
@@ -1929,13 +2049,13 @@ fn visitvgetinner(
             Visit::Iterate(_) => unreachable!()
         }
         if (cc.is_some() || vload.is_some()) && start < end {
-            let tcall = emittabcall(&lcx.data.func, target.func);
+            let tcall = emittabcall(&lcx.data.func, lcx.data.tab_func[target]);
             emitvgetvc(lcx, start, end, None, &mut outerloop, &mut cc, &mut flat, &mut None, tcall,
                 target);
         }
     } else {
         let mut innerloop: Option<(/*start:*/Ins, /*out:*/InsId)> = None;
-        let tcall = emittabcall(&lcx.data.func, target.func);
+        let tcall = emittabcall(&lcx.data.func, lcx.data.tab_func[target]);
         if let Visit::Materialize(slot) = visit.reborrow_mut() {
             let nest = lcx.tmp[start..].last().map(|i| i.nest+1).unwrap_or(0);
             let mut a = ann;
@@ -2016,19 +2136,18 @@ fn emitvgetfuse(
     ann: ObjRef,
     var: ObjRef<VAR>,
     inline: bool,
-    fwdload: Option<BumpRef<VSet>>,
+    fwdload: IndexOption<VSetId>,
     mut prefix: InsId
 ) -> InsId {
-    let bump = Access::borrow(&lcx.data.bump);
     let objs = Access::borrow(&lcx.objs);
     debug_assert!(objs[ann].op == Obj::TTEN);
-    let vdata = vardata(&lcx.data.objs, var);
-    let target = &bump[bump[vdata].tab];
-    let tcall = emittabcall(&lcx.data.func, target.func);
+    let vid: VarId = zerocopy::transmute!(lcx.data.objs[&var.erase()]);
+    let target = lcx.data.vars[vid].tab;
+    let tcall = emittabcall(&lcx.data.func, lcx.data.tab_func[target]);
     while start < fuse {
         let VGETIdx { value, scalar_expr, axis, span, .. } = lcx.tmp[start];
         debug_assert!(scalar_expr == 1);
-        prefix = idxftrann(lcx, target, tcall, axis as _, (axis+span) as _, prefix);
+        prefix = idxftrann(&lcx.data, target, tcall, axis as _, (axis+span) as _, prefix);
         prefix = lcx.data.func.code.push(Ins::ADD(IRT_IDX, prefix, value.unwrap()));
         start = start.offset(1);
     }
@@ -2044,7 +2163,7 @@ fn emitvgetfuse(
         }
     }
     prefix = match lcx.tmp[fuse] {
-        VGETIdx { expr, axis, span, .. } if expr.is_nil() => emitsplatloop(lcx, loop_, target,
+        VGETIdx { expr, axis, span, .. } if expr.is_nil() => emitsplatloop(&lcx.data, loop_, target,
             prefix, tcall, axis as _, (axis+span) as _),
         VGETIdx { expr, .. } => emitexpri(lcx, expr, loop_, None)
     };
@@ -2065,7 +2184,6 @@ fn emitvgetfuse(
 }
 
 fn visitvget(lcx: &mut Lcx, expr: ObjRef<VGET>, mut visit: Visit) {
-    let bump = Access::borrow(&lcx.data.bump);
     let objs = Access::borrow(&lcx.objs);
     let vget = &objs[expr];
     let base = lcx.tmp.end();
@@ -2081,12 +2199,12 @@ fn visitvget(lcx: &mut Lcx, expr: ObjRef<VGET>, mut visit: Visit) {
     }
     let idx_start: BumpRef<VGETIdx> = base.cast_up();
     let idx_end: BumpRef<VGETIdx> = lcx.tmp.end().cast();
-    let var = vardata(&lcx.data.objs, vget.var);
-    let target = &bump[bump[var].tab];
-    let source = &bump[lcx.data.tab];
-    let nprefix = prefixlen(source.axes.len(), target.axes.len(), vget.dim as _);
-    let prefix = idxtransfer(lcx, lcx.data.tab, bump[var].tab, source.axes.len(), nprefix, INS_FLATIDX);
-    let inline = isdisjointidx(&bump[lcx.data.tab], target, &vget.idx);
+    let target = lcx.data.vars[zerocopy::transmute!(lcx.data.objs[&vget.var.erase()])].tab;
+    let source_dim = (lcx.data.tab_axes[lcx.data.tab+1] - lcx.data.tab_axes[lcx.data.tab]) as usize;
+    let target_dim = (lcx.data.tab_axes[target+1] - lcx.data.tab_axes[target]) as usize;
+    let nprefix = prefixlen(source_dim, target_dim, vget.dim as _);
+    let prefix = idxtransfer(lcx, lcx.data.tab, target, source_dim, nprefix, INS_FLATIDX);
+    let inline = isdisjointidx(&lcx.data, lcx.data.tab, target, &vget.idx);
     if let Visit::Iterate(iter) = visit.reborrow_mut() {
         if let Some(fuseidx) = maybefusevget(&lcx.tmp[base.cast()..idx_end]) {
             iter.element = emitvgetfuse(
@@ -2110,6 +2228,107 @@ fn visitvget(lcx: &mut Lcx, expr: ObjRef<VGET>, mut visit: Visit) {
         lcx.data.func.code.set(flat, Ins::MOV(IRT_IDX, prefix));
     };
     lcx.tmp.truncate(base);
+}
+
+fn visitapply(lcx: &mut Lcx, expr: ObjRef<APPLY>, mut visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &APPLY { func, ref args, .. } = &objs[expr];
+    let ufunc: UFuncId = zerocopy::transmute!(lcx.data.objs[&func.erase()]);
+    let ufbase = lcx.data.ufuncs[ufunc].base;
+    let want_check = lcx.data.check.is_some();
+    let want_value = visit.is_materialize();
+    debug_assert!(want_check || want_value);
+    let (check_args, check_base) = match want_check {
+        true => {
+            let afunc = &lcx.ir.funcs[ufbase+UserFunc::SUB_AVAIL];
+            (reserve(&lcx.data.func, (afunc.arg-afunc.ret) as _), afunc.ret)
+        },
+        false => (InsId::INVALID.into(), PhiId::INVALID.into())
+    };
+    if want_check { lcx.data.func.code.push(Ins::NOP(Type::LSV)); }
+    let (value_args, value_base) = match want_value {
+        true => {
+            let vfunc = &lcx.ir.funcs[ufbase+UserFunc::SUB_VALUE];
+            (reserve(&lcx.data.func, (vfunc.arg-vfunc.ret) as _), vfunc.ret)
+        },
+        false => (InsId::INVALID.into(), PhiId::INVALID.into())
+    };
+    if want_value { lcx.data.func.code.push(Ins::NOP(Type::LSV)); }
+    let params_base = lcx.data.ufunc_params[ufunc];
+    let ctr = visit.ctr();
+    for (i, &arg) in args.iter().enumerate() {
+        let Param { value, avail } = lcx.data.params[params_base + i as isize];
+        if want_value || avail.is_some() {
+            let v = emitexprv(lcx, arg, ctr);
+            for i in 0..decomposition_size(objs, arg.erase()) as usize {
+                if want_value {
+                    let vidx = value_args + (value-value_base) + i as isize;
+                    lcx.data.func.code.set(vidx, Ins::CARG(vidx+1, v));
+                }
+                if want_check && let Some(avail) = avail.unpack() {
+                    let cidx = check_args + (avail-check_base) + i as isize;
+                    lcx.data.func.code.set(cidx, Ins::CARG(cidx+1, v));
+                }
+            }
+        } else {
+            visitexpr(lcx, arg, Visit::None(ctr));
+        }
+    }
+    if want_check {
+        let call = lcx.data.func.code.push(Ins::CALL(check_args, ufbase+UserFunc::SUB_AVAIL));
+        let check = lcx.data.func.code.push(Ins::RES(Type::B1, call, 0.into()));
+        emitjumpifnot(&lcx.data.func, ctr, check, lcx.data.check.raw);
+    }
+    if want_value {
+        let call = lcx.data.func.code.push(Ins::CALL(value_args, ufbase+UserFunc::SUB_VALUE));
+        let Visit::Materialize(slot) = visit else { unreachable!() };
+        let base = lcx.tmp.end();
+        let deco = decomposition(objs, expr.erase(), &mut lcx.tmp);
+        slot.value = lcx.data.func.code.extend(
+            deco
+            .iter()
+            .enumerate()
+            .map(|(i,&ty)| Ins::RES(ty, call, i.into()))
+        );
+        lcx.tmp.truncate(base);
+    }
+}
+
+fn emitparam(lcx: &mut Lcx, expr: ObjRef<PGET>, ufunc: UFuncId) -> InsId {
+    let PGET { idx, ann, .. } = lcx.objs[expr];
+    let base = lcx.tmp.end();
+    let deco = decomposition(&lcx.objs, ann, &mut lcx.tmp);
+    let param = lcx.data.ufunc_params[ufunc] + idx as isize;
+    let phibase = match lcx.data.check.unpack() {
+        Some(_) => match lcx.data.params[param].avail.unpack() {
+            Some(phi) => phi,
+            None => {
+                let phi = lcx.data.func.arg;
+                lcx.data.params[param].avail = Some(phi).into();
+                for &ty in deco.iter() {
+                    lcx.data.func.phis.set(lcx.data.func.arg, Phi::new(ty));
+                    lcx.data.func.arg += 1;
+                }
+                phi
+            }
+        },
+        None => lcx.data.params[param].value
+    };
+    let ret = lcx.data.func.code.end();
+    lcx.data.func.code.extend(deco
+        .iter()
+        .enumerate()
+        .map(|(i,&ty)| Ins::PHI(ty, INS_ENTRY, phibase + i as isize))
+    );
+    lcx.tmp.truncate(base);
+    ret
+}
+
+fn emitpget(lcx: &mut Lcx, expr: ObjRef<PGET>) -> InsId {
+    match lcx.data.ufunc.unpack() {
+        Some(ufunc) => emitparam(lcx, expr, ufunc),
+        None => emitdim(lcx, lcx.objs[expr].idx as _)
+    }
 }
 
 fn emitcat(lcx: &mut Lcx, expr: ObjRef<CAT>, ctr: &mut InsId) -> InsId {
@@ -2526,30 +2745,21 @@ fn visitnew(lcx: &mut Lcx, expr: ObjRef<NEW>, visit: Visit) {
     }
 }
 
-fn visitget(lcx: &mut Lcx, expr: ObjRef<GET>, visit: Visit) {
-    let GET { ann, value, idx, .. } = lcx.objs[expr];
+fn visittget(lcx: &mut Lcx, expr: ObjRef<TGET>, visit: &mut ExprSlot) {
+    let TGET { value, idx, .. } = lcx.objs[expr];
     debug_assert!(lcx.objs[lcx.objs[value].ann].op == Obj::TTUP);
-    let is_materialize = visit.is_materialize();
-    match visit {
-        Visit::Materialize(slot) | Visit::Shape(slot) => {
-            let mut v = emitexprv(lcx, value, &mut slot.ctr);
-            let offset: usize = lcx.objs[lcx.objs[value].ann.cast::<TTUP>()].elems[..idx as usize]
-                .iter()
-                .map(|&e| decomposition_size(&lcx.objs, e))
-                .sum();
-            v += offset as isize;
-            if !is_materialize {
-                v = extractshape(&lcx.objs, v, &lcx.objs[ann.cast()]);
-            }
-            slot.value = v;
-        },
-        _ => unreachable!()
-    }
+    let mut v = emitexprv(lcx, value, &mut visit.ctr);
+    let offset: usize = lcx.objs[lcx.objs[value].ann.cast::<TTUP>()].elems[..idx as usize]
+        .iter()
+        .map(|&e| decomposition_size(&lcx.objs, e))
+        .sum();
+    v += offset as isize;
+    visit.value = v;
 }
 
-fn visitcallx(lcx: &mut Lcx, expr: ObjRef<CALLX>, visit: Visit) {
+fn visitcallx(lcx: &mut Lcx, expr: ObjRef<CALL>, visit: Visit) {
     let objs = Access::borrow(&lcx.objs);
-    let &CALLX { ann, lang, ref inputs, .. } = &objs[expr];
+    let &CALL { ann, lang, ref inputs, .. } = &objs[expr];
     let is_materialize = visit.is_materialize();
     match visit {
         Visit::Materialize(slot) | Visit::Shape(slot) => {
@@ -2603,23 +2813,22 @@ fn visitcallx(lcx: &mut Lcx, expr: ObjRef<CALLX>, visit: Visit) {
 // * return 0 is the flattened size (i64)
 // * returns 1.. are allocated in order, starting from the first axis, with 1 slot (i64 size)
 //   per static dimension, and 2 slots (ptr F, ptr B) per dynamic dimension.
-fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
+fn emittab(lcx: &mut Lcx, tab: TabId) {
     let mut ctr = INS_ENTRY;
     let mut len: IndexOption<InsId> = None.into();
-    let bump = Access::borrow(&lcx.data.bump);
-    let tab = &bump[tab];
     let zero = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
     let ret = lcx.data.func.code.push(Ins::RET());
     let mut fail = lcx.data.func.code.push(Ins::JMP(zero, ret, 0.into()));
     // emit zeroing code for the case when any dimension fails to compute.
     // note that lookup tables have size 1 here so that one-past-last-index computations
     // return zero.
-    for &Axis { rank, ret, .. } in &tab.axes {
+    let axes = lcx.data.tab_axes[tab]..lcx.data.tab_axes[tab+1];
+    for &Axis { rank, ret, .. } in lcx.data.axes.get_range(axes.clone()) {
         match rank {
-            Axis::SCALAR => {
+            Rank::Scalar => {
                 fail = lcx.data.func.code.push(Ins::JMP(zero, fail, ret));
             },
-            _ /* VECTOR */ => {
+            Rank::Vector => {
                 let size = lcx.data.func.code.push(Ins::KINT(IRT_IDX, IRT_IDX.size() as _));
                 let ptr = lcx.data.func.code.push(Ins::ALLOC(size, size, ctr));
                 let store = lcx.data.func.code.push(Ins::STORE(ptr, zero));
@@ -2631,7 +2840,8 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
     }
     // emit checks for all dimensions, zero everything if any fails.
     let mut nils = 0;
-    for &Axis { size, .. } in &tab.axes {
+    for axis in index::iter_range(axes.clone()) {
+        let Axis { size, .. } = lcx.data.axes[axis];
         if size.is_nil() {
             nils += 1;
         } else {
@@ -2640,9 +2850,10 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
     }
     let mut nils = reserve(&lcx.data.func, nils);
     // emit the actual dimensions.
-    for (i, &Axis { rank, ret, size, .. }) in tab.axes.iter().enumerate() {
+    for (i, axis) in index::iter_range(axes.clone()).enumerate() {
+        let Axis { rank, ret, size, .. } = lcx.data.axes[axis];
         match rank {
-            Axis::SCALAR => {
+            Rank::Scalar => {
                 let n = match size.is_nil() {
                     true => {
                         // next vector axis will patch this
@@ -2659,7 +2870,7 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
                     None      => n
                 }).into();
             },
-            _ /* VECTOR */ => {
+            Rank::Vector => {
                 // pseudocode:
                 //   F = alloc(len+1)
                 //   F[0] = 0
@@ -2764,11 +2975,11 @@ fn emittab(lcx: &mut Lcx, tab: BumpRef<Tab>) {
 
 /* ---- Initializers -------------------------------------------------------- */
 
-fn emitcinit(lcx: &mut Lcx, tab: BumpRef<Tab>, chunk: FuncId) {
-    let cinit = match lcx.data.bump[tab].axes.is_empty() {
+fn emitcinit(lcx: &mut Lcx, tab: TabId, chunk: FuncId) {
+    let cinit = match lcx.data.tab_axes[tab] == lcx.data.tab_axes[tab+1] {
         true => lcx.data.func.code.push(Ins::NOP(Type::FX)),
         false => {
-            let tabcall = emittabcall(&lcx.data.func, lcx.data.bump[tab].func);
+            let tabcall = emittabcall(&lcx.data.func, lcx.data.tab_func[tab]);
             let size = lcx.data.func.code.push(Ins::RES(IRT_IDX, tabcall, 0.into()));
             lcx.data.func.code.push(Ins::CINIT(size, chunk))
         }
@@ -2779,35 +2990,34 @@ fn emitcinit(lcx: &mut Lcx, tab: BumpRef<Tab>, chunk: FuncId) {
 
 /* ---- Variables ----------------------------------------------------------- */
 
-fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
+fn emitvararms(lcx: &mut Lcx, var: VarId) {
     let mut ctr = INS_ENTRY;
     let ret = lcx.data.func.code.push(Ins::RET());
-    let bump = Access::borrow(&lcx.data.bump);
     let objs = Access::borrow(&lcx.objs);
-    for (i, &setter) in bump[var].value.iter().enumerate() {
-        let vset = &bump[setter];
-        let model = &bump[vset.model];
+    let Var { tab: var_tab, .. } = lcx.data.vars[var];
+    for (i,j) in (lcx.data.var_vsets_idx[var]..lcx.data.var_vsets_idx[var+1]).enumerate() {
+        let vset = lcx.data.var_vsets[j as usize];
+        let VSet { model, vst, .. } = lcx.data.vsets[vset];
+        let Mod { obj, tab: model_tab, base: model_base, .. } = lcx.data.models[model];
         let [next] = areserve(&lcx.data.func);
-        match vset.vst {
-            VSet::SIMPLE => {
-                let mobj = &objs[model.obj];
+        match vst {
+            VSetType::Simple => {
+                let mobj = &objs[obj];
                 if !mobj.guard.is_nil() {
                     let cond = emitexprcv(lcx, mobj.guard, &mut ctr, next);
                     emitjumpifnot(&lcx.data.func, &mut ctr, cond, next);
                 }
                 emitexprc(lcx, mobj.value, &mut ctr, next);
             },
-            VSet::PREFIX => {
-                let var = &bump[vset.var];
-                // SourcePrefix on VSET implies:
-                debug_assert!(bump[model.tab].n <= bump[var.tab].n);
-                let idx = idxtransfer(lcx, var.tab, model.tab, bump[var.tab].n as _,
-                    bump[model.tab].n as _, INS_FLATIDX);
-                let call = emitcallvm1(&lcx.data, idx, model.base + Mod::SUB_AVAIL);
+            VSetType::Prefix => {
+                let source_dim = (lcx.data.tab_axes[var_tab+1] - lcx.data.tab_axes[var_tab]) as usize;
+                let target_dim = (lcx.data.tab_axes[model_tab+1] - lcx.data.tab_axes[model_tab]) as usize;
+                let idx = idxtransfer(lcx, var_tab, model_tab, source_dim, target_dim, INS_FLATIDX);
+                let call = emitcallvm1(&lcx.data, idx, model_base + Mod::SUB_AVAIL);
                 let check = lcx.data.func.code.push(Ins::RES(Type::B1, call, 0.into()));
                 emitjumpifnot(&lcx.data.func, &mut ctr, check, next);
             },
-            _ /* COMPLEX */ => {
+            VSetType::Complex => {
                 todo!()
             }
         }
@@ -2819,61 +3029,62 @@ fn emitvararms(lcx: &mut Lcx, var: BumpRef<Var>) {
     lcx.data.func.code.set(ctr, Ins::JMP(knone, ret, 0.into()));
 }
 
-fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
+fn emitvarvalue(lcx: &mut Lcx, var: VarId) {
     let mut ctr = INS_ENTRY;
-    let bump = Access::borrow(&lcx.data.bump);
     let objs = Access::borrow(&lcx.objs);
-    let var = &bump[var];
-    lcx.data.tmp_vty.clear();
-    pushdeco__old(&lcx.objs, var.obj.erase(), &mut lcx.data.tmp_vty);
-    let ds = decomposition_size(&lcx.objs, var.obj.erase());
-    let vardim = bump[var.tab].n as usize;
-    let armcall = emitcallvm1(&lcx.data, INS_FLATIDX, var.base + Var::SUB_ARM);
+    let Var { obj: var_obj, tab: var_tab, base: var_base, .. } = lcx.data.vars[var];
+    let ds = decomposition_size(&lcx.objs, var_obj.erase());
+    let var_dim = (lcx.data.tab_axes[var_tab+1] - lcx.data.tab_axes[var_tab]) as usize;
+    let armcall = emitcallvm1(&lcx.data, INS_FLATIDX, var_base + Var::SUB_ARM);
     let arm = lcx.data.func.code.push(Ins::RES(IRT_ARM, armcall, 0.into()));
     let out = lcx.data.func.code.push(Ins::RET());
-    for (i, &setter) in var.value.iter().enumerate() {
+    for (i,j) in (lcx.data.var_vsets_idx[var]..lcx.data.var_vsets_idx[var+1]).enumerate() {
+        let vset = lcx.data.var_vsets[j as usize];
+        let VSet { model, vst, ret, .. } = lcx.data.vsets[vset];
+        let Mod { obj: model_obj, tab: model_tab, base: model_base, .. } = lcx.data.models[model];
         let karm = lcx.data.func.code.push(Ins::KINT(IRT_ARM, i as _));
         let check = lcx.data.func.code.push(Ins::EQ(arm, karm));
         let tru = reserve(&lcx.data.func, 2);
         let fal = tru+1;
         lcx.data.func.code.set(ctr, Ins::IF(check, tru, fal));
         ctr = tru;
-        let vset = &bump[setter];
-        let model = &bump[vset.model];
-        let value = match vset.vst {
-            VSet::SIMPLE => emitexprv(lcx, objs[model.obj].value, &mut ctr),
-            VSet::PREFIX => {
-                let modeldim = bump[model.tab].n as usize;
-                let idx = idxtransfer(lcx, var.tab, model.tab, vardim, modeldim, INS_FLATIDX);
-                let call = emitcallvm1(&lcx.data, idx, model.base + Mod::SUB_VALUE);
-                if vsettype(objs, model.obj, vset.idx as _) == lcx.objs[var.obj].ann {
+        let value = match vst {
+            VSetType::Simple => emitexprv(lcx, objs[model_obj].value, &mut ctr),
+            VSetType::Prefix => {
+                let base = lcx.tmp.end();
+                let model_dim = (lcx.data.tab_axes[model_tab+1] - lcx.data.tab_axes[model_tab]) as usize;
+                let idx = idxtransfer(lcx, var_tab, model_tab, var_dim, model_dim, INS_FLATIDX);
+                let call = emitcallvm1(&lcx.data, idx, model_base + Mod::SUB_VALUE);
+                let vset_idx = vset - lcx.data.model_outputs[model];
+                let value = if vsettype(objs, model_obj, vset_idx as _) == lcx.objs[var_obj].ann {
                     // model returns scalar of var type -> we just forward the value
-                    debug_assert!(modeldim == vardim);
+                    debug_assert!(var_dim == model_dim);
                     lcx.data.func.code.extend(
-                        lcx.data.tmp_vty
+                        decomposition(objs, var_obj.erase(), &mut lcx.tmp)
                         .iter()
                         .enumerate()
-                        .map(|(j, &ty)| Ins::RES(ty, call, vset.ret + j as isize))
+                        .map(|(j, &ty)| Ins::RES(ty, call, ret + j as isize))
                     )
                 } else {
                     // model returns rank-k tensor of var type, where k = number of implicit
                     // dimensions, ie. the dim(var.tab) - dim(mod.tab)
                     // -> we "peel off" one layer by loading the flat index on each return slot.
-                    debug_assert!(modeldim < vardim);
-                    let baseidx = idxtransfer(lcx, model.tab, var.tab, modeldim,
-                        vardim, idx);
+                    debug_assert!(model_dim < var_dim);
+                    let baseidx = idxtransfer(lcx, model_tab, var_tab, model_dim, var_dim, idx);
                     let ofs = lcx.data.func.code.push(Ins::SUB(IRT_IDX, INS_FLATIDX, baseidx));
-                    let base = reserve(&lcx.data.func, ds);
-                    for (j, &ty) in lcx.data.tmp_vty.iter().enumerate() {
+                    let start = reserve(&lcx.data.func, ds);
+                    for (j, &ty) in decomposition(objs, var_obj.erase(), &mut lcx.tmp).iter().enumerate() {
                         let res = lcx.data.func.code.push(
-                            Ins::RES(Type::PTR, call, vset.ret + j as isize));
+                            Ins::RES(Type::PTR, call, ret + j as isize));
                         let ptr = emitarrayptr(&lcx.data.func, res, ofs, ty);
-                        lcx.data.func.code.set(base + j as isize, Ins::LOAD(ty, ptr));
+                        lcx.data.func.code.set(start + j as isize, Ins::LOAD(ty, ptr));
                     }
-                    base
-                }
+                    start
+                };
+                lcx.tmp.truncate(base);
+                value
             },
-            _ /* COMPLEX */ => {
+            VSetType::Complex => {
                 todo!()
             }
         };
@@ -2893,10 +3104,10 @@ fn emitvarvalue(lcx: &mut Lcx, var: BumpRef<Var>) {
 // only non-simple models are handled here.
 // simple models emit directly into the variable definition.
 
-fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
+fn emitmodavail(lcx: &mut Lcx, model: ModId) {
     let mut ctr = INS_ENTRY;
     let objs = Access::borrow(&lcx.objs);
-    let mobj = &objs[lcx.data.bump[model].obj];
+    let mobj = &objs[lcx.data.models[model].obj];
     let ret = lcx.data.func.code.push(Ins::RET());
     let kfal = lcx.data.func.code.push(Ins::KINT(Type::B1, 0));
     let jfal = lcx.data.func.code.push(Ins::JMP(kfal, ret, 0.into()));
@@ -2914,10 +3125,10 @@ fn emitmodavail(lcx: &mut Lcx, model: BumpRef<Mod>) {
     lcx.data.func.code.set(ctr, Ins::JMP(ktru, ret, 0.into()));
 }
 
-fn emitmodvalue(lcx: &mut Lcx, model: BumpRef<Mod>) {
+fn emitmodvalue(lcx: &mut Lcx, model: ModId) {
     let mut ctr = INS_ENTRY;
     let objs = Access::borrow(&lcx.objs);
-    let mobj = &objs[lcx.data.bump[model].obj];
+    let mobj = &objs[lcx.data.models[model].obj];
     // TODO: optimization: for full table VSET (ie. empty idx) return only the pointer,
     // and on use load the shape from the tab instead
     let value = emitexprv(lcx, mobj.value, &mut ctr);
@@ -2949,20 +3160,48 @@ fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
     lcx.data.func.code.set(ctr, Ins::RET());
 }
 
-/* -------------------------------------------------------------------------- */
+/* ---- Functions ----------------------------------------------------------- */
 
-enum Template {
-    TabInit(BumpRef<Tab>),
-    ChunkInit(BumpRef<Tab>, FuncId),
-    VarVal(BumpRef<Var>),
-    VarArm(BumpRef<Var>),
-    ModVal(BumpRef<Mod>),
-    ModAvail(BumpRef<Mod>),
-    Query(ObjRef<QUERY>)
+fn emitfuncavail(lcx: &mut Lcx, ufunc: UFuncId) {
+    let mut ctr = INS_ENTRY;
+    let ret = lcx.data.func.code.push(Ins::RET());
+    let kfal = lcx.data.func.code.push(Ins::KINT(Type::B1, 0));
+    let jfal = lcx.data.func.code.push(Ins::JMP(kfal, ret, 0.into()));
+    emitexprc(lcx, lcx.data.ufuncs[ufunc].expr, &mut ctr, jfal);
+    let ktru = lcx.data.func.code.push(Ins::KINT(Type::B1, 1));
+    lcx.data.func.code.set(ctr, Ins::JMP(ktru, ret, 0.into()));
 }
 
-fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) {
-    swap(&mut *lcx.data.func, &mut lcx.ir.funcs[id]);
+fn emitfuncvalue(lcx: &mut Lcx, ufunc: UFuncId) {
+    let mut ctr = INS_ENTRY;
+    let expr = lcx.data.ufuncs[ufunc].expr;
+    let value = emitexprv(lcx, expr, &mut ctr);
+    for i in 0..decomposition_size(&lcx.objs, expr.erase()) {
+        let [next] = areserve(&lcx.data.func);
+        lcx.data.func.code.set(ctr, Ins::JMP(value + i as isize, next, i.into()));
+        ctr = next;
+    }
+    lcx.data.func.code.set(ctr, Ins::RET());
+}
+
+/* -------------------------------------------------------------------------- */
+
+#[derive(Debug)]
+enum Template {
+    TabInit(TabId),
+    ChunkInit(TabId, FuncId),
+    VarVal(VarId),
+    VarArm(VarId),
+    ModVal(ModId),
+    ModAvail(ModId),
+    Query(ObjRef<QUERY>),
+    FuncAvail(UFuncId),
+    FuncVal(UFuncId)
+}
+
+fn emittemplate(lcx: &mut Ccx<Lower, R>, id: FuncId, template: Template) {
+    trace!(LOWER "emit {:?} -> {:?}", id, template);
+    swap(&mut lcx.data.func, &mut lcx.ir.funcs[id]);
     debug_assert!(lcx.data.func.code.is_empty());
     // start:
     lcx.data.func.entry = INS_ENTRY;
@@ -2974,7 +3213,10 @@ fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) 
             _ => { emitarg(&lcx.data.func, 0); }
         },
         FuncKind::Query(_) => { emitarg(&lcx.data.func, 0); },
-        FuncKind::User() => todo!() // no flatidx (?)
+        FuncKind::User => { lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0)); }
+    }
+    if let Template::FuncAvail(id) | Template::FuncVal(id) = template {
+        lcx.data.ufunc = Some(id).into();
     }
     {
         use Template::*;
@@ -2986,84 +3228,89 @@ fn emittemplate(lcx: &mut Ccx<Lower<R, RW>, R>, id: FuncId, template: Template) 
             VarArm(var) => emitvararms(lcx, var),
             ModVal(model) => emitmodvalue(lcx, model),
             ModAvail(model) => emitmodavail(lcx, model),
-            Query(query) => emitquery(lcx, query)
+            Query(query) => emitquery(lcx, query),
+            FuncAvail(ufunc) => emitfuncavail(lcx, ufunc),
+            FuncVal(ufunc) => emitfuncvalue(lcx, ufunc)
         }
     }
-    swap(&mut *lcx.data.func, &mut lcx.ir.funcs[id]);
+    swap(&mut lcx.data.func, &mut lcx.ir.funcs[id]);
+    lcx.data.ufunc = None.into();
 }
 
-fn emitobjs(lcx: &mut Ccx<Lower<R, RW>, R>) {
-    let objs = Access::borrow(&lcx.data.objs);
-    for (&obj, &bump) in objs {
-        match lcx.objs[obj].op {
-            Obj::TAB => {
-                lcx.data.tab = Tab::GLOBAL;
-                let func = lcx.data.bump[bump.cast::<Tab>()].func;
-                emittemplate(lcx, func, Template::TabInit(bump.cast()));
-            },
-            Obj::VAR => {
-                let Var { base, tab, .. } = lcx.data.bump[bump.cast::<Var>()];
-                lcx.data.tab = tab;
-                emittemplate(lcx, base,   Template::VarVal(bump.cast()));
-                emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
-                emittemplate(lcx, base+2, Template::VarArm(bump.cast()));
-                emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
-            },
-            Obj::MOD => {
-                if lcx.data.bump[bump.cast::<Mod>()].mt == Mod::COMPLEX {
-                    let Mod { base, tab, .. } = lcx.data.bump[bump.cast::<Mod>()];
-                    lcx.data.tab = tab;
-                    emittemplate(lcx, base,   Template::ModVal(bump.cast()));
-                    emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
-                    emittemplate(lcx, base+2, Template::ModAvail(bump.cast()));
-                    emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
-                }
-            },
-            Obj::QUERY => {
-                // TODO: make query take the dest as parameter and return only fxes
-                let &QUERY { tab, ref value , .. } = &lcx.objs[obj.cast::<QUERY>()];
-                lcx.data.tab = objs[&tab.erase()].cast();
-                let mut query = Query::new(obj.cast());
-                let putofs = lcx.perm.align_for::<Offset>();
-                query.offsets = putofs.end();
-                let mut func = Func::new(FuncKind::Query(query),
-                    DebugSource::new(obj, EnumSet::empty()));
-                let mut sig = func.build_signature();
-                let mut cursor = 0;
-                for &v in value {
-                    let ann = lcx.objs[v].ann;
-                    let align = match lcx.objs.get(ann) {
-                        ObjectRef::TPRI(&TPRI { ty, .. }) => Primitive::from_u8(ty).to_ir(),
-                        _ => Type::PTR
-                    }.size();
-                    // query cannot return FX:
-                    debug_assert!(align > 0);
-                    // layout query as:
-                    //   struct {
-                    //     struct {
-                    //       ty11 field11;
-                    //       ...
-                    //       ty1N field1N;
-                    //     } value1;
-                    //     ...
-                    //     struct { ... } valueM;
-                    //   }
-                    cursor = (cursor + align - 1) & !(align - 1);
-                    for &ty in decomposition__old(&lcx.objs, ann, &mut lcx.data.tmp_ty) {
-                        debug_assert!(cursor & (ty.size() - 1) == 0);
-                        putofs.push(cursor as Offset);
-                        sig = sig.add_return(ty);
-                        cursor += ty.size();
-                    }
-                }
-                sig.finish_returns().add_arg(IRT_IDX).finish_args();
-                let func = lcx.ir.funcs.push(func);
-                trace!(LOWER "QUERY {:?} func: {:?}", obj, func);
-                emittemplate(lcx, func, Template::Query(obj.cast()));
-            },
-            Obj::FUNC => todo!(),
-            _ => unreachable!()
+fn emitall(lcx: &mut Ccx<Lower, R>) {
+    lcx.data.tab = TabId::GLOBAL;
+    for id in index::iter_span(lcx.data.ufuncs.end()) {
+        let UserFunc { base, .. } = lcx.data.ufuncs[id];
+        emittemplate(lcx, base,   Template::FuncVal(id));
+        emittemplate(lcx, base+1, Template::FuncAvail(id));
+    }
+    for id in index::iter_span(lcx.data.tab_func.end()) {
+        let base = lcx.data.tab_func[id];
+        emittemplate(lcx, base, Template::TabInit(id));
+    }
+    for id in index::iter_span(lcx.data.vars.end()) {
+        let Var { base, tab, .. } = lcx.data.vars[id];
+        lcx.data.tab = tab;
+        emittemplate(lcx, base,   Template::VarVal(id));
+        emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
+        emittemplate(lcx, base+2, Template::VarArm(id));
+        emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
+    }
+    for id in index::iter_span(lcx.data.models.end()) {
+        let Mod { base, tab, mt, .. } = lcx.data.models[id];
+        if mt == ModType::Complex {
+            lcx.data.tab = tab;
+            emittemplate(lcx, base,   Template::ModVal(id));
+            emittemplate(lcx, base+1, Template::ChunkInit(tab, base));
+            emittemplate(lcx, base+2, Template::ModAvail(id));
+            emittemplate(lcx, base+3, Template::ChunkInit(tab, base+2));
         }
+    }
+    let objs = Access::borrow(&lcx.objs);
+    for id in index::iter_span(lcx.data.queries.end()) {
+        // TODO: make query take the dest as parameter and return only fxes
+        let obj = lcx.data.queries[id];
+        let &QUERY { tab, ref value , .. } = &lcx.objs[obj];
+        lcx.data.tab = zerocopy::transmute!(lcx.data.objs[&tab.erase()] as u16);
+        let mut query = Query::new(obj);
+        let putofs = lcx.perm.align_for::<Offset>();
+        query.offsets = putofs.end();
+        let mut func = Func::new(FuncKind::Query(query),
+        DebugSource::new(obj, EnumSet::empty()));
+        let mut sig = SignatureBuilder::new(&mut func);
+        let mut cursor = 0;
+        for &v in value {
+            let ann = lcx.objs[v].ann;
+            let align = match lcx.objs.get(ann) {
+                ObjectRef::TPRI(&TPRI { ty, .. }) => Primitive::from_u8(ty).to_ir(),
+                _ => Type::PTR
+            }.size();
+            // query cannot return FX:
+            debug_assert!(align > 0);
+            // layout query as:
+            //   struct {
+            //     struct {
+            //       ty11 field11;
+            //       ...
+            //       ty1N field1N;
+            //     } value1;
+            //     ...
+            //     struct { ... } valueM;
+            //   }
+            cursor = (cursor + align - 1) & !(align - 1);
+            let base = lcx.tmp.end();
+            for &mut ty in decomposition(objs, ann, &mut lcx.tmp) {
+                debug_assert!(cursor & (ty.size() - 1) == 0);
+                putofs.push(cursor as Offset);
+                sig = sig.add(ty);
+                cursor += ty.size();
+            }
+            lcx.tmp.truncate(base);
+        }
+        sig.finish_returns().add(IRT_IDX).finish_args();
+        let func = lcx.ir.funcs.push(func);
+        trace!(LOWER "QUERY {:?} func: {:?}", obj, func);
+        emittemplate(lcx, func, Template::Query(obj.cast()));
     }
 }
 
@@ -3090,28 +3337,30 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
                 let ptr = ccx.data.objs[&obj];
                 match ccx.objs[obj].op {
                     Obj::VAR => {
-                        let var = &ccx.data.bump[ptr.cast::<Var>()];
-                        resetvm(&mut mat, var.base, id);
-                        for &vset in &var.value {
-                            let vset = &ccx.data.bump[vset];
-                            if vset.vst != VSet::SIMPLE {
-                                resetvm(&mut mat, ccx.data.bump[vset.model].base, id);
+                        let var: VarId = zerocopy::transmute!(ptr);
+                        let Var { base, .. } = ccx.data.vars[var];
+                        resetvm(&mut mat, base, id);
+                        for j in ccx.data.var_vsets_idx[var]..ccx.data.var_vsets_idx[var+1] {
+                            let VSet { model, vst, .. } = ccx.data.vsets[ccx.data.var_vsets[j as usize]];
+                            if vst != VSetType::Simple {
+                                resetvm(&mut mat, ccx.data.models[model].base, id);
                             }
                         }
                     },
                     _ /* MOD */ => {
-                        let model = &ccx.data.bump[ccx.data.objs[&obj].cast::<Mod>()];
-                        let base = match model.mt {
-                            Mod::SIMPLE => {
+                        let model: ModId = zerocopy::transmute!(ptr);
+                        let Mod { mt, base, .. } = ccx.data.models[model];
+                        let resetbase = match mt {
+                            ModType::Simple => {
                                 // simple model: reset the variable
-                                ccx.data.bump[model.outputs[0].var].base
+                                ccx.data.vars[ccx.data.vsets[ccx.data.model_outputs[model]].var].base
                             },
-                            _ /* COMPLEX */ => {
+                            ModType::Complex => {
                                 // complex model: reset the model
-                                model.base
+                                base
                             }
                         };
-                        resetvm(&mut mat, base, id);
+                        resetvm(&mut mat, resetbase, id);
                     }
                 }
             }
@@ -3164,23 +3413,43 @@ fn computereset(ccx: &mut Ccx<Lower, R>) {
 impl Stage for Lower {
 
     fn new(_: &mut Ccx<Absent>) -> compile::Result<Self> {
+        let mut tab_axes = IndexVec::default();
+        let mut model_outputs = IndexVec::default();
+        let mut var_vsets_idx = IndexVec::default();
+        let mut ufunc_params = IndexVec::default();
+        tab_axes.push(0.into());
+        model_outputs.push(0.into());
+        var_vsets_idx.push(0);
+        ufunc_params.push(0.into());
         Ok(Lower {
-            bump: Default::default(),
-            objs: Default::default(),
+            tab_func: Default::default(),
+            tab_axes,
+            axes: Default::default(),
+            models: Default::default(),
+            model_outputs,
+            vsets: Default::default(),
+            vars: Default::default(),
+            var_vsets_idx,
+            var_vsets: Default::default(),
+            params: Default::default(),
+            ufuncs: Default::default(),
+            ufunc_params,
+            queries: Default::default(),
             locals: Default::default(),
+            objs: Default::default(),
             tmp_ins: Default::default(),
             tmp_vty: Default::default(),
             tmp_ty: Default::default(),
-            func: Access::new(Func::new(FuncKind::User(),
-                DebugSource::new(ObjRef::NIL, EnumSet::empty()))),
-            tab: BumpRef::zero(),
+            func: Func::new(FuncKind::User, DebugSource::new(ObjRef::NIL, EnumSet::empty())),
+            ufunc: None.into(),
+            tab: TabId::GLOBAL,
             check: None.into()
         })
     }
 
     fn run(ccx: &mut Ccx<Lower>) -> compile::Result {
         collectobjs(ccx);
-        emitobjs(unsafe { core::mem::transmute(&mut *ccx) });
+        ccx.freeze_graph(emitall);
         if trace!(LOWER) {
             let mut tmp = Default::default();
             dump_ir(&mut tmp, &ccx.ir, &ccx.intern, &ccx.objs);

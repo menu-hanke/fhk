@@ -264,7 +264,18 @@ impl FuncBuilder {
 
 fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
     match func.kind {
-        FuncKind::User() => todo!(),
+        FuncKind::User => {
+            signature.call_conv = CallConv::Fast;
+            if func.ret != 1.into() {
+                // TODO: multiple returns through memory
+                todo!()
+            }
+            signature.returns.push(AbiParam::new(irt2cl(func.phis.at(0.into()).type_)));
+            signature.params.extend(
+                index::iter_range(func.params())
+                .map(|arg| AbiParam::new(irt2cl(func.phis.at(arg).type_)))
+            );
+        },
         FuncKind::Query(_) => {
             // queries use sysv callconv even on windows so that fhk_vmcall doesn't need a
             // windows-specific version
@@ -422,7 +433,7 @@ pub fn storeslot(
 
 fn emithead(emit: &mut Emit, func: &Func) {
     match func.kind {
-        FuncKind::User() => { /* NOP */ },
+        FuncKind::User => { /* NOP */ },
         FuncKind::Query(_) => {
             // vmctx
             emit.fb.ctx.func.dfg.append_block_param(block2cl(BlockId::START), irt2cl(Type::PTR));

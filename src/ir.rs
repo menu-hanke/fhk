@@ -1,7 +1,6 @@
 //! Intermediate representation.
 
 use core::fmt::Debug;
-use core::marker::PhantomData;
 use core::mem::transmute;
 use core::ops::Range;
 use core::slice;
@@ -324,7 +323,6 @@ define_opcodes! {
     GOTO.FX   C,     decode_GOTO;
     IF.FX     V C C, decode_IF;   // cond tru fal
     RET.FX;
-    TRET.FX   V F;                // args func
     UB.FX;
     ABORT.FX; // (add reason/message here if needed)
 
@@ -399,7 +397,7 @@ impl Opcode {
 
     pub fn is_control(self) -> bool {
         use Opcode::*;
-        (JMP|GOTO|IF|RET|TRET|UB|ABORT).contains(self)
+        (JMP|GOTO|IF|RET|UB|ABORT).contains(self)
     }
 
     pub fn is_data(self) -> bool {
@@ -424,6 +422,11 @@ impl Opcode {
     pub fn is_const(self) -> bool {
         use Opcode::*;
         (KINT|KINT64|KFP64|KSTR|KREF).contains(self)
+    }
+
+    pub fn is_call(self) -> bool {
+        use Opcode::*;
+        (CALL|CALLC|CALLCI).contains(self)
     }
 
     pub fn num_v(self) -> usize {
@@ -615,6 +618,13 @@ impl Ins {
         unsafe { *(&self as *const Ins as *const InsId).add(1+ofs) }
     }
 
+    pub fn decode_F(self) -> FuncId {
+        use Opcode::*;
+        debug_assert!((CALL|CALLC|CALLCI|CINIT).contains(self.opcode()));
+        let abc = self.abc();
+        zerocopy::transmute!(abc[match self.opcode() { CALL|CINIT => 1, _ => 2 }])
+    }
+
     // it's a bit ugly but oh well
     pub fn decode_L(self) -> LangOp {
         use Opcode::*;
@@ -712,7 +722,7 @@ pub struct Phi {
 pub type Code = IndexValueVec<InsId, Ins>;
 
 pub enum FuncKind {
-    User(/*TODO*/),
+    User,
     Query(Query),
     Chunk(Chunk)
 }
@@ -771,11 +781,6 @@ impl Func {
         }
     }
 
-    pub fn build_signature(&mut self) -> SignatureBuilder<'_, Returns> {
-        debug_assert!(self.phis.is_empty());
-        SignatureBuilder { func: self, _marker: PhantomData }
-    }
-
     pub fn returns(&self) -> Range<PhiId> {
         0.into() .. self.ret
     }
@@ -823,40 +828,6 @@ impl DebugSource {
 
     pub fn flags(self) -> EnumSet<DebugFlag> {
         unsafe { EnumSet::from_repr_unchecked((self.0 & 3) as _) }
-    }
-
-}
-
-pub struct Returns;
-pub struct Args;
-pub struct SignatureBuilder<'a, State> {
-    pub func: &'a mut Func,
-    _marker: PhantomData<fn(&State)>
-}
-
-impl<'a> SignatureBuilder<'a, Returns> {
-
-    pub fn add_return(self, ty: Type) -> Self {
-        self.func.phis.push(Phi::new(ty));
-        self
-    }
-
-    pub fn finish_returns(self) -> SignatureBuilder<'a, Args> {
-        self.func.ret = self.func.phis.end();
-        SignatureBuilder { func: self.func, _marker: PhantomData }
-    }
-
-}
-
-impl<'a> SignatureBuilder<'a, Args> {
-
-    pub fn add_arg(self, ty: Type) -> Self {
-        self.func.phis.push(Phi::new(ty));
-        self
-    }
-
-    pub fn finish_args(self) {
-        self.func.arg = self.func.phis.end();
     }
 
 }

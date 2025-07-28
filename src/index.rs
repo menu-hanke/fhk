@@ -62,6 +62,14 @@ impl<I: Index, T> IndexSlice<I, T> {
         iter_span(self.end()).zip(self.raw.iter_mut())
     }
 
+    // cannot implement index<range> because range is a foreign type. common rust L.
+    pub fn get_range(&self, range: Range<I>) -> &[T]
+    {
+        let start: usize = range.start.into();
+        let end: usize = range.end.into();
+        &self.raw[start..end]
+    }
+
 }
 
 impl<I: Index, T> core::ops::Index<I> for IndexSlice<I, T> {
@@ -463,6 +471,10 @@ macro_rules! index {
         impl core::ops::Sub<isize> for $name {
             type Output = Self;
             fn sub(self, rhs: isize) -> Self { self + (-rhs) }
+        }
+        impl core::ops::Sub<Self> for $name {
+            type Output = isize;
+            fn sub(self, rhs: Self) -> isize { self.0 as isize - rhs.0 as isize }
         }
         impl core::ops::AddAssign<isize> for $name {
             fn add_assign(&mut self, rhs: isize) { *self = *self + rhs }

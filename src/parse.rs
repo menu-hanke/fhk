@@ -12,7 +12,7 @@ use crate::err::ErrorMessage;
 use crate::intern::IRef;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, BINOP, CALLX, CAT, DIM, EXPR, FLAT, GET, INTR, KINT, LEN, LET, LGET, LOAD, MOD, SPLAT, TAB, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LEN, LET, LGET, LOAD, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
@@ -44,6 +44,14 @@ fn newundef(pcx: &mut Pcx, id: ObjRef) -> ObjRef {
 
 fn reftab(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<TAB> {
     let id = match pcx.objs.tab(name) {
+        LookupEntry::Occupied(id) => return id,
+        LookupEntry::Vacant(e) => e.create()
+    };
+    newundef(pcx, id.erase()).cast()
+}
+
+fn reffunc(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<FUNC> {
+    let id = match pcx.objs.func(name) {
         LookupEntry::Occupied(id) => return id,
         LookupEntry::Vacant(e) => e.create()
     };
@@ -134,7 +142,16 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
     }
 }
 
-fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
+fn usercall(
+    pcx: &mut Pcx,
+    name: IRef<[u8]>,
+    base: BumpRef<ObjRef<EXPR>>
+) -> ObjRef<APPLY> {
+    let func = reffunc(pcx, name);
+    pcx.objs.push_args(APPLY::new(ObjRef::NIL, func), &pcx.tmp[base..])
+}
+
+fn parse_apply(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
     next(pcx)?; // skip '('
     let base = pcx.tmp.end();
     while pcx.data.token != Token::RParen {
@@ -143,9 +160,10 @@ fn parse_call(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> 
         if !check(pcx, Token::Comma)? { break }
     }
     consume(pcx, Token::RParen)?;
+    // TODO: remove the builtin check here, and make then normal functions
     let expr = match builtincall(pcx, name, base) {
         Some(expr) => expr,
-        None => todo!("user function call")
+        None => usercall(pcx, name, base.cast_up()).cast()
     };
     pcx.tmp.truncate(base);
     Ok(expr)
@@ -236,7 +254,7 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
     Ok(vget)
 }
 
-fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALLX>> {
+fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
     consume(pcx, Token::Call)?;
     require(pcx, Token::Ident)?;
     let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
@@ -304,16 +322,16 @@ fn parse_maybesuffix(pcx: &mut Pcx, expr: ObjRef<EXPR>) -> compile::Result<ObjRe
 
 fn parse_nameref(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
     let bindings = &pcx.data.bindings;
-    let binddim = pcx.data.binddim as usize;
-    for i in (binddim..bindings.len()).rev() {
+    let npar = pcx.data.bindparams as usize;
+    for i in (npar..bindings.len()).rev() {
         if bindings[i] == name {
             return Ok(pcx.objs.push(LGET::new(ObjRef::NIL,
-                        zerocopy::transmute!((i-binddim) as u32))).cast());
+                        zerocopy::transmute!((i-npar) as u32))).cast());
         }
     }
-    for i in (0..binddim).rev() {
+    for i in (0..npar).rev() {
         if pcx.data.bindings[i] == name {
-            return Ok(pcx.objs.push(DIM::new(i as _, ObjRef::NIL)).cast());
+            return Ok(pcx.objs.push(PGET::new(i as _, ObjRef::NIL)).cast());
         }
     }
     let tab = implicittab(pcx)?;
@@ -325,7 +343,7 @@ fn parse_nameref(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR
 fn parse_letin(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     next(pcx)?;
     let bindbase = pcx.data.bindings.len();
-    let binddim = pcx.data.binddim as usize;
+    let binddim = pcx.data.bindparams as usize;
     let name = parse_name(pcx)?;
     let ann = parse_maybeann(pcx)?;
     let outer = pcx.objs.push(LET::new(ann, ObjRef::NIL.cast(), ObjRef::NIL.cast()));
@@ -343,7 +361,7 @@ fn parse_letin(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
             loop {
                 pcx.tmp.push(name);
                 let lgeto = pcx.objs.push(LGET::new(ann, bslot));
-                let geti = pcx.objs.push(GET::new(idx as _, ann, lgeto.cast())).cast();
+                let geti = pcx.objs.push(TGET::new(idx as _, ann, lgeto.cast())).cast();
                 let chain = pcx.objs.push(LET::new(ann, geti, ObjRef::NIL.cast()));
                 pcx.objs[inner].expr = chain.cast();
                 inner = chain;
@@ -371,7 +389,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
         Token::Scope | Token::Ident => {
             let name = parse_name(pcx)?;
             let expr = match pcx.data.token {
-                Token::LParen => parse_call(pcx, name)?,
+                Token::LParen => parse_apply(pcx, name)?,
                 Token::Dot => {
                     next(pcx)?;
                     let tab = reftab(pcx, name);
@@ -617,7 +635,7 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
             }
         }
     }
-    pcx.data.binddim = pcx.data.bindings.len() as _;
+    pcx.data.bindparams = pcx.data.bindings.len() as _;
     if check(pcx, Token::LCurly)? {
         while pcx.data.token != Token::RCurly {
             parse_model_def(pcx, blockguard)?;
@@ -627,12 +645,31 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
         parse_model_def(pcx, blockguard)?;
     }
     pcx.data.bindings.clear();
-    pcx.data.binddim = 0;
+    pcx.data.bindparams = 0;
     Ok(())
 }
 
-fn parse_func(_pcx: &mut Pcx) -> compile::Result {
-    todo!()
+fn parse_func(pcx: &mut Pcx) -> compile::Result {
+    pcx.data.tab = ObjRef::GLOBAL;
+    next(pcx)?; // skip `func`
+    let name = parse_name(pcx)?;
+    let func = reffunc(pcx, name);
+    consume(pcx, Token::LParen)?;
+    while pcx.data.token != Token::RParen {
+        let name = parse_name(pcx)?;
+        pcx.data.bindings.push(name);
+        if !check(pcx, Token::Comma)? { break }
+    }
+    consume(pcx, Token::RParen)?;
+    consume(pcx, Token::Eq)?;
+    pcx.objs[func].arity = pcx.data.bindings.len() as _;
+    pcx.objs[func].mark = 0;
+    pcx.data.bindparams = pcx.data.bindings.len() as _;
+    let value = parse_expr(pcx)?;
+    pcx.objs[func].expr = value;
+    pcx.data.bindings.clear();
+    pcx.data.bindparams = 0;
+    Ok(())
 }
 
 fn parse_macro_body_rec(

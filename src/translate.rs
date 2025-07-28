@@ -9,7 +9,7 @@ use crate::controlflow::BlockId;
 use crate::lang::Lang;
 use crate::mem::{CursorType, SizeClass};
 use crate::compile;
-use crate::emit::{block2cl, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
+use crate::emit::{block2cl, cast_values, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
 use crate::ir::{Chunk, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::support::{NativeFunc, SuppFunc};
 
@@ -56,7 +56,7 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
         if phi < func.ret && ty != Type::FX {
             let phi: usize = phi.into();
             match func.kind {
-                FuncKind::User() => {
+                FuncKind::User => {
                     // user funcs return normally
                     break 'jret;
                 },
@@ -106,8 +106,22 @@ fn ins_if(ecx: &mut Ecx, id: InsId) {
 }
 
 fn ins_ret(ecx: &mut Ecx) {
-    // TODO: user funcs return values here.
-    ecx.data.fb.ins().return_(&[]);
+    let emit = &mut *ecx.data;
+    let func = &ecx.ir.funcs[emit.fid];
+    match func.kind {
+        FuncKind::Query(_) | FuncKind::Chunk(_) => {
+            emit.fb.ins().return_(&[]);
+        },
+        FuncKind::User => {
+            if func.ret != 1.into() {
+                // TODO: multiple returns through memory
+                todo!()
+            }
+            // phi zero is necessarily the first block param
+            let phiv = emit.fb.ctx.func.dfg.block_params(block2cl(emit.block))[0];
+            emit.fb.ins().return_(&[phiv]);
+        }
+    }
 }
 
 fn coldblock(emit: &mut Emit) {
@@ -389,6 +403,27 @@ fn ins_bref(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = InsValue::from_value(ptr);
 }
 
+fn ins_call(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let (mut args, func) = emit.code[id].decode_CALL();
+    let funcref = emit.fb.importfunc(&ecx.ir, func);
+    let base = ecx.tmp.end();
+    while emit.code[args].opcode() == Opcode::CARG {
+        let (next, value) = emit.code[args].decode_CARG();
+        ecx.tmp.push(emit.values[value]);
+        args = next;
+    }
+    if ecx.ir.funcs[func].ret != 1.into() {
+        // TODO: return values through memory; stack alloc pointer as first arg and pass here,
+        // put the pointer in emit.values and RES loads from there
+        todo!()
+    }
+    let call = emit.fb.ins().call(funcref, cast_values(&ecx.tmp[base.cast_up()..]));
+    ecx.tmp.truncate(base);
+    let res = emit.fb.ctx.func.dfg.inst_results(call)[0];
+    emit.values[id] = InsValue::from_value(res);
+}
+
 fn ins_callc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (idx, _, chunk) = emit.code[id].decode_CALLC();
@@ -415,7 +450,16 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
     if ty == Type::FX { return; }
     let (call, phi) = ins.decode_RES();
     let value = match emit.code[call].opcode() {
-        Opcode::CALL => todo!(),
+        Opcode::CALL => {
+            let (_, func) = emit.code[call].decode_CALL();
+            let res = emit.values[call].value();
+            if ecx.ir.funcs[func].ret == 1.into() {
+                res
+            } else {
+                // TODO: res is a pointer; load from res
+                todo!()
+            }
+        },
         Opcode::CALLC | Opcode::CALLCI => {
             let (idx, _, chunk) = emit.code[call].decode_CALLC();
             let FuncKind::Chunk(Chunk { scl, slots, .. }) = ecx.ir.funcs[chunk].kind
@@ -462,7 +506,6 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             GOTO => ins_goto(ecx, id),
             IF => ins_if(ecx, id),
             RET => ins_ret(ecx),
-            TRET => todo!(),
             UB => ins_ub(ecx),
             ABORT => ins_abort(ecx),
             PHI => ins_phi(ecx, id),
@@ -483,7 +526,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             BOX => ins_box(ecx, id),
             ABOX => ins_abox(ecx, id),
             BREF => ins_bref(ecx, id),
-            CALL => todo!(),
+            CALL => ins_call(ecx, id),
             CALLC | CALLCI => ins_callc(ecx, id),
             CARG => { /* NOP */ },
             RES => ins_res(ecx, id),

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
-use crate::index::{self, IndexOption, IndexSet, IndexSlice, IndexVec};
+use crate::index::{self, IndexOption, IndexSet, IndexSlice, IndexVec, InvalidValue};
 use crate::ir::{FuncId, FuncKind, Ins, InsId, Opcode, IR};
 use crate::optimize::{Ocx, Pass};
 use crate::trace::trace;
@@ -37,12 +37,11 @@ macro_rules! define_costs {
 // regular CALL should consider code size cost instead.
 define_costs! {
     NOP | JMP | GOTO | UB | ABORT | PHI | KINT | KINT64 | KFP64 | KSTR | KREF
-       | MOV | MOVB | MOVF | CONV | ABOX | BREF | CARG | RES | RET | TRET => 0,
+       | MOV | MOVB | MOVF | CONV | ABOX | BREF | CARG | RES | RET  => 0,
     ADD | SUB | MUL | DIV | UDIV | NEG | ADDP | EQ | NE | LT | LE | ULT | ULE
         | STORE | LOAD | BOX | IF => 1,
-    // TODO: CALL cost should depend on called function
-    POW | ALLOC | CALL | CALLC | CALLCI => 5,
-    CINIT | LO | LOV | LOVV | LOVX | LOX | LOXX => 255
+    POW | ALLOC | CALLC | CALLCI => 5,
+    CALL | CINIT | LO | LOV | LOVV | LOVX | LOX | LOXX => 255
 }
 
 const LOOP_COST: u32 = 255;
@@ -56,7 +55,7 @@ fn execcost(op: Opcode) -> u32 {
     OP_COST[op as usize] as _
 }
 
-const CALLER_CALLC: u32 = 0x80000000;
+const CALLER_CALLX: u32 = 0x80000000;
 
 #[derive(Default, Clone, Copy)]
 enum InlineState {
@@ -112,13 +111,13 @@ fn hasloop(
 fn visitcallers(ir: &IR, inline: &mut Inline, fid: FuncId) {
     for (_, ins) in ir.funcs[fid].code.pairs() {
         let op = ins.opcode();
-        if (Opcode::CALLC|Opcode::CALLCI).contains(op) {
-            let (_, _, f) = ins.decode_CALLC();
+        if op.is_call() {
+            let f = ins.decode_F();
             let fd = &mut inline.func[f];
             debug_assert!(ir.funcs[f].reset.is_subset(&ir.funcs[fid].reset));
             let callers = fd.callers;
-            if op == Opcode::CALLC || ir.funcs[f].reset != ir.funcs[fid].reset {
-                fd.callers |= CALLER_CALLC;
+            if op != Opcode::CALLCI || ir.funcs[f].reset != ir.funcs[fid].reset {
+                fd.callers |= CALLER_CALLX;
             } else {
                 fd.callers += 1;
             }
@@ -210,8 +209,8 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
     let func = &ccx.ir.funcs[fid];
     let mut code = func.code.take_inner();
     inl.control.map_all(&mut code, &inl.inst);
-    let mut phi_base = 0usize;
-    let mut dest: InsId = 0.into();
+    let mut phi_base = !0usize;
+    let mut dest: InsId = InsId::INVALID.into();
     for action in &inl.actions {
         match action {
             &Action::Fixup(at, old, new) => {
@@ -222,21 +221,39 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
                 }
             },
             &Action::Inline(at, dest_) => {
-                let (idx, _, fu) = code[at].decode_CALLC();
+                let op = code[at].opcode();
+                let fu = code[at].decode_F();
+                *cost -= execcost(op);
                 *cost += inl.func[fu].cost;
                 dest = dest_;
                 phi_base = func.phis.end().into();
-                let ins_base: usize = code.end().into();
                 let other = &ccx.ir.funcs[fu];
-                let entry = other.entry + ins_base as isize;
-                func.phis.extend(other.phis.pairs().map(|(_,p)|p));
-                code[at] = match other.params() {
-                    r if r.is_empty() => Ins::GOTO(entry),
-                    Range { start, end } => {
-                        debug_assert!(end == start+1);
-                        Ins::JMP(idx, entry, start + phi_base as isize)
+                let mut ins_base: usize = code.end().into();
+                if op == Opcode::CALL {
+                    ins_base += (other.arg-other.ret) as usize; // make space for JMPs. hacky but oh well.
+                    let entry = other.entry + ins_base as isize;
+                    let mut args = code[at].decode_V();
+                    let mut enter = Ins::GOTO(entry);
+                    let mut phi = other.params().start + phi_base as isize;
+                    while code[args].opcode() == Opcode::CARG {
+                        let (next, value) = code[args].decode_CARG();
+                        enter = Ins::JMP(value, code.push(enter), phi);
+                        args = next;
+                        phi += 1;
                     }
-                };
+                    code[at] = enter;
+                } else {
+                    let entry = other.entry + ins_base as isize;
+                    code[at] = match other.params() {
+                        r if r.is_empty() => Ins::GOTO(entry),
+                        Range { start, end } => {
+                            debug_assert!(end == start+1);
+                            let idx = code[at].decode_V();
+                            Ins::JMP(idx, entry, start + phi_base as isize)
+                        }
+                    };
+                }
+                func.phis.extend(other.phis.pairs().map(|(_,p)|p));
                 for (_, mut ins) in other.code.pairs() {
                     if ins.opcode() == Opcode::RET {
                         ins = Ins::GOTO(dest);
@@ -293,7 +310,7 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     for (id, ins) in ccx.ir.funcs[fid].code.pairs() {
         let op = ins.opcode();
         cost += execcost(op);
-        if (Opcode::CALLC|Opcode::CALLCI).contains(op) {
+        if op.is_call() {
             calls.push(id);
         }
     }
@@ -301,7 +318,7 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     let mut end = calls.end().cast::<InsId>();
     let mut call = base.cast_up::<InsId>();
     while call < end {
-        let (_, _, f) = ccx.ir.funcs[fid].code.at(ccx.tmp[call]).decode_CALLC();
+        let f = ccx.ir.funcs[fid].code.at(ccx.tmp[call]).decode_F();
         match visitinline(ccx, f) {
             InlineState::Yes => {
                 call = call.offset(1);
@@ -316,7 +333,6 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     let (start, end) = (base.cast_up::<InsId>(), call);
     // perform inline
     if end > start {
-        cost -= (end.index()-start.index()) as u32 * execcost(Opcode::CALLC);
         inlinecalls(ccx, fid, start..end, &mut cost);
     }
     ccx.tmp.truncate(base);
@@ -324,7 +340,7 @@ fn visitinline(ccx: &mut Ocx, fid: FuncId) -> InlineState {
     match fd.state {
         InlineState::Working => {
             let func = &mut ccx.ir.funcs[fid];
-            if let FuncKind::Chunk(_) = func.kind {
+            if let FuncKind::Chunk(_)|FuncKind::User = func.kind {
                 ccx.mark1.clear();
                 ccx.mark2.clear();
                 // queries are always leaf functions, so don't bother checking this for queries.
@@ -362,9 +378,10 @@ fn sweepdead(
     work: &mut IndexSlice<FuncId, IndexOption<FuncId>>
 ) {
     for (f,(fd,w)) in zip(&ir.funcs.raw, zip(&fda.raw, &mut work.raw)) {
-        *w = (!matches!((&f.kind, fd),
-            (FuncKind::Chunk(_), FuncData {state:InlineState::Yes|InlineState::Undetermined,..})
-        )).then_some(0.into()).into();
+        *w = (!matches!((&f.kind, fd), (
+                    FuncKind::Chunk(_)|FuncKind::User,
+                    FuncData {state:InlineState::Yes|InlineState::Undetermined,..}
+        ))).then_some(0.into()).into();
     }
     let mut left = 0.into();
     let mut right = ir.funcs.end();
@@ -389,9 +406,13 @@ fn sweepdead(
         for func in &mut ir.funcs.raw {
             for ins in &mut func.code.inner_mut().raw {
                 match ins.opcode() {
-                    Opcode::CALLC|Opcode::CALLCI => {
+                    Opcode::CALL => {
                         // at this point all ir functions are live, and live functions do
                         // not call dead functions.
+                        debug_assert!(work[zerocopy::transmute!(ins.b())].is_some());
+                        *ins = ins.set_b(zerocopy::transmute!(work[zerocopy::transmute!(ins.b())]));
+                    }
+                    Opcode::CALLC|Opcode::CALLCI => {
                         debug_assert!(work[zerocopy::transmute!(ins.c())].is_some());
                         *ins = ins.set_c(zerocopy::transmute!(work[zerocopy::transmute!(ins.c())]));
                     },
