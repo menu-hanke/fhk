@@ -13,7 +13,7 @@ use crate::compile::{self, Ccx};
 use crate::data::{CALL_LUA, TENSOR_LUA};
 use crate::emit::{irt2cl, Ecx, Emit, InsValue};
 use crate::image::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance, SwapInit};
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
@@ -21,7 +21,7 @@ use crate::lower::{decompose, decomposition, decomposition_size, reserve, CLcx};
 use crate::mmap::{Mmap, Prot};
 use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALL, EXPR, NEW, TPRI, TTEN, TTUP};
 use crate::parse::parse_expr;
-use crate::parser::{check, consume, next, require, Pcx};
+use crate::parser::{check, consume, next, Pcx};
 use crate::support::SuppFunc;
 
 #[cfg(all(unix, not(feature="host-Lua")))]
@@ -115,8 +115,8 @@ pub struct Lua {
 
 bump::vla_struct! {
     struct LuaFunc {
-        load: Unalign<IRef<[u8]>>,
-        template: Unalign<IRef<[u8]>>,
+        load: Unalign<Interned<[u8]>>,
+        template: Unalign<Interned<[u8]>>,
         no: u8
     } out: [u8; |lf| lf.no as usize]
 }
@@ -124,14 +124,14 @@ bump::vla_struct! {
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct LuaCall {
-    load: IRef<[u8]>,
-    template: IRef<[u8]>,
-    ret: IRef<[ObjRef]>
+    load: Interned<[u8]>,
+    template: Interned<[u8]>,
+    ret: Interned<[ObjRef]>
 }
 
 // execute a lua function call.
 // before begin_emit:
-//   FX LOVV (args: CARG LOP_VALUE) (func: KREF IRef<LuaCall>)
+//   FX LOVV (args: CARG LOP_VALUE) (func: KREF Interned<LuaCall>)
 // after begin_emit:
 //   FX LOVX (args unchanged) (func: jump table index)
 const LOP_CALL: u8 = 0;
@@ -228,17 +228,15 @@ fn parse_luavalue(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
 
 fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
     consume(pcx, Token::LBracket)?;
-    require(pcx, Token::Literal)?;
-    let mut load: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
-    next(pcx)?;
+    let mut load: Interned<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
     if check(pcx, Token::Colon)? {
         // TODO: this needs some escaping but that's a problem for another day.
-        let name: IRef<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
+        let name: Interned<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
         let base = pcx.tmp.end();
         pcx.tmp.write(b"return require(\"");
-        pcx.tmp.write(pcx.intern.get_slice(load));
+        pcx.tmp.write(&pcx.intern[load]);
         pcx.tmp.write(b"\")[\"");
-        pcx.tmp.write(pcx.intern.get_slice(name));
+        pcx.tmp.write(&pcx.intern[name]);
         pcx.tmp.write(b"\"]");
         load = pcx.intern.intern(&pcx.tmp[base..]);
         pcx.tmp.truncate(base);
@@ -411,10 +409,10 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
                     }
                     lib.lua_settop(L, -2);
                     lib.lua_setfield(L, -2, c"inputs".as_ptr());
-                    let cref: IRef<LuaCall> = zerocopy::transmute!(func.code.at(cref).bc());
+                    let cref: Interned<LuaCall> = zerocopy::transmute!(func.code.at(cref).bc());
                     let call = &ccx.intern[cref];
                     lib.lua_createtable(L, 0, 0); // returns
-                    for (i,&ret) in ccx.intern.get_slice(call.ret).iter().enumerate() {
+                    for (i,&ret) in ccx.intern[call.ret].iter().enumerate() {
                         lib.lua_createtable(L, 0, 0);
                         pushctype(&ccx.objs, lib, L, ctidx, ret);
                         lib.lua_setfield(L, -2, c"ctype".as_ptr());
@@ -423,10 +421,10 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
                         lib.lua_rawseti(L, -2, (i+1) as _);
                     }
                     lib.lua_setfield(L, -2, c"returns".as_ptr());
-                    let load = ccx.intern.get_slice(call.load);
+                    let load = &ccx.intern[call.load];
                     lib.lua_pushlstring(L, load.as_ptr(), load.len() as _);
                     lib.lua_setfield(L, -2, c"load".as_ptr());
-                    let template = ccx.intern.get_slice(call.template);
+                    let template = &ccx.intern[call.template];
                     lib.lua_pushlstring(L, template.as_ptr(), template.len() as _);
                     lib.lua_setfield(L, -2, c"template".as_ptr());
                     jump += 1;

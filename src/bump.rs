@@ -105,6 +105,12 @@ unsafe impl<T> FromBytes for T where T: ?Sized + zerocopy::FromBytes {}
 unsafe impl<T> IntoBytes for T where T: ?Sized + zerocopy::IntoBytes {}
 unsafe impl<T> Immutable for T where T: ?Sized + zerocopy::Immutable {}
 
+pub fn as_bytes<T>(value: &T) -> &[u8]
+    where T: ?Sized + IntoBytes
+{
+    unsafe { core::slice::from_raw_parts(value as *const T as *const u8, size_of_val(value)) }
+}
+
 /* ---- Bump references ----------------------------------------------------- */
 
 impl<T: ?Sized> BumpRef<T> {

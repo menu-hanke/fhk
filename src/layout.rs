@@ -92,7 +92,7 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
             FuncKind::Chunk(Chunk { scl, slots, dynslots, check, .. }) => {
                 if scl.is_dynamic() {
                     // alloc dynamic slot data for CINIT
-                    *dynslots = ctx.mcode.data.bump().end().cast_up();
+                    *dynslots = ctx.mcode.align_data_for::<DynSlot>();
                     let mut ds = slot;
                     for phi in index::iter_span(func.ret) {
                         let ty = func.phis.at(phi).type_;
@@ -102,12 +102,12 @@ fn save(ctx: &mut Ccx<ComputeLayout>) {
                                 SlotType::Data => DynSlot::new_data(value.byte(), ty.size() as _),
                                 _ => DynSlot::new_bitmap(value.byte(), false, value.bit())
                             };
-                            ctx.mcode.data.write(&dslot);
+                            ctx.mcode.write_data(&dslot);
                             ds += 1;
                         }
                     }
                     let SlotDef { value, sty, .. } = slotdefs[ds];
-                    ctx.mcode.data.write(
+                    ctx.mcode.write_data(
                         &DynSlot::new_bitmap(value.byte(), sty == SlotType::BitmapDup, value.bit()));
                 }
                 // alloc vmctx slots (fx slots don't matter, they will never be read/written)

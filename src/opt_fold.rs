@@ -5,12 +5,11 @@ use core::mem::swap;
 use alloc::collections::vec_deque::VecDeque;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
-use zerocopy::Unalign;
 
-use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::hash::fxhash;
 use crate::index::{IndexOption, IndexVec};
+use crate::intern::Interned;
 use crate::ir::{ins_matches, Func, FuncId, Ins, InsId, Opcode, Type};
 use crate::optimize::{FuncPass, Ocx, Optimize};
 use crate::typestate::{Absent, Access, R};
@@ -32,35 +31,40 @@ enum FoldStatus {
     // Old(InsId)
 }
 
-fn kintvalue(fcx: &Fcx, ins: Ins) -> i64 {
-    use Opcode::*;
+enum Knumv {
+    Int(i64),
+    Fp(f64)
+}
+
+fn knumvalue(fcx: &Fcx, ins: Ins) -> Knumv {
+    use {Opcode::*,Knumv::*};
     match ins.opcode() {
-        KINT => ins.bc() as i32 as _,
+        KINT => Int(ins.bc() as i32 as _),
         KINT64 => {
-            let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(ins.bc());
-            fcx.intern.bump()[data].get()
+            let data: Interned<i64> = zerocopy::transmute!(ins.bc());
+            Int(fcx.intern[data])
         },
         KFP64 => {
-            let data: BumpRef<Unalign<f64>> = zerocopy::transmute!(ins.bc());
-            fcx.intern.bump()[data].get() as _
+            let data: Interned<f64> = zerocopy::transmute!(ins.bc());
+            Fp(fcx.intern[data])
         },
         _ => unreachable!()
     }
 }
 
+fn kintvalue(fcx: &Fcx, ins: Ins) -> i64 {
+    use Knumv::*;
+    match knumvalue(fcx, ins) {
+        Int(x) => x,
+        Fp(x) => x as _
+    }
+}
+
 fn kfpvalue(fcx: &Fcx, ins: Ins) -> f64 {
-    use Opcode::*;
-    match ins.opcode() {
-        KINT => ins.bc() as i32 as _,
-        KINT64 => {
-            let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(ins.bc());
-            fcx.intern.bump()[data].get() as _
-        },
-        KFP64 => {
-            let data: BumpRef<Unalign<f64>> = zerocopy::transmute!(ins.bc());
-            fcx.intern.bump()[data].get()
-        },
-        _ => unreachable!()
+    use Knumv::*;
+    match knumvalue(fcx, ins) {
+        Int(x) => x as _,
+        Fp(x) => x
     }
 }
 
@@ -68,7 +72,7 @@ fn newkint(fcx: &mut Fcx, ty: Type, value: i64) -> Ins {
     if value == (value as i32) as _ {
         Ins::KINT(ty, value as _)
     } else {
-        Ins::KINT64(ty, zerocopy::transmute!(fcx.intern.intern(&value.to_ne_bytes()).to_bump()))
+        Ins::KINT64(ty, zerocopy::transmute!(fcx.intern.intern(&value)))
     }
 }
 
@@ -76,7 +80,7 @@ fn newkfp(fcx: &mut Fcx, ty: Type, value: f64) -> Ins {
     if value == (value as i32) as _ {
         Ins::KINT(ty, value as i32 as _)
     } else {
-        Ins::KFP64(ty, zerocopy::transmute!(fcx.intern.intern(&value.to_ne_bytes()).to_bump()))
+        Ins::KFP64(ty, zerocopy::transmute!(fcx.intern.intern(&value)))
     }
 }
 

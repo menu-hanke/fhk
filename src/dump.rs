@@ -10,7 +10,7 @@ use crate::bump::Bump;
 use crate::controlflow::BlockId;
 use crate::emit::InsValue;
 use crate::index::{self, IndexSlice};
-use crate::intern::Intern;
+use crate::intern::{Intern, Interned};
 use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, OperandData, PhiId, IR};
 use crate::mem::{BreakpointId, Layout};
 use crate::obj::{FieldType, ObjRef, ObjectRef, Objects, Operator, FUNC, MOD, TAB, VAR, VSET};
@@ -25,12 +25,15 @@ fn dump_field(buf: &mut Bump, intern: &Intern, fty: FieldType, value: u32) {
         Lit  => write!(buf, "{}", value as i32).unwrap(),
         Ref if value == zerocopy::transmute!(ObjRef::NIL) => { buf.write(b"(nil)"); },
         Ref  => write!(buf, "{:?}", {let r: ObjRef = zerocopy::transmute!(value); r}).unwrap(),
-        Name => stringify(
-            buf,
-            intern,
-            intern.get_slice(zerocopy::transmute!(value)),
-            SequenceType::Pattern // doesn't matter what is passed here, it doesn't have captures
-        ),
+        Name => {
+            let value: Interned<[u8]> = zerocopy::transmute!(value);
+            stringify(
+                buf,
+                intern,
+                &intern[value],
+                SequenceType::Pattern // doesn't matter what is passed here, it doesn't have captures
+            )
+        },
         _ => unreachable!()
     }
 }
@@ -94,7 +97,7 @@ fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugS
                 | ObjectRef::TAB(&TAB { name, .. })
                 | ObjectRef::FUNC(&FUNC { name, .. }) => {
             buf.push(b'(');
-            stringify(buf, intern, intern.get_slice(name), SequenceType::Pattern);
+            stringify(buf, intern, &intern[name], SequenceType::Pattern);
             buf.push(b')');
         },
         ObjectRef::MOD(MOD { outputs, .. }) => {
@@ -103,7 +106,7 @@ fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugS
                 if i>0 { buf.push(b','); }
                 let VSET { var, .. } = objs[vset];
                 let VAR { name, .. } = objs[var];
-                stringify(buf, intern, intern.get_slice(name), SequenceType::Pattern);
+                stringify(buf, intern, &intern[name], SequenceType::Pattern);
             }
             buf.push(b')');
         },

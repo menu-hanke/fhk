@@ -15,18 +15,19 @@ use cranelift_codegen::ir::InstBuilder;
 use zerocopy::Unalign;
 
 use crate::array::{Array, ArrayBuf, ArrayMut, ArrayType};
-use crate::bump::{AlignedBytes, BumpRef};
+use crate::bump::AlignedBytes;
 use crate::compile::Ccx;
 use crate::data::CALL_R;
 use crate::dl::LibBox;
 use crate::emit::{irt2cl, signature, Ecx, Emit, InsValue, Signature, NATIVE_CALLCONV};
 use crate::image::{fhk_vmexit, Instance};
+use crate::intern::Interned;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lower::{areserve, decompose, decomposition, decomposition_size, reserve, CLcx};
+use crate::mcode::MCodeOffset;
 use crate::mem::{CursorA, CursorType};
 use crate::typing::{Idx, Primitive, IRT_IDX};
 use crate::{compile, dl};
-use crate::intern::IRef;
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
 use crate::obj::{ObjRef, ObjectRef, CALL, TTUP};
@@ -178,14 +179,14 @@ r_api! {
 pub struct R {
     lib: Box<LibR>, // boxed to keep size of LangState reasonable.
     loader: SEXP,
-    rt: BumpRef<RuntimeLibR>
+    rt: MCodeOffset
 }
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct RFunc {
-    source: IRef<[u8]>,
-    expr: IRef<[u8]>,
+    source: Interned<[u8]>,
+    expr: Interned<[u8]>,
 }
 
 // note: if you change the layout, make sure to also update the construction in emit_call.
@@ -198,7 +199,7 @@ struct Call {
 }
 
 // execute an R function call.
-// FX LOVV (CARG LOP_VALUE*) (KREF IRef<RFunc>)
+// FX LOVV (CARG LOP_VALUE*) (KREF Interned<RFunc>)
 const LOP_CALL: u8 = 0;
 
 // LSV LOVV ([A]BOX) (KREF type)
@@ -210,11 +211,11 @@ const LOP_OUTPUT: u8 = 2;
 fn parse_call(pcx: &mut Pcx) -> compile::Result<ObjRef<CALL>> {
     consume(pcx, Token::LBracket)?;
     let (source, expr) = {
-        let lit: IRef<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
+        let lit: Interned<[u8]> = zerocopy::transmute!(consume(pcx, Token::Literal)?);
         if check(pcx, Token::Colon)? {
             (lit, zerocopy::transmute!(consume(pcx, Token::Literal)?))
         } else {
-            (IRef::EMPTY, lit)
+            (Interned::EMPTY, lit)
         }
     };
     let rf = pcx.intern.intern(&RFunc { source, expr });
@@ -350,7 +351,7 @@ fn begin_emit(ccx: &mut Ccx) -> compile::Result<R> {
     // load the loader. this cannot fail.
     let loader = unsafe { lib.R_ParseEvalString(CALL_R.as_ptr().cast(), *lib.R_GlobalEnv) };
     // define the runtime library.
-    let rt = ccx.mcode.data.intern(&RuntimeLibR::new(&lib)).to_bump();
+    let rt = ccx.mcode.intern_data(&RuntimeLibR::new(&lib));
     Ok(R { lib, loader, rt })
 }
 
@@ -376,8 +377,8 @@ fn emit_call(ecx: &mut Ecx, id: InsId) -> compile::Result<InsValue> {
         let rf: &RFunc = &ecx.intern[zerocopy::transmute!(emit.code[rf].bc())];
         let mut err = 0;
         unsafe {
-            let source = lib.Rf_protect(optstring(lib, ecx.intern.get_slice(rf.source)));
-            let expr = lib.Rf_protect(optstring(lib, ecx.intern.get_slice(rf.expr)));
+            let source = lib.Rf_protect(optstring(lib, &ecx.intern[rf.source]));
+            let expr = lib.Rf_protect(optstring(lib, &ecx.intern[rf.expr]));
             let call = lib.Rf_lang3(loader, source, expr);
             let fun = lib.R_tryEval(call, *lib.R_GlobalEnv, &mut err);
             lib.Rf_unprotect(2);
@@ -411,14 +412,10 @@ fn emit_call(ecx: &mut Ecx, id: InsId) -> compile::Result<InsValue> {
         args = next;
     }
     ecx.tmp[info] = [narg, nret];
-    let calldata = emit.fb.importdata(
-        &mut ecx.mcode,
-        AlignedBytes::<{align_of::<Call>()}>::new(&ecx.tmp[base..])
-    );
+    let calldata = emit.fb.usedata(
+        ecx.mcode.intern_data(AlignedBytes::<{align_of::<Call>()}>::new(&ecx.tmp[base..])));
     ecx.tmp.truncate(base);
-    let calldata = emit.fb.dataptr(calldata);
-    let rt = emit.fb.importdataref(rt.cast());
-    let rt = emit.fb.dataptr(rt);
+    let rt = emit.fb.usedata(rt);
     let mut sig = cranelift_codegen::ir::Signature::new(NATIVE_CALLCONV);
     CALL_SIGNATURE.to_cranelift(&mut sig);
     let sig = emit.fb.ctx.func.import_signature(sig);

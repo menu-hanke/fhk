@@ -211,7 +211,7 @@ fn internint(pcx: &mut Pcx, v: i64) -> Token {
     let (token, data) = if (v as i32) as i64 == v {
         (Token::Int, v as _)
     } else {
-        (Token::Int64, zerocopy::transmute!(pcx.intern.intern(&v.to_ne_bytes()).to_bump()))
+        (Token::Int64, zerocopy::transmute!(pcx.intern.intern(&v)))
     };
     pcx.data.tdata = data;
     token
@@ -221,7 +221,7 @@ fn internfloat(pcx: &mut Pcx, v: f64) -> Token {
     if (v as i64) as f64 == v {
         internint(pcx, v as i64)
     } else {
-        pcx.data.tdata = zerocopy::transmute!(pcx.intern.intern(&v.to_ne_bytes()).to_bump());
+        pcx.data.tdata = zerocopy::transmute!(pcx.intern.intern(&v));
         Token::Fp64
     }
 }

@@ -14,7 +14,7 @@ use crate::compile::{self, Ccx};
 use crate::dl::{self, LibBox};
 use crate::emit::{cast_values, irt2cl, Ecx, InsValue, NATIVE_CALLCONV};
 use crate::index::InvalidValue;
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
@@ -188,8 +188,8 @@ impl Output {
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 struct Sym {
-    lib: IRef<[u8]>,
-    sym: IRef<[u8]>,
+    lib: Interned<[u8]>,
+    sym: Interned<[u8]>,
 }
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
@@ -295,7 +295,8 @@ fn parse_indirection(pcx: &mut Pcx) -> compile::Result<u8> {
 
 fn parse_ctype(pcx: &mut Pcx) -> compile::Result<CType> {
     require(pcx, Token::Ident)?;
-    let Some(pri) = CPrimitive::from_name(pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
+    let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+    let Some(pri) = CPrimitive::from_name(&pcx.intern[name])
         else { todo!() /* TODO: report error (invalid ctype) */ };
     next(pcx)?;
     let indir = parse_indirection(pcx)?;
@@ -427,8 +428,8 @@ fn parse_cexpr(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     match pcx.data.token {
         Token::Colon => {
             next(pcx)?;
-            require(pcx, Token::Ident)?;
-            if pcx.intern.get_slice::<u8>(zerocopy::transmute!(pcx.data.tdata)) != b"struct" {
+            let ident: Interned<[u8]> = zerocopy::transmute!(require(pcx, Token::Ident)?);
+            if &pcx.intern[ident] != b"struct" {
                 // TODO: report error (expected `struct`)
                 todo!()
             }
@@ -445,7 +446,7 @@ fn parse_cexpr(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result<CExpr> {
     }
 }
 
-fn newsymref(sym: BumpRef<Sym>) -> u32 {
+fn newsymref(sym: Interned<Sym>) -> u32 {
     let sym: u32 = zerocopy::transmute!(sym);
     !sym
 }
@@ -470,9 +471,9 @@ fn parse_call(pcx: &mut Pcx, ps: &mut ParseState) -> compile::Result {
                     next(pcx)?;
                     Sym { lib: s, sym }
                 },
-                false => Sym { lib: IRef::EMPTY, sym: s }
+                false => Sym { lib: Interned::EMPTY, sym: s }
             };
-            let sym = pcx.intern.intern(&sym).to_bump();
+            let sym = pcx.intern.intern(&sym);
             pcx.objs.push(CALL::new(Lang::C as _, ObjRef::PTR.erase(), newsymref(sym))).cast()
         },
         _ => {
@@ -709,18 +710,18 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
     // this allocates instead of using ccx.tmp because dealing with pointers with zerocopy is aids.
     // big deal, this happens once per compilation and dlopen is much slower than an allocation
     // anyway.
-    let mut libs: Vec<(IRef<[u8]>, LibBox)> = Default::default();
+    let mut libs: Vec<(Interned<[u8]>, LibBox)> = Default::default();
     let tmp_base = ccx.tmp.end();
     for func in &mut ccx.ir.funcs.raw {
         for ins in &mut func.code.inner_mut().raw {
             if ins.opcode() == Opcode::LOXX && ins.decode_L() == LangOp::C(LOP_CSYM) {
                 let (_, fsym) = ins.decode_LOXX();
-                let fsym: BumpRef<Sym> = zerocopy::transmute!(fsym);
-                let Sym { lib, sym } = ccx.intern.bump()[fsym];
+                let fsym: Interned<Sym> = zerocopy::transmute!(fsym);
+                let Sym { lib, sym } = ccx.intern[fsym];
                 let handle = match libs.iter().find_map(|(l,h)| (lib==*l).then_some(&*h)) {
                     Some(handle) => handle,
                     None => {
-                        let libname = ccx.intern.get_slice(lib);
+                        let libname = &ccx.intern[lib];
                         ccx.tmp.truncate(tmp_base);
                         ccx.tmp.write(libname);
                         ccx.tmp.push(0u8);
@@ -735,7 +736,7 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
                         &*libs.last().unwrap().1
                     }
                 };
-                let symname = ccx.intern.get_slice(sym);
+                let symname = &ccx.intern[sym];
                 ccx.tmp.truncate(tmp_base);
                 ccx.tmp.write(symname);
                 ccx.tmp.push(0u8);
@@ -747,7 +748,7 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
                     ccx.host.buf.write("'");
                     return Err(());
                 }
-                let fp = ccx.intern.intern(&(fp as u64).to_ne_bytes()).to_bump();
+                let fp = ccx.intern.intern(&(fp as u64));
                 *ins = Ins::KINT64(Type::PTR, zerocopy::transmute!(fp));
             }
         }

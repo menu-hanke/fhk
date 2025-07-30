@@ -3,15 +3,14 @@
 use core::mem::{transmute, ManuallyDrop};
 
 use enumset::EnumSet;
-use zerocopy::IntoBytes;
 
-use crate::bump::{Bump, BumpRef};
+use crate::bump::Bump;
 use crate::emit::Emit;
 use crate::finalize::FinalizerBuilder;
 use crate::host::HostCtx;
 use crate::image::Image;
 use crate::index::IndexSet;
-use crate::intern::{Intern, IRef};
+use crate::intern::{Intern, Interned};
 use crate::ir::{InsId, IR};
 use crate::layout::ComputeLayout;
 use crate::lex::Token;
@@ -106,15 +105,15 @@ pub struct CompileStage<'a, P, T: StageMarker> {
 
 impl Ccx<Absent> {
 
-    pub const SEQ_GLOBAL: IRef<[u8]> = IRef::small_from_end_size(11, 5);
+    pub const SEQ_GLOBAL: Interned<[u8]> = Interned::small_from_raw_parts(6, 5);
 
     pub fn new(host: HostCtx) -> Self {
         let mut intern = Intern::default();
-        let global_str = intern.intern("global");
-        debug_assert!(global_str == IRef::small_from_end_size(6, 6));
-        intern.write(&(Token::Ident as u8));
-        intern.write(global_str.as_bytes()); // must be unaligned
-        let global_seq = intern.intern_consume_from(BumpRef::from_ptr(6));
+        let global_str: Interned<[u8]> = intern.intern(b"global");
+        debug_assert!(global_str == Interned::small_from_raw_parts(0, 6));
+        let global_str: [u8; 4] = zerocopy::transmute!(global_str);
+        let global_seq: Interned<[u8]> = intern.intern(&[Token::Ident as u8, global_str[0],
+            global_str[1], global_str[2], global_str[3]]);
         debug_assert!(global_seq == Self::SEQ_GLOBAL);
         Self {
             host,

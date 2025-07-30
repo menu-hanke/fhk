@@ -12,7 +12,7 @@ use cranelift_entity::packed_option::ReservedValue;
 use enumset::EnumSet;
 
 use crate::bitmap::BitMatrix;
-use crate::bump::{self, Aligned, Bump};
+use crate::bump::Bump;
 use crate::compile::{self, Ccx, Stage};
 use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
@@ -20,7 +20,7 @@ use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
 use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
-use crate::mcode::{MCode, MCodeData, MCodeOffset, Reloc, Sym};
+use crate::mcode::{MCode, MCodeOffset, Reloc, Sym};
 use crate::mem::{CursorA, SizeClass, Slot};
 use crate::schedule::{compute_schedule, Gcm};
 use crate::support::{emitsupport, NativeFunc, SuppFunc};
@@ -211,10 +211,6 @@ impl FuncBuilder {
         self.ins().get_pinned_reg(irt2cl(Type::PTR))
     }
 
-    pub fn dataptr(&mut self, data: GlobalValue) -> Value {
-        self.ins().global_value(irt2cl(Type::PTR), data)
-    }
-
     pub fn kload(&mut self, type_: Type, ptr: Value) -> Value {
         self.ins().load(irt2cl(type_), MemFlags::trusted().with_readonly(), ptr, 0)
     }
@@ -297,9 +293,8 @@ fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
 
 impl FuncBuilder {
 
-    pub fn importdataref(&mut self, ptr: MCodeData) -> GlobalValue {
-        let nameref = self.ctx.func.declare_imported_user_function(
-            UserExternalName::new(Sym::Data as _, zerocopy::transmute!(ptr)));
+    pub fn importdata(&mut self, ptr: MCodeOffset) -> GlobalValue {
+        let nameref = self.ctx.func.declare_imported_user_function(UserExternalName::new(Sym::Data as _, ptr));
         self.ctx.func.create_global_value(GlobalValueData::Symbol {
             name: ExternalName::user(nameref),
             offset: 0.into(),
@@ -308,10 +303,9 @@ impl FuncBuilder {
         })
     }
 
-    pub fn importdata<T>(&mut self, mcode: &mut MCode, value: &T) -> GlobalValue
-        where T: ?Sized + Aligned + bump::IntoBytes
-    {
-        self.importdataref(mcode.data.intern(value).to_bump_sized(size_of_val(value)).cast())
+    pub fn usedata(&mut self, ptr: MCodeOffset) -> Value {
+        let gv = self.importdata(ptr);
+        self.ins().global_value(irt2cl(Type::PTR), gv)
     }
 
     fn importfuncref(
@@ -498,13 +492,12 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
 }
 
 fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
-    let loc = mcode.code.end().ptr() as MCodeOffset;
-    mcode.code.write(buf);
+    let loc = mcode.write_code(buf);
     mcode.align_code();
     if trace!(MCODE) {
         let mut sbuf = Default::default();
         // dump mcode.code here rather than buf to also print the nop padding.
-        dump_mcode(&mut sbuf, &mcode.code.as_slice()[loc as usize..]);
+        dump_mcode(&mut sbuf, &mcode.code()[loc as usize..]);
         trace!("{}", core::str::from_utf8(sbuf.as_slice()).unwrap());
     }
     loc

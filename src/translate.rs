@@ -2,10 +2,9 @@
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{InstBuilder, MemFlags, TrapCode, Value};
-use zerocopy::Unalign;
 
-use crate::bump::BumpRef;
 use crate::controlflow::BlockId;
+use crate::intern::Interned;
 use crate::lang::Lang;
 use crate::mem::{CursorType, SizeClass};
 use crate::compile;
@@ -175,8 +174,8 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
     let k = match ins.opcode() {
         Opcode::KINT => data as i32 as i64,
         Opcode::KINT64 => {
-            let data: BumpRef<Unalign<i64>> = zerocopy::transmute!(data);
-            ecx.intern.bump()[data].get()
+            let data: Interned<i64> = zerocopy::transmute!(data);
+            ecx.intern[data]
         },
         _ => unreachable!()
     };
@@ -184,11 +183,10 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
         I8 | I16 | I32 | I64 | PTR | B1 => ecx.data.fb.ins().iconst(irt2cl(type_), k),
         F32 | F64 => {
             let data = match type_ {
-                F32 => ecx.mcode.data.intern(&(k as f32)).to_bump().cast(),
-                _   => ecx.mcode.data.intern(&(k as f64)).to_bump().cast()
+                F32 => ecx.mcode.intern_data(&(k as f32)),
+                _   => ecx.mcode.intern_data(&(k as f64)),
             };
-            let data = ecx.data.fb.importdataref(data);
-            let ptr = ecx.data.fb.dataptr(data);
+            let ptr = ecx.data.fb.usedata(data);
             ecx.data.fb.kload(type_, ptr)
         },
         FX | LSV => unreachable!()
@@ -199,16 +197,15 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
 fn ins_kfp64(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
-    let b: BumpRef<Unalign<f64>> = zerocopy::transmute!(ins.bc());
-    let k = ecx.intern.bump()[b].get();
+    let b: Interned<f64> = zerocopy::transmute!(ins.bc());
+    let k = ecx.intern[b];
     let type_ = ins.type_();
     let data = match type_ {
-        Type::F32 => ecx.mcode.data.intern(&(k as f32)).to_bump().cast(),
-        Type::F64 => ecx.mcode.data.intern(&k).to_bump().cast(),
+        Type::F32 => ecx.mcode.intern_data(&(k as f32)),
+        Type::F64 => ecx.mcode.intern_data(&k),
         _ => unreachable!()
     };
-    let data = emit.fb.importdataref(data);
-    let ptr = emit.fb.dataptr(data);
+    let ptr = emit.fb.usedata(data);
     emit.values[id] = InsValue::from_value(emit.fb.kload(type_, ptr));
 }
 
@@ -481,8 +478,7 @@ fn ins_cinit(ecx: &mut Ecx, id: InsId) {
     let FuncKind::Chunk(chunk) = &func.kind else { unreachable!() };
     if !chunk.scl.is_dynamic() { /* NOP */ return }
     let dsinit = emit.fb.importsupp(&ecx.ir, SuppFunc::INIT);
-    let tab = emit.fb.importdataref(chunk.dynslots.cast());
-    let tab = emit.fb.dataptr(tab);
+    let tab = emit.fb.usedata(chunk.dynslots);
     let nret: usize = func.ret.into();
     // bitmap + one for each return
     let num = emit.fb.ins().iconst(irt2cl(Type::I32), (1 + nret) as i64);

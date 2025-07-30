@@ -2,11 +2,12 @@
 
 use alloc::vec::Vec;
 use enumset::EnumSetType;
+use hashbrown::hash_table::Entry;
+use hashbrown::HashTable;
 
-use crate::bump::{Bump, BumpRef};
+use crate::bump::{self, as_bytes, Bump};
+use crate::hash::fxhash;
 use crate::index::{index, IndexVec};
-use crate::intern::Intern;
-use crate::support::NativeFunc;
 
 // cranelift uses:
 //   x64        32
@@ -18,9 +19,6 @@ const FUNC_ALIGN: u32 = 32;
 index!(pub struct Label(u32) invalid(!0) debug("L{}"));
 
 pub type MCodeOffset = u32;
-
-// marker for BumpRef in mcode.data
-pub type MCodeData<T=[u8]> = BumpRef<T>;
 
 // FIXME this only derives EnumSetType for VARIANT_COUNT
 // remove this when (if) core::mem::variant_count stabilizes
@@ -39,12 +37,16 @@ pub struct Reloc {
     pub which: u32
 }
 
+// this implements its own interning because intern::Intern stores the sequence lengths inline.
+// unlike intern::Intern, we don't need a `handle -> data` operation, so we can put the lengths
+// in a separate table.
 #[derive(Default)]
 pub struct MCode {
-    pub data: Intern,
-    pub code: Bump,
+    data: Bump,
+    code: Bump,
+    data_tab: HashTable<(/*offset:*/MCodeOffset, /*len:*/MCodeOffset)>,
     pub relocs: Vec<Reloc>,
-    pub labels: IndexVec<Label, MCodeOffset>
+    pub labels: IndexVec<Label, MCodeOffset>,
 }
 
 impl Sym {
@@ -53,55 +55,6 @@ impl Sym {
         // FIXME replace with core::mem::variant_count when it stabilizes
         assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
         unsafe { core::mem::transmute(raw) }
-    }
-
-}
-
-impl Reloc {
-
-    pub fn data(
-        at: MCodeOffset,
-        add: i32,
-        kind: cranelift_codegen::binemit::Reloc,
-        data: MCodeData
-    ) -> Self {
-        Self {
-            at,
-            add,
-            kind,
-            sym: Sym::Data,
-            which: zerocopy::transmute!(data)
-        }
-    }
-
-    pub fn label(
-        at: MCodeOffset,
-        add: i32,
-        kind: cranelift_codegen::binemit::Reloc,
-        label: Label
-    ) -> Self {
-        Self {
-            at,
-            add,
-            kind,
-            sym: Sym::Label,
-            which: zerocopy::transmute!(label)
-        }
-    }
-
-    pub fn native(
-        at: MCodeOffset,
-        add: i32,
-        kind: cranelift_codegen::binemit::Reloc,
-        func: NativeFunc
-    ) -> Self {
-        Self {
-            at,
-            add,
-            kind,
-            sym: Sym::Native,
-            which: func as _
-        }
     }
 
 }
@@ -134,6 +87,55 @@ impl MCode {
     pub fn align_code(&mut self) {
         // TODO insert nops
         self.code.align(FUNC_ALIGN);
+    }
+
+    pub fn write_code(&mut self, code: &[u8]) -> MCodeOffset {
+        self.code.write(code).ptr() as _
+    }
+
+    pub fn code(&self) -> &[u8] {
+        self.code.as_slice()
+    }
+
+    fn intern_data_bytes(&mut self, bytes: &[u8], align: usize) -> MCodeOffset {
+        let data: &[u8] = self.data.as_slice();
+        match self.data_tab.entry(
+            fxhash(bytes),
+            |&(ofs,len)| &data[ofs as usize..(ofs+len) as usize] == bytes
+                && (ofs as usize) & (align-1) == 0,
+            |&(ofs,len)| fxhash(&data[ofs as usize..(ofs+len) as usize])
+        ) {
+            Entry::Occupied(e) => e.get().0,
+            Entry::Vacant(e) => {
+                self.data.align(align);
+                let ofs = self.data.write(bytes).ptr();
+                e.insert((ofs as _, bytes.len() as _));
+                ofs as _
+            }
+        }
+    }
+
+    pub fn intern_data<T>(&mut self, data: &T) -> MCodeOffset
+        where T: ?Sized + bump::Aligned + bump::IntoBytes
+    {
+        self.intern_data_bytes(as_bytes(data), T::ALIGN)
+    }
+
+    pub fn write_data<T>(&mut self, data: &T) -> MCodeOffset
+        where T: ?Sized + bump::Aligned + bump::IntoBytes
+    {
+        self.data.write(data).ptr() as _
+    }
+
+    pub fn align_data_for<T>(&mut self) -> MCodeOffset
+        where T: ?Sized + bump::Aligned
+    {
+        self.data.align(T::ALIGN);
+        self.data.end().ptr() as _
+    }
+
+    pub fn data(&self) -> &[u8] {
+        self.data.as_slice()
     }
 
 }

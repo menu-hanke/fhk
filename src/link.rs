@@ -33,8 +33,8 @@ unsafe fn doreloc(kind: cranelift_codegen::binemit::Reloc, at: *mut u8, what: *c
 }
 
 fn link(mcode: &MCode) -> compile::Result<Mmap> {
-    let code: &[u8] = mcode.code.as_slice();
-    let data: &[u8] = mcode.data.bump().as_slice();
+    let code = mcode.code();
+    let data = mcode.data();
     // TODO this can really fail and should set an error insted of unwrapping
     let mut map = Mmap::new(code.len() + data.len(), Prot::Read | Prot::Write).unwrap();
     let mem = map.as_mut_slice();

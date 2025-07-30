@@ -10,7 +10,7 @@ use crate::compile::Ccx;
 use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, RESET, TAB};
 use crate::optimize::parse_optflags;
 use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_toplevel_def, parse_toplevel_expr, ExpandResult};
@@ -34,7 +34,7 @@ type fhk_Graph = Ccx<Parser>;
 type fhk_Image = Image;
 type fhk_Instance = Instance;
 type fhk_ObjRef<T=Obj> = ObjRef<T>;
-type fhk_SeqRef = IRef<[u8]>;
+type fhk_SeqRef = Interned<[u8]>;
 type fhk_Result = i32;
 type fhk_Alloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut u8;
 
@@ -179,7 +179,7 @@ extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
     stringify(
         &mut G.host.buf,
         &G.intern,
-        G.intern.get_slice(string.cast()),
+        &G.intern[string],
         SequenceType::Pattern
     );
 }

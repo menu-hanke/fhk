@@ -10,10 +10,9 @@ use crate::bump::BumpRef;
 use crate::foreach_lang;
 use crate::index::{index, IndexValueVec, IndexVec, InvalidValue};
 use crate::lang::Lang;
-use crate::mcode::MCodeData;
+use crate::mcode::MCodeOffset;
 use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
 use crate::obj::{ObjRef, QUERY};
-use crate::support::DynSlot;
 
 index!(pub struct FuncId(u16) invalid(!0) debug("f{}"));
 index!(pub struct InsId(u16)  invalid(!0) debug("{:04}"));
@@ -706,7 +705,7 @@ pub struct Chunk {
     pub scl: SizeClass,
     pub check: Slot,
     pub slots: BumpRef<Slot>, // slot info in ccx.bump, one for each ret phi
-    pub dynslots: MCodeData<DynSlot>
+    pub dynslots: MCodeOffset
 }
 
 pub struct Query {
@@ -798,7 +797,7 @@ impl Chunk {
             scl,
             check: Default::default(),
             slots: BumpRef::zero(),
-            dynslots: BumpRef::zero()
+            dynslots: 0
         }
     }
 

@@ -1,5 +1,6 @@
 //! Intern table.
 
+use core::cmp::max;
 use core::hash::Hash;
 use core::marker::PhantomData;
 use core::ops::Range;
@@ -7,339 +8,117 @@ use core::ops::Range;
 use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 
-use crate::bump::{self, Aligned, Bump, BumpRef, PackedSliceDst};
+use crate::bump::{self, as_bytes, Bump, BumpPtr, BumpRef};
 use crate::hash::fxhash;
 
-/*
- * +-------+------+
- * | 31..4 | 3..0 |
- * +-------+------+
- * |  end  | size |
- * +-------+------+
- *
- * size 1..8 -> smallref of `size`
- *      9..0 -> bigref of `-size`
- */
-#[derive(Clone, Copy, PartialEq, Eq, Hash,
-    zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
-#[repr(transparent)]
-struct RawRef(u32);
-
+// for sized T, this is a BumpRef<T>
+// for unsized T, this is an intern::Ref
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
-pub struct IRef<T: ?Sized>(RawRef, PhantomData<T>);
+pub struct Interned<T: ?Sized>(u32, PhantomData<T>);
+
+pub trait InternType {
+    fn from_raw_ref(r: Ref) -> Interned<Self>;
+    fn ptr(handle: Interned<Self>) -> usize;
+    fn get(intern: &InternPtr, handle: Interned<Self>) -> &Self;
+    fn get_range(intern: &InternPtr, handle: Interned<Self>) -> Range<usize>;
+}
+
+/*
+ *  +-------+------+
+ *  | 31..4 | 3..0 |
+ *  +-------+------+
+ *  |  ptr  | size |
+ *  +-------+------+
+ *
+ *  size = 0..14  -> size in bytes
+ *         15 -> size is stored in 4 bytes preceding ptr (aligned)
+ */
+#[derive(Clone, Copy, PartialEq, Eq, Hash, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+pub struct Ref(u32);
 
 pub struct Intern {
-    bump: Bump<u8>,
-    tab: HashTable<RawRef>,
-    base: BumpRef<u8>
+    bump: Bump,
+    tab: HashTable<Ref>,
 }
 
-impl RawRef {
+#[repr(transparent)]
+pub struct InternPtr {
+    bump: BumpPtr
+}
 
-    const SIZE_BITS: usize = 4;
-    const MAX_SMALL: u32 = 8;
+impl Ref {
+
     const EMPTY: Self = Self(0);
+    const MAX_SMALL: usize = 14;
 
-    const fn pack(end: u32, size: u32) -> Self {
-        Self((end << Self::SIZE_BITS) | size)
+    const fn new_small(ptr: usize, size: usize) -> Self {
+        debug_assert!(size <= Self::MAX_SMALL as _);
+        Self(((ptr as u32) << 4) | (size as u32))
     }
 
-    fn end(self) -> u32 {
-        self.0 >> Self::SIZE_BITS
+    fn new_big(ptr: usize) -> Self {
+        Self(((ptr as u32) << 4) | 0xf)
     }
 
-    fn raw_size(self) -> u32 {
-        self.0 & 0xf
+    fn smallsize(self) -> Option<usize> {
+        match (self.0 as usize) & 0xf {
+            0xf => None,
+            s => {
+                debug_assert!(s > 0 || self == Self::EMPTY);
+                Some(s)
+            }
+        }
+    }
+
+    fn ptr(self) -> usize {
+        (self.0 as usize) >> 4
     }
 
 }
 
-impl<T: ?Sized> Clone for IRef<T> {
+impl<T: ?Sized> Clone for Interned<T> {
     fn clone(&self) -> Self {
         Self(self.0, PhantomData)
     }
 }
 
-impl<T: ?Sized> Copy for IRef<T> {}
+impl<T: ?Sized> Copy for Interned<T> {}
 
-impl<T: ?Sized> PartialEq for IRef<T> {
+impl<T: ?Sized> PartialEq for Interned<T> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T: ?Sized> Eq for IRef<T> {}
+impl<T: ?Sized> Eq for Interned<T> {}
 
-impl<T: ?Sized> Hash for IRef<T> {
+impl<T: ?Sized> Hash for Interned<T> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.hash(state)
     }
 }
 
-impl<T: ?Sized> IRef<T> {
+impl<T: ?Sized> Interned<T> {
 
-    pub const EMPTY: Self = Self(RawRef::EMPTY, PhantomData);
-
-    pub fn cast<U: ?Sized>(self) -> IRef<U> {
-        zerocopy::transmute!(self)
-    }
-
-}
-
-impl<T: ?Sized + Aligned> IRef<T> {
-
-    pub fn to_bump_sized(self, size: usize) -> BumpRef<T> {
-        BumpRef::from_ptr(self.0.end() as usize - size)
-    }
-
-    // pub fn to_bump_small_unchecked(self) -> BumpRef<T> {
-    //     debug_assert!((refsize(self.0) as i32) >= 0);
-    //     self.to_bump_sized(refsize(self.0) as usize + 1)
-    // }
-
-}
-
-impl<T: Aligned> IRef<T> {
-
-    pub fn to_bump(self) -> BumpRef<T> {
-        self.to_bump_sized(size_of::<T>())
-    }
-
-}
-
-impl<T: ?Sized> IRef<T> {
-
-    // public for hardcoding constant references (eg. Ccx::SEQ_GLOBAL).
-    // extremely easy to misuse.
-    pub const fn small_from_end_size(end: u32, size: u32) -> Self {
-        Self(RawRef::pack(end, size), PhantomData)
-    }
-
-    // const fn big(ptr: u32, size: u32) -> Self {
-    //     Self(bigref(ptr, size), PhantomData)
-    // }
-
-}
-
-unsafe fn bigsize(mut end: *const u8, mut raw_size: usize) -> usize {
-    let mut shift = 0;
-    let mut size = 0;
-    loop {
-        size |= (unsafe { *end } as usize) << shift;
-        raw_size += 1;
-        if raw_size == 0x10 { return size }
-        end = unsafe { end.add(1) };
-        shift += 8;
-    }
-}
-
-unsafe fn bigbytes<'a>(data: *const u8, end: usize, raw_size: usize) -> &'a [u8] {
-    unsafe {
-        let end = data.add(end);
-        let size = bigsize(end, raw_size);
-        core::slice::from_raw_parts(end.sub(size), size)
-    }
-}
-
-unsafe fn bytesmatch(data: *const u8, r: RawRef, bytes: &[u8]) -> bool {
-    let raw_size = r.raw_size() as usize;
-    let end = r.end() as usize;
-    if bytes.len() <= RawRef::MAX_SMALL as _ {
-        // if `r` is big then the first comparison is always false
-        raw_size == bytes.len()
-            && bytes == unsafe { core::slice::from_raw_parts(data.add(end-raw_size), raw_size) }
-    } else {
-        raw_size > RawRef::MAX_SMALL as _ && bytes == unsafe { bigbytes(data, end, raw_size) }
-    }
-}
-
-unsafe fn refmatch(bump: &[u8], r: RawRef, bytes: &[u8], align: u32) -> bool {
-    r.end() & (align - 1) == 0 && unsafe { bytesmatch(bump.as_ptr(), r, bytes) }
-}
-
-unsafe fn refdata<'a>(data: *const u8, r: RawRef) -> &'a [u8] {
-    let raw_size = r.raw_size() as usize;
-    let end = r.end() as usize;
-    let ep = unsafe { data.add(end) };
-    let size = if raw_size <= RawRef::MAX_SMALL as _ {
-        raw_size
-    } else {
-        unsafe { bigsize(ep, raw_size) }
-    };
-    unsafe { core::slice::from_raw_parts(ep.sub(size), size) }
-}
-
-// safety: tab and bump must come from the same intern table
-unsafe fn entry<'tab, 'short>(
-    tab: &'tab mut HashTable<RawRef>,
-    bump: &'short [u8],
-    bytes: &'short [u8],
-    align: u32
-) -> Entry<'tab, RawRef> {
-    tab.entry(
-        fxhash(bytes),
-        // note: this tests that the *end* is aligned, which works as long as size is a multiple
-        // of alignment.
-        |&r| unsafe { refmatch(bump, r, bytes, align) },
-        |&r| fxhash(unsafe { refdata(bump.as_ptr(), r) })
-    )
-}
-
-fn writebigsize(data: &mut Bump<u8>, mut len: usize) -> u32 {
-    let mut bytes = 0;
-    loop {
-        data.push(len as u8);
-        len >>= 8;
-        bytes += 1;
-        if len == 0 { return bytes }
-    }
-}
-
-fn newref(bump: &mut Bump<u8>, len: usize) -> RawRef {
-    let end = bump.end().ptr() as _;
-    let size = if len <= RawRef::MAX_SMALL as _ {
-        len as _
-    } else {
-        0x10 - writebigsize(bump, len)
-    };
-    RawRef::pack(end, size)
-}
-
-fn internbytes(intern: &mut Intern, bytes: &[u8], align: u32) -> RawRef {
-    match unsafe { entry(&mut intern.tab, intern.bump.as_slice(), bytes, align) } {
-        Entry::Occupied(e) => *e.get(),
-        Entry::Vacant(e) => {
-            intern.bump.align(align as _);
-            intern.bump.write(bytes);
-            intern.base = intern.bump.end();
-            *e.insert(newref(&mut intern.bump, bytes.len())).get()
-        }
-    }
-}
-
-fn reflen(data: &[u8], end: usize, raw_size: usize) -> usize {
-    if raw_size <= RawRef::MAX_SMALL as _ {
-        raw_size
-    } else {
-        assert!(end + (0x10 - raw_size) <= data.len());
-        unsafe { bigsize(data.as_ptr().add(end), raw_size) }
-    }
-}
-
-fn refrange(data: &[u8], r: RawRef) -> Range<usize> {
-    let end = r.end() as usize;
-    end - reflen(data, end, r.raw_size() as _) .. end
-}
-
-impl Intern {
-
-    pub fn intern<T>(&mut self, value: &T) -> IRef<T>
-        where T: ?Sized + Aligned + bump::IntoBytes
+    pub fn ptr(self) -> usize
+        where T: InternType
     {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(value as *const T as *const u8, size_of_val(value))
-        };
-        IRef(internbytes(self, bytes, T::ALIGN as _), PhantomData)
+        T::ptr(self)
     }
 
-    pub fn intern_collect<T>(&mut self, values: impl IntoIterator<Item=T>) -> IRef<[T]>
-        where T: Aligned + bump::FromBytes + bump::IntoBytes
-    {
-        let base = self.bump.extend(values).cast();
-        self.intern_consume_from(base).cast()
+}
+
+impl<T> Interned<[T]> {
+
+    pub const EMPTY: Self = zerocopy::transmute!(Ref::EMPTY);
+
+    pub const fn small_from_raw_parts(ptr: usize, len: usize) -> Self {
+        zerocopy::transmute!(Ref::new_small(ptr, len))
     }
 
-    pub fn find<T>(&self, value: &T) -> Option<IRef<T>>
-        where T: ?Sized + Aligned + bump::IntoBytes
-    {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(value as *const T as *const u8, size_of_val(value))
-        };
-        self.tab.find(
-            fxhash(bytes),
-            |&r| unsafe { refmatch(self.bump.as_slice(), r, bytes, T::ALIGN as _) }
-        ).map(|&r| IRef(r, PhantomData))
-    }
-
-    pub fn intern_range(&mut self, range: Range<usize>) -> IRef<[u8]> {
-        let Range { start, end } = range;
-        let bytes = self.bump.as_slice();
-        IRef(match unsafe { entry(&mut self.tab, bytes, &bytes[start..end], 1) } {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                self.bump.write_range::<u8>(BumpRef::from_ptr(start)..BumpRef::from_ptr(end));
-                *e.insert(newref(&mut self.bump, end-start)).get()
-            }
-        }, PhantomData)
-    }
-
-    pub fn get_range(&self, r: IRef<[u8]>) -> Range<usize> {
-        refrange(self.bump.as_slice(), r.0)
-    }
-
-    pub fn get<T>(&self, r: IRef<T>) -> &T
-        where T: ?Sized + Aligned + bump::Get
-    {
-        &self.bump[BumpRef::from_ptr(refrange(self.bump.as_slice(), r.0).start)]
-    }
-
-    pub fn get_slice<T>(&self, r: IRef<[T]>) -> &[T]
-        where T: bump::FromBytes + bump::Immutable
-    {
-        let Range { start, end } = refrange(self.bump.as_slice(), r.0);
-        &self.bump[BumpRef::from_ptr(start)..BumpRef::from_ptr(end)]
-    }
-
-    pub fn bump(&self) -> &Bump {
-        &self.bump
-    }
-
-    // pub fn ref_to_bump<T>(&self, r: IRef<T>) -> BumpRef<T>
-    //     where T: ?Sized + Aligned
-    // {
-    //     r.to_bump_sized(reflen(self.bump.as_slice(), r.0))
-    // }
-
-    pub fn write<T>(&mut self, value: &T)
-        where T: ?Sized + Aligned + bump::IntoBytes
-    {
-        self.bump.write(value);
-    }
-
-    // type doesn't matter here, so take a concrete type for better type inference and less
-    // monomorphization
-    pub fn write_ref(&mut self, r: IRef<[u8]>) {
-        let Range { start, end } = self.get_range(r);
-        self.bump.write_range::<u8>(BumpRef::from_ptr(start)..BumpRef::from_ptr(end));
-    }
-
-    pub fn reserve_dst<T>(&mut self, len: usize) -> &mut T
-        where T: ?Sized + Aligned + PackedSliceDst,
-              T::Head: bump::FromBytes + bump::IntoBytes,
-              T::Item: bump::FromBytes + bump::IntoBytes
-    {
-        self.bump.reserve_dst(len).1
-    }
-
-    pub fn intern_consume_from(&mut self, cursor: BumpRef<u8>) -> IRef<[u8]> {
-        match unsafe { entry(&mut self.tab, self.bump.as_slice(), &self.bump[cursor..], 1) } {
-            Entry::Occupied(e) => {
-                // this assert is needed for correctness because any ref in the hashtable
-                // is assumed to be valid and can therefore skip bound checks.
-                // ie. it's not ok in any situation to remove data that is referenced
-                // from the hashtable.
-                assert!(cursor >= self.base);
-                self.bump.truncate(cursor);
-                IRef(*e.get(), PhantomData)
-            },
-            Entry::Vacant(e) => {
-                let len = self.bump.end().ptr() - cursor.ptr();
-                let r = newref(&mut self.bump, len);
-                self.base = cursor;
-                IRef(*e.insert(r).get(), PhantomData)
-            }
-        }
+    pub fn is_empty(self) -> bool {
+        self == Self::EMPTY
     }
 
 }
@@ -347,30 +126,210 @@ impl Intern {
 impl Default for Intern {
     fn default() -> Self {
         let mut tab = HashTable::new();
-        tab.insert_unique(fxhash(&[0; 0]), RawRef::EMPTY, |_| unreachable!());
-        Self { tab, bump: Default::default(), base: BumpRef::zero() }
+        tab.insert_unique(fxhash(&[0;0]), Ref::EMPTY, |_| unreachable!());
+        Self { tab, bump: Default::default() }
     }
 }
 
-impl<T> core::ops::Index<IRef<T>> for Intern
-    where T: ?Sized + Aligned + bump::Get
+// safety: bump and r must come from the same intern table
+unsafe fn refsize(bump: *const u8, r: Ref) -> usize {
+    match r.smallsize() {
+        Some(s) => s,
+        None => (unsafe { *(bump.add(r.ptr()) as *const u32).sub(1) }) as _
+    }
+}
+
+// safety: bump and r must come from the same intern table
+unsafe fn refbytes<'a>(bump: *const u8, r: Ref) -> &'a [u8] {
+    unsafe { core::slice::from_raw_parts(bump.add(r.ptr()), refsize(bump, r)) }
+}
+
+// safety: bump and r must come from the same intern table
+unsafe fn refmatch(bump: *const u8, r: Ref, bytes: &[u8], align: usize) -> bool {
+    ((unsafe { refbytes(bump, r) }) == bytes) && (r.ptr() & (align-1) == 0)
+}
+
+// safety: tab and bump must come from the same intern table
+unsafe fn entry<'a, 'tab>(
+    tab: &'tab mut HashTable<Ref>,
+    bump: *const u8,
+    bytes: &'a [u8],
+    align: usize
+) -> Entry<'tab, Ref> {
+    tab.entry(
+        fxhash(bytes),
+        |&r| unsafe { refmatch(bump, r, bytes, align) },
+        |&r| fxhash(unsafe { refbytes(bump, r) })
+    )
+}
+
+fn newbigref(bump: &mut Bump, len: usize, align: usize) -> Ref {
+    bump.align_for::<u32>();
+    let base = bump.end();
+    bump.align(align);
+    if bump.end().ptr() - base.ptr() < size_of::<u32>() {
+        bump.reserve_dst::<[u8]>(max(align, size_of::<u32>()));
+    }
+    let ptr = bump.end();
+    bump[ptr.cast::<u32>().offset(-1)] = len as _;
+    Ref::new_big(ptr.ptr())
+}
+
+fn internbytes(intern: &mut Intern, bytes: &[u8], align: usize) -> Ref {
+    match unsafe { entry(&mut intern.tab, intern.bump.as_slice().as_ptr(), bytes, align) } {
+        Entry::Occupied(e) => *e.get(),
+        Entry::Vacant(e) => {
+            let r = if bytes.len() > Ref::MAX_SMALL {
+                newbigref(&mut intern.bump, bytes.len(), align)
+            } else {
+                intern.bump.align(align);
+                Ref::new_small(intern.bump.end().ptr(), bytes.len())
+            };
+            intern.bump.write(bytes);
+            e.insert(r);
+            r
+        }
+    }
+}
+
+fn findbytes(intern: &Intern, bytes: &[u8], align: usize) -> Option<Ref> {
+    intern.tab.find(
+        fxhash(bytes),
+        |&r| unsafe { refmatch(intern.bump.as_slice().as_ptr(), r, bytes, align) }
+    ).cloned()
+}
+
+impl<T> InternType for T
+    where T: bump::FromBytes + bump::IntoBytes + bump::Immutable
+{
+
+    fn from_raw_ref(r: Ref) -> Interned<T> {
+        zerocopy::transmute!(BumpRef::<T>::from_ptr(r.ptr()))
+    }
+
+    fn ptr(handle: Interned<T>) -> usize {
+        let ptr: BumpRef<T> = zerocopy::transmute!(handle);
+        ptr.ptr()
+    }
+
+    fn get(intern: &InternPtr, handle: Interned<T>) -> &T {
+        let ptr: BumpRef<T> = zerocopy::transmute!(handle);
+        &intern.bump[ptr]
+    }
+
+    fn get_range(_: &InternPtr, handle: Interned<T>) -> Range<usize> {
+        let ptr: BumpRef<T> = zerocopy::transmute!(handle);
+        let start = ptr.ptr();
+        start..start+size_of::<T>()
+    }
+
+}
+
+fn refsize_checked(bump: &BumpPtr, r: Ref) -> usize {
+    match r.smallsize() {
+        Some(s) => s,
+        None => {
+            let p: BumpRef<u32> = BumpRef::from_ptr(r.ptr());
+            bump[p.offset(-1)] as usize
+        }
+    }
+}
+
+impl<T> InternType for [T]
+    where T: bump::FromBytes + bump::IntoBytes + bump::Immutable
+{
+
+    fn from_raw_ref(r: Ref) -> Interned<Self> {
+        zerocopy::transmute!(r)
+    }
+
+    fn ptr(handle: Interned<Self>) -> usize {
+        let r: Ref = zerocopy::transmute!(handle);
+        r.ptr()
+    }
+
+    fn get(intern: &InternPtr, handle: Interned<Self>) -> &Self {
+        let r: Ref = zerocopy::transmute!(handle);
+        intern.bump.get_dst(BumpRef::from_ptr(r.ptr()),
+            refsize_checked(&intern.bump, r) / size_of::<T>())
+    }
+
+    fn get_range(intern: &InternPtr, handle: Interned<Self>) -> Range<usize> {
+        let r: Ref = zerocopy::transmute!(handle);
+        let start = r.ptr();
+        start..start+refsize_checked(&intern.bump, r)
+    }
+
+}
+
+impl Intern {
+
+    pub fn intern<T>(&mut self, value: &T) -> Interned<T>
+        where T: ?Sized + bump::Aligned + bump::IntoBytes + InternType
+    {
+        T::from_raw_ref(internbytes(self, as_bytes(value), T::ALIGN))
+    }
+
+    pub fn intern_range(&mut self, Range { start, end }: Range<usize>) -> Interned<[u8]> {
+        let bump = self.bump.as_slice();
+        <_>::from_raw_ref(match unsafe { entry(&mut self.tab, bump.as_ptr(), &bump[start..end], 1) } {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let len = end-start;
+                let r = if len > Ref::MAX_SMALL {
+                    let r = newbigref(&mut self.bump, len, 1);
+                    self.bump.write_range::<u8>(BumpRef::from_ptr(start)..BumpRef::from_ptr(end));
+                    r
+                } else {
+                    Ref::new_small(start, len)
+                };
+                e.insert(r);
+                r
+            }
+        })
+    }
+
+    pub fn find<T>(&self, value: &T) -> Option<Interned<T>>
+        where T: ?Sized + bump::Aligned + bump::IntoBytes + InternType
+    {
+        findbytes(self, as_bytes(value), T::ALIGN).map(T::from_raw_ref)
+    }
+
+}
+
+impl InternPtr {
+
+    fn get<T>(&self, handle: Interned<T>) -> &T
+        where T: ?Sized + InternType
+    {
+        T::get(self, handle)
+    }
+
+    pub fn get_range<T>(&self, handle: Interned<T>) -> Range<usize>
+        where T: ?Sized + InternType
+    {
+        T::get_range(self, handle)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.bump.as_slice()
+    }
+
+}
+
+impl core::ops::Deref for Intern {
+    type Target = InternPtr;
+    fn deref(&self) -> &Self::Target {
+        let ptr: &BumpPtr = &*self.bump;
+        unsafe { core::mem::transmute(ptr) }
+    }
+}
+
+impl<T> core::ops::Index<Interned<T>> for InternPtr
+    where T: ?Sized + InternType
 {
     type Output = T;
-    fn index(&self, r: IRef<T>) -> &T {
-        self.get(r)
+    fn index(&self, index: Interned<T>) -> &Self::Output {
+        self.get(index)
     }
 }
-
-impl core::fmt::Write for Intern {
-
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.bump.write_str(s)
-    }
-
-}
-
-// the following COULD be implemented...
-//     impl<T: ReadBytes> core::ops::Index<IRef<[T]>> for Intern { ... }
-// BUT implementing it breaks type inference in...
-//     let v: Type = intern[zerocopy::transmute!(handle)]
-// so for now just use get_slice() for slices.

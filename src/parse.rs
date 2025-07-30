@@ -9,7 +9,7 @@ use enumset::{enum_set, EnumSet};
 use crate::bump::BumpRef;
 use crate::compile;
 use crate::err::ErrorMessage;
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::lang::Lang;
 use crate::lex::Token;
 use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LEN, LET, LGET, LOAD, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
@@ -20,11 +20,11 @@ const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
     Token::Model | Token::Table | Token::Func | Token::Macro | Token::Eof
 );
 
-fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(IRef<[u8]>, IRef<[u8]>)> {
+fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(Interned<[u8]>, Interned<[u8]>)> {
     let name = parse_name(pcx)?;
     Ok(match check(pcx, Token::Dot)? {
         true  => (name, parse_name(pcx)?),
-        false => (IRef::EMPTY, name)
+        false => (Interned::EMPTY, name)
     })
 }
 
@@ -42,7 +42,7 @@ fn newundef(pcx: &mut Pcx, id: ObjRef) -> ObjRef {
     id
 }
 
-fn reftab(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<TAB> {
+fn reftab(pcx: &mut Pcx, name: Interned<[u8]>) -> ObjRef<TAB> {
     let id = match pcx.objs.tab(name) {
         LookupEntry::Occupied(id) => return id,
         LookupEntry::Vacant(e) => e.create()
@@ -50,7 +50,7 @@ fn reftab(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<TAB> {
     newundef(pcx, id.erase()).cast()
 }
 
-fn reffunc(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<FUNC> {
+fn reffunc(pcx: &mut Pcx, name: Interned<[u8]>) -> ObjRef<FUNC> {
     let id = match pcx.objs.func(name) {
         LookupEntry::Occupied(id) => return id,
         LookupEntry::Vacant(e) => e.create()
@@ -58,7 +58,7 @@ fn reffunc(pcx: &mut Pcx, name: IRef<[u8]>) -> ObjRef<FUNC> {
     newundef(pcx, id.erase()).cast()
 }
 
-fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: IRef<[u8]>) -> ObjRef<VAR> {
+fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: Interned<[u8]>) -> ObjRef<VAR> {
     let id = match pcx.objs.var(tab, name) {
         LookupEntry::Occupied(id) => return id,
         LookupEntry::Vacant(e) => e.create()
@@ -67,7 +67,7 @@ fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: IRef<[u8]>) -> ObjRef<VAR> {
 }
 
 fn newanonvar(pcx: &mut Pcx, tab: ObjRef<TAB>, ann: ObjRef/*TY*/, value: ObjRef<EXPR>) -> ObjRef<VAR> {
-    let var = pcx.objs.push(VAR::new(IRef::EMPTY, tab, ann));
+    let var = pcx.objs.push(VAR::new(Interned::EMPTY, tab, ann));
     let vset = pcx.objs.push_args::<VSET>(VSET::new(0, var), &[]);
     pcx.objs.push_args::<MOD>(MOD::new(tab, ObjRef::NIL.cast(), value), &[vset]);
     var
@@ -89,23 +89,23 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
         }
     }
     let (tab, name) = parse_dotname(pcx)?;
-    let tab = match tab == IRef::EMPTY {
+    let tab = match tab.is_empty() {
         true  => implicittab(pcx)?,
         false => reftab(pcx, tab)
     };
     Ok(refvar(pcx, tab, name))
 }
 
-fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
+fn builtincall(pcx: &mut Pcx, name: Interned<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
     const IDENT: u8 = Token::Ident as _;
     const INT: u8 = Token::Int as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
     const LCURLY: u8 = Token::LCurly as _;
     const RCURLY: u8 = Token::RCurly as _;
-    let name @ [IDENT, _, _, _, _, rest @ .. ] = pcx.intern.get_slice(name.cast())
-        else { return None };
+    let name @ [IDENT, _, _, _, _, rest @ .. ] = &pcx.intern[name] else { return None };
     let stem: [u8; 4] = name[1..5].try_into().unwrap();
-    let stem: &[u8] = pcx.intern.get_slice(zerocopy::transmute!(stem));
+    let stem: Interned<[u8]> = zerocopy::transmute!(stem);
+    let stem: &[u8] = &pcx.intern[stem];
     let args: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
     if let Some(intrin) = Intrinsic::from_func(stem) {
         return match rest.is_empty() {
@@ -119,8 +119,8 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
         b"load" => {
             let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
             let ty: [u8; 4] = tail[3..7].try_into().unwrap();
-            let pri = pcx.objs.push(TPRI::new(Primitive::from_name(
-                        pcx.intern.get_slice(zerocopy::transmute!(ty)))? as u8)).erase();
+            let ty: Interned<[u8]> = zerocopy::transmute!(ty);
+            let pri = pcx.objs.push(TPRI::new(Primitive::from_name(&pcx.intern[ty])? as u8)).erase();
             let ann = match args.len() {
                 1 => pri,
                 n => pcx.objs.push(TTEN::new(n as u8 - 1, pri)).erase()
@@ -144,14 +144,14 @@ fn builtincall(pcx: &mut Pcx, name: IRef<[u8]>, base: BumpRef<u8>) -> Option<Obj
 
 fn usercall(
     pcx: &mut Pcx,
-    name: IRef<[u8]>,
+    name: Interned<[u8]>,
     base: BumpRef<ObjRef<EXPR>>
 ) -> ObjRef<APPLY> {
     let func = reffunc(pcx, name);
     pcx.objs.push_args(APPLY::new(ObjRef::NIL, func), &pcx.tmp[base..])
 }
 
-fn parse_apply(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
+fn parse_apply(pcx: &mut Pcx, name: Interned<[u8]>) -> compile::Result<ObjRef<EXPR>> {
     next(pcx)?; // skip '('
     let base = pcx.tmp.end();
     while pcx.data.token != Token::RParen {
@@ -257,8 +257,8 @@ fn parse_vget(pcx: &mut Pcx, var: ObjRef<VAR>) -> compile::Result<ObjRef<VGET>> 
 fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
     consume(pcx, Token::Call)?;
     require(pcx, Token::Ident)?;
-    let Some(lang) = Lang::from_name(&pcx.intern.get_slice(zerocopy::transmute!(pcx.data.tdata)))
-        else { return pcx.error(LangError) };
+    let lang: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+    let Some(lang) = Lang::from_name(&pcx.intern[lang]) else { return pcx.error(LangError) };
     next(pcx)?; // skip name
     lang.parse(pcx, n)
 }
@@ -267,8 +267,8 @@ fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
 fn parse_typeann(pcx: &mut Pcx) -> compile::Result<ObjRef/*TY*/> {
     let mut ty = match check(pcx, Token::Ident)? {
         true => {
-            let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
-            match Primitive::from_name(pcx.intern.get_slice(name)) {
+            let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+            match Primitive::from_name(&pcx.intern[name]) {
                 Some(pri) => pcx.objs.push(TPRI::new(pri as _)).erase(),
                 None => return syntaxerr(pcx, ErrorMessage::ExpectedPrimitive)
             }
@@ -320,7 +320,7 @@ fn parse_maybesuffix(pcx: &mut Pcx, expr: ObjRef<EXPR>) -> compile::Result<ObjRe
     Ok(expr)
 }
 
-fn parse_nameref(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ObjRef<EXPR>> {
+fn parse_nameref(pcx: &mut Pcx, name: Interned<[u8]>) -> compile::Result<ObjRef<EXPR>> {
     let bindings = &pcx.data.bindings;
     let npar = pcx.data.bindparams as usize;
     for i in (npar..bindings.len()).rev() {
@@ -693,7 +693,7 @@ fn parse_macro_body_rec(
                 pcx.tmp.push(Token::OpThis as u8);
             },
             Token::CapName => {
-                let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+                let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
                 let idx = match pcx.data.marg.iter().position(|a| *a == name) {
                     Some(i) => i,
                     None => return syntaxerr(pcx, ErrorMessage::UndefCap),
@@ -706,9 +706,9 @@ fn parse_macro_body_rec(
             }
             Token::Literal => {
                 // this mess should probably go somewhere in the lexer instead.
-                let sid: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
-                let Range { start, end } = pcx.intern.get_range(sid.cast());
-                let mut data: &[u8] = pcx.intern.bump().as_slice();
+                let sid: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+                let Range { start, end } = pcx.intern.get_range(sid);
+                let mut data: &[u8] = pcx.intern.as_slice();
                 if let Some(mut cursor) = data[start..end].iter().position(|c| *c == '$' as _) {
                     pcx.tmp.push(Token::OpLiteralBoundary as u8);
                     let mut base = start;
@@ -718,10 +718,9 @@ fn parse_macro_body_rec(
                         if cursor > base {
                             pcx.tmp.push(Token::Literal as u8);
                             // write it this way so that it doesn't add padding for alignment.
-                            let lit: [u8; 4] = zerocopy::transmute!(
-                                pcx.intern.intern_range(base..cursor));
+                            let lit: [u8; 4] = zerocopy::transmute!(pcx.intern.intern_range(base..cursor));
                             pcx.tmp.push(lit);
-                            data = pcx.intern.bump().as_slice();
+                            data = pcx.intern.as_slice();
                         }
                         if cursor >= end { break; }
                         assert!(end <= data.len()); // eliminate some bound checks.
@@ -756,7 +755,7 @@ fn parse_macro_body_rec(
                                 let cap = match pcx.intern.find(&data[start..cursor]) {
                                     Some(r) => r,
                                     None => return syntaxerr(pcx, ErrorMessage::UndefCap)
-                                }.cast();
+                                };
                                 let idx = match pcx.data.marg.iter().position(|a| *a == cap) {
                                     Some(i) => i,
                                     None => return syntaxerr(pcx, ErrorMessage::UndefCap)
@@ -802,10 +801,10 @@ fn checkopenparen(pcx: &mut Pcx) -> compile::Result<Option<Token>> {
     Ok(Some(close))
 }
 
-fn parse_pattern(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+fn parse_pattern(pcx: &mut Pcx) -> compile::Result<Interned<[u8]>> {
     match pcx.data.token {
         Token::CapName => {
-            let name: IRef<[u8]> = zerocopy::transmute!(pcx.data.tdata);
+            let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
             pcx.data.marg.push(name);
             next(pcx)?;
             Ok(pcx.intern.intern(&[Token::OpInsert as u8]))
@@ -859,7 +858,7 @@ fn parse_snippet(pcx: &mut Pcx) -> compile::Result {
     )?;
     let body = pcx.intern.intern(&pcx.tmp[base..]);
     pcx.tmp.truncate(base);
-    defmacro(pcx, Namespace::Snippet, IRef::EMPTY, name, body);
+    defmacro(pcx, Namespace::Snippet, Interned::EMPTY, name, body);
     if let Some(stop) = stop {
         consume(pcx, stop)?;
     }
@@ -908,7 +907,7 @@ fn expandobjs(pcx: &mut Pcx) -> compile::Result {
         if pcx.objs[o].mark != 0 {
             let (ns, table, name) = match pcx.objs.get(o) {
                 ObjectRef::VAR(&VAR { tab, name, .. }) => (Namespace::Var, pcx.objs[tab].name, name),
-                ObjectRef::TAB(&TAB { name, .. }) => (Namespace::Table, IRef::EMPTY, name),
+                ObjectRef::TAB(&TAB { name, .. }) => (Namespace::Table, Interned::EMPTY, name),
                 ObjectRef::FUNC(_) => todo!(),
                 _ => unreachable!()
             };
@@ -933,14 +932,14 @@ pub enum ExpandResult<O,N> {
     Undefined(N)
 }
 
-fn expandtab(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
+fn expandtab(pcx: &mut Pcx, name: Interned<[u8]>) -> compile::Result<ExpandResult<TAB, Interned<[u8]>>> {
     let id = match pcx.objs.tab(name) {
         LookupEntry::Occupied(id) => return Ok(ExpandResult::Defined(id)),
         LookupEntry::Vacant(e) => match pushmacro(
             &mut pcx.data,
             &pcx.intern,
             Namespace::Table,
-            IRef::EMPTY,
+            Interned::EMPTY,
             name
         ) {
             Some(_) => e.create(),
@@ -955,8 +954,8 @@ fn expandtab(pcx: &mut Pcx, name: IRef<[u8]>) -> compile::Result<ExpandResult<TA
 fn expandvar(
     pcx: &mut Pcx,
     tab: ObjRef<TAB>,
-    name: IRef<[u8]>
-) -> compile::Result<ExpandResult<VAR, (IRef<[u8]>, IRef<[u8]>)>> {
+    name: Interned<[u8]>
+) -> compile::Result<ExpandResult<VAR, (Interned<[u8]>, Interned<[u8]>)>> {
     let tabname = pcx.objs[tab].name;
     let id = match pcx.objs.var(tab, name) {
         LookupEntry::Occupied(id) => return Ok(ExpandResult::Defined(id)),
@@ -976,16 +975,16 @@ fn expandvar(
     Ok(ExpandResult::Defined(id))
 }
 
-pub fn parse_expand_tab(pcx: &mut Pcx) -> compile::Result<ExpandResult<TAB, IRef<[u8]>>> {
+pub fn parse_expand_tab(pcx: &mut Pcx) -> compile::Result<ExpandResult<TAB, Interned<[u8]>>> {
     let name = parse_name(pcx)?;
     expandtab(pcx, name)
 }
 
 pub fn parse_expand_var(
     pcx: &mut Pcx
-) -> compile::Result<ExpandResult<VAR, (IRef<[u8]>, IRef<[u8]>)>> {
+) -> compile::Result<ExpandResult<VAR, (Interned<[u8]>, Interned<[u8]>)>> {
     let (tab, name) = parse_dotname(pcx)?;
-    let table = match tab == IRef::EMPTY {
+    let table = match tab.is_empty() {
         true  => pcx.data.tab,
         false => match expandtab(pcx, tab)? {
             ExpandResult::Defined(t) => t,
@@ -1013,7 +1012,7 @@ pub fn parse_toplevel_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     Ok(expr)
 }
 
-pub fn parse_template(pcx: &mut Pcx) -> compile::Result<IRef<[u8]>> {
+pub fn parse_template(pcx: &mut Pcx) -> compile::Result<Interned<[u8]>> {
     let base = pcx.tmp.end();
     parse_macro_body(pcx, Token::Eof.into(), true)?;
     let template = pcx.intern.intern(&pcx.tmp[base..]);

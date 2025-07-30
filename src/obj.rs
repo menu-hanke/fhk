@@ -10,13 +10,12 @@ use core::str;
 use enumset::EnumSetType;
 use hashbrown::hash_table::{Entry, VacantEntry};
 use hashbrown::HashTable;
-use zerocopy::Unalign;
 
 use crate::bump::{self, Aligned, Bump, BumpRef};
 use crate::compile::Ccx;
 use crate::hash::fxhash;
 use crate::index::index;
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::mcode::MCodeOffset;
 use crate::typing::Primitive;
 
@@ -136,7 +135,7 @@ impl<'a> Iterator for OpFieldIter<'a> {
 }
 
 // for define_ops macro:
-type Name = IRef<[u8]>;
+type Name = Interned<[u8]>;
 
 macro_rules! define_ops {
     (@meta ($($buf:expr,)*) ) => { crate::concat::concat_slices!(u8; $($buf),*) };
@@ -304,9 +303,11 @@ define_ops! {
     FLAT        { ann: ObjRef<TTUP/*UNIT*/> } idx: [ObjRef<EXPR>];
     SPLAT       { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     KINT        { ann: ObjRef/*TY*/, k: i32 };
-    KINT64      { ann: ObjRef/*TY*/, k: BumpRef<Unalign<i64>> };
-    KFP64       { ann: ObjRef/*TY*/, k: BumpRef<Unalign<f64>> };
-    KSTR        { ann: ObjRef/*TY*/, k: IRef<[u8]> };
+    KINT64      { ann: ObjRef/*TY*/, k: Interned<i64> };
+    KINTV       { ann: ObjRef/*TY*/, k: Interned<[i64]> };
+    KFP64       { ann: ObjRef/*TY*/, k: Interned<f64> };
+    KFPV        { ann: ObjRef/*TY*/, k: Interned<[f64]> };
+    KSTR        { ann: ObjRef/*TY*/, k: Interned<[u8]> };
     LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     TGET.idx    { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
@@ -691,9 +692,9 @@ impl Objects {
 
 }
 
-fn lookupkey(data: &[u32], idx: usize) -> (u32, IRef<[u8]>) {
+fn lookupkey(data: &[u32], idx: usize) -> (u32, Interned<[u8]>) {
     let obj: Obj = zerocopy::transmute!(data[idx]);
-    let name: IRef<[u8]> = zerocopy::transmute!(data[idx+1]);
+    let name: Interned<[u8]> = zerocopy::transmute!(data[idx+1]);
     let mut namespace = obj.op as u32;
     if obj.op == Obj::VAR {
         namespace |= data[idx+obj_index_of!(VAR, tab)] << 2;
@@ -704,7 +705,7 @@ fn lookupkey(data: &[u32], idx: usize) -> (u32, IRef<[u8]>) {
 fn entry<'lookup, 'data>(
     lookup: &'lookup mut HashTable<ObjRef>,
     data: &'data [u32],
-    key: (u32, IRef<[u8]>)
+    key: (u32, Interned<[u8]>)
 ) -> Entry<'lookup, ObjRef> {
     lookup.entry(
         fxhash(key),
@@ -755,7 +756,7 @@ impl Objects {
 
     pub fn tab(
         &mut self,
-        name: IRef<[u8]>
+        name: Interned<[u8]>
     ) -> LookupEntry<'_, TAB, impl FnMut() -> ObjRef<TAB> + '_> {
         match entry(&mut self.lookup, self.bump.as_slice(), (Operator::TAB as _, name)) {
             Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
@@ -769,7 +770,7 @@ impl Objects {
 
     pub fn func(
         &mut self,
-        name: IRef<[u8]>
+        name: Interned<[u8]>
     ) -> LookupEntry<'_, FUNC, impl FnMut() -> ObjRef<FUNC> + '_> {
         match entry(&mut self.lookup, self.bump.as_slice(), (Operator::FUNC as _, name)) {
             Entry::Occupied(e) => LookupEntry::Occupied(e.get().cast()),
@@ -784,7 +785,7 @@ impl Objects {
     pub fn var(
         &mut self,
         tab: ObjRef<TAB>,
-        name: IRef<[u8]>
+        name: Interned<[u8]>
     ) -> LookupEntry<'_, VAR, impl FnMut() -> ObjRef<VAR> + '_> {
         let raw: u32 = zerocopy::transmute!(tab);
         match entry(

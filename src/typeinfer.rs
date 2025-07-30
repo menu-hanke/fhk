@@ -15,7 +15,7 @@ use rustc_hash::FxHasher;
 use crate::compile::{self, Ccx, Stage};
 use crate::dump::trace_objs;
 use crate::index::{self, index, IndexSlice, IndexVec};
-use crate::intern::IRef;
+use crate::intern::Interned;
 use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LEN, LET, LGET, LOAD, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
@@ -82,7 +82,7 @@ enum Constraint {
 }
 
 struct Func {
-    name: IRef<[u8]>, // original objs[func].name; objs name is FuncId during inference
+    name: Interned<[u8]>, // original objs[func].name; objs name is FuncId during inference
     obj: ObjRef<FUNC>,
     type_: Ty
 }
@@ -1159,15 +1159,9 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
             }
         },
         ObjectRef::KINT(&KINT { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kintpri(k as _)),
-        ObjectRef::KINT64(&KINT64 { k, .. }) => {
-            unifyvpri(&mut tcx.data.sub, tv, kintpri(tcx.intern.bump()[k].get()));
-        },
-        ObjectRef::KFP64(&KFP64 { k, .. }) => {
-            unifyvpri(&mut tcx.data.sub, tv, kfpri(tcx.intern.bump()[k].get()));
-        },
-        ObjectRef::KSTR(_) => {
-            unifyvt(&mut tcx.data.sub, tv, Ty::primitive(Primitive::STR));
-        },
+        ObjectRef::KINT64(&KINT64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kintpri(tcx.intern[k])),
+        ObjectRef::KFP64(&KFP64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kfpri(tcx.intern[k])),
+        ObjectRef::KSTR(_) => unifyvt(&mut tcx.data.sub, tv, Ty::primitive(Primitive::STR)),
         ObjectRef::LEN(&LEN { value, .. }) => {
             // TODO: make sure here that it has at least as many dimensions as our axis.
             unifyvt(&mut tcx.data.sub, tv, Ty::primitive(PRI_IDX));
