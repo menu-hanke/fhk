@@ -4,7 +4,7 @@ use core::mem::take;
 
 use crate::compile::{self, Ccx, Stage};
 use crate::image::Image;
-use crate::mcode::{MCode, Reloc, Sym};
+use crate::mcode::{MCode, Reloc, Segment, Sym};
 use crate::mmap::{Mmap, Prot};
 use crate::support::NativeFunc;
 use crate::trace::trace;
@@ -41,19 +41,17 @@ fn link(mcode: &MCode) -> compile::Result<Mmap> {
     mem[..code.len()].copy_from_slice(code);
     mem[code.len()..].copy_from_slice(data);
     let mem = mem.as_mut_ptr();
-    for &Reloc { at, add, kind, sym, which } in &mcode.relocs {
+    for &Reloc { at, seg, add, kind, sym, which } in &mcode.relocs {
+        let loc = match seg {
+            Segment::Code => mem,
+            Segment::Data => unsafe { mem.add(code.len()) }
+        };
         let base = match sym {
             Sym::Data   => unsafe { mem.add(code.len() + which as usize) },
             Sym::Label  => unsafe { mem.add(mcode.labels[zerocopy::transmute!(which)] as usize) },
             Sym::Native => NativeFunc::from_u8(which as _).ptr().cast()
         };
-        unsafe {
-            doreloc(
-                kind,
-                mem.add(at as _),
-                base.offset(add as _)
-            )
-        }
+        unsafe { doreloc(kind, loc.add(at as _), base.offset(add as _)) }
     }
     // protect data first so that any overlap is still executable
     map.protect(code.len()..code.len()+data.len(), Prot::Read.into());

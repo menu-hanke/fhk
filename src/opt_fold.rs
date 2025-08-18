@@ -188,7 +188,7 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         },
 
         // x+0 = x-0 = x
-        ADD|SUB if m!(_ 0) => FoldStatus::New(ins.decode_V()),
+        ADD|SUB|ADDP if m!(_ 0) => FoldStatus::New(ins.decode_V()),
 
         // x*1 = x/1 = x
         MUL|DIV|UDIV if m!(_ 1) => FoldStatus::New(ins.decode_V()),
@@ -225,6 +225,9 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             debug_assert!(code[value].opcode() != MOV);
             FoldStatus::New(value)
         },
+
+        // eliminate nop CONVs
+        CONV if ins.type_() == code[ins.decode_V()].type_() => FoldStatus::New(ins.decode_V()),
 
         // eliminate GOTOs
         // GOTO => {

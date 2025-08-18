@@ -8,12 +8,11 @@ use enumset::{enum_set, EnumSet};
 
 use crate::bump::BumpRef;
 use crate::compile;
-use crate::err::ErrorMessage;
 use crate::intern::Interned;
 use crate::lang::Lang;
 use crate::lex::Token;
 use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LEN, LET, LGET, LOAD, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, syntaxerr, DefinitionError, DefinitionErrorType, LangError, Namespace, ParenCounter, Pcx, TokenError};
+use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, DefinitionError, DefinitionErrorType, SyntaxError, LangError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
 const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
@@ -31,7 +30,7 @@ fn parse_dotname(pcx: &mut Pcx) -> compile::Result<(Interned<[u8]>, Interned<[u8
 fn implicittab(pcx: &mut Pcx) -> compile::Result<ObjRef<TAB>> {
     let tab = pcx.data.tab;
     if tab.is_nil() {
-        return syntaxerr(pcx, ErrorMessage::BadImplicitTab);
+        return pcx.error(SyntaxError::BadImplicitTab);
     }
     Ok(tab)
 }
@@ -176,7 +175,7 @@ fn parse_idxelem(pcx: &mut Pcx, ingroup: bool) -> compile::Result<usize> {
     }
     if (Token::Comma|Token::RParen|Token::RBracket).contains(pcx.data.token) {
         match dim {
-            0 => return syntaxerr(pcx, ErrorMessage::ExpectedValue),
+            0 => return pcx.error(SyntaxError::ExpectedValue),
             1 => {
                 pcx.tmp.push(ObjRef::NIL);
             },
@@ -270,7 +269,7 @@ fn parse_typeann(pcx: &mut Pcx) -> compile::Result<ObjRef/*TY*/> {
             let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
             match Primitive::from_name(&pcx.intern[name]) {
                 Some(pri) => pcx.objs.push(TPRI::new(pri as _)).erase(),
-                None => return syntaxerr(pcx, ErrorMessage::ExpectedPrimitive)
+                None => return pcx.error(SyntaxError::ExpectedPrimitive)
             }
         },
         false => ObjRef::NIL
@@ -288,7 +287,7 @@ fn parse_typeann(pcx: &mut Pcx) -> compile::Result<ObjRef/*TY*/> {
         ty = pcx.objs.push(TTEN::new(dim as _, ty)).erase();
     }
     if ty.is_nil() {
-        return syntaxerr(pcx, ErrorMessage::ExpectedType);
+        return pcx.error(SyntaxError::ExpectedType);
     }
     Ok(ty)
 }
@@ -456,7 +455,7 @@ fn parse_value(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
         Token::Call => Ok(parse_callx(pcx, 1)?.cast()),
         Token::True => { next(pcx)?; Ok(ObjRef::TRUE.cast()) },
         Token::False => { next(pcx)?; Ok(ObjRef::FALSE.cast()) },
-        _ => return syntaxerr(pcx, ErrorMessage::ExpectedValue)
+        _ => return pcx.error(SyntaxError::ExpectedValue)
     }
 }
 
@@ -682,9 +681,9 @@ fn parse_macro_body_rec(
     while !(stop.contains(pcx.data.token) && parens.balanced()) {
         parens.token(pcx.data.token);
         match pcx.data.token {
-            Token::CapName if template => return syntaxerr(pcx, ErrorMessage::CapNameInTemplate),
+            Token::CapName if template => return pcx.error(SyntaxError::CapNameInTemplate),
             Token::CapPos | Token::Dollar if !template
-                => return syntaxerr(pcx, ErrorMessage::CapPosInBody),
+                => return pcx.error(SyntaxError::CapPosInBody),
             Token::Dollar => {
                 pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                 nextcap += 1;
@@ -696,7 +695,7 @@ fn parse_macro_body_rec(
                 let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
                 let idx = match pcx.data.marg.iter().position(|a| *a == name) {
                     Some(i) => i,
-                    None => return syntaxerr(pcx, ErrorMessage::UndefCap),
+                    None => return pcx.error(SyntaxError::UndefCap),
                 };
                 pcx.tmp.push([Token::OpInsert as u8, idx as u8]);
                 nextcap = max(nextcap, idx as u8+1);
@@ -731,7 +730,7 @@ fn parse_macro_body_rec(
                                 cursor += 1;
                             },
                             Some(&(mut c)) if c.is_ascii_digit() => {
-                                if !template { return syntaxerr(pcx, ErrorMessage::CapPosInBody) }
+                                if !template { return pcx.error(SyntaxError::CapPosInBody) }
                                 let mut idx = 0;
                                 loop {
                                     idx = 10*idx + c-b'0';
@@ -744,7 +743,7 @@ fn parse_macro_body_rec(
                                 nextcap = max(nextcap, idx+1);
                             },
                             Some(&(mut c)) if c.is_ascii_alphanumeric() || c == b'_' => {
-                                if template { return syntaxerr(pcx, ErrorMessage::CapNameInTemplate) }
+                                if template { return pcx.error(SyntaxError::CapNameInTemplate) }
                                 let start = cursor;
                                 loop {
                                     cursor += 1;
@@ -754,16 +753,16 @@ fn parse_macro_body_rec(
                                 }
                                 let cap = match pcx.intern.find(&data[start..cursor]) {
                                     Some(r) => r,
-                                    None => return syntaxerr(pcx, ErrorMessage::UndefCap)
+                                    None => return pcx.error(SyntaxError::UndefCap)
                                 };
                                 let idx = match pcx.data.marg.iter().position(|a| *a == cap) {
                                     Some(i) => i,
-                                    None => return syntaxerr(pcx, ErrorMessage::UndefCap)
+                                    None => return pcx.error(SyntaxError::UndefCap)
                                 };
                                 pcx.tmp.push([Token::OpInsert as u8, idx as _]);
                             },
                             _ => {
-                                if !template { return syntaxerr(pcx, ErrorMessage::CapPosInBody) }
+                                if !template { return pcx.error(SyntaxError::CapPosInBody) }
                                 pcx.tmp.push([Token::OpInsert as u8, nextcap]);
                                 nextcap += 1;
                             }

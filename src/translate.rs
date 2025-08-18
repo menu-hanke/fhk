@@ -9,7 +9,7 @@ use crate::lang::Lang;
 use crate::mem::{CursorType, SizeClass};
 use crate::compile;
 use crate::emit::{block2cl, cast_values, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
-use crate::ir::{Chunk, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
+use crate::ir::{Chunk, Conv, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
 use crate::support::{NativeFunc, SuppFunc};
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
@@ -215,6 +215,14 @@ fn ins_mov(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = emit.values[value];
 }
 
+fn ins_conv(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let (value, conv) = emit.code[id].decode_CONV();
+    let value = emit.fb.coerce(emit.values[value].value(), emit.code[id].type_(),
+        Conv::from_u16(conv));
+    emit.values[id] = InsValue::from_value(value);
+}
+
 fn ins_arith(ecx: &mut Ecx, id: InsId) {
     use {Type::*, Opcode::*};
     let emit = &mut *ecx.data;
@@ -253,7 +261,7 @@ fn ins_pow(ecx: &mut Ecx, id: InsId) {
 fn ins_addp(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (left, right) = emit.code[id].decode_VV();
-    let right = emit.fb.coerce(emit.values[right].value(), Type::I64);
+    let right = emit.fb.coerce(emit.values[right].value(), Type::I64, Conv::Signed);
     emit.values[id] = InsValue::from_value(emit.fb.ins().iadd(emit.values[left].value(), right));
 }
 
@@ -328,8 +336,8 @@ fn ins_alloc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (size, align) = emit.code[id].decode_VV();
     let alloc = emit.fb.importsupp(&ecx.ir, SuppFunc::ALLOC);
-    let size = emit.fb.coerce(emit.values[size].value(), Type::I64);
-    let align = emit.fb.coerce(emit.values[align].value(), Type::I64);
+    let size = emit.fb.coerce(emit.values[size].value(), Type::I64, Conv::Unsigned);
+    let align = emit.fb.coerce(emit.values[align].value(), Type::I64, Conv::Unsigned);
     let call = emit.fb.ins().call(alloc, &[size, align]);
     emit.values[id] = InsValue::from_value(emit.fb.ctx.func.dfg.inst_results(call)[0]);
 }
@@ -510,7 +518,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             KSTR => todo!(),
             KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
-            CONV => todo!(),
+            CONV => ins_conv(ecx, id),
             ADD | SUB | MUL | DIV | UDIV => ins_arith(ecx, id),
             POW => ins_pow(ecx, id),
             ADDP => ins_addp(ecx, id),

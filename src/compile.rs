@@ -1,5 +1,6 @@
 //! Compiler pipeline.
 
+use core::fmt::Display;
 use core::mem::{transmute, ManuallyDrop};
 
 use enumset::EnumSet;
@@ -181,10 +182,10 @@ pub trait CompileError<P=()> {
     fn write(self, ccx: &mut Ccx<P, R, R>);
 }
 
-// shorthand so that you don't have to write ccx.erase().error(...) for generic errors.
-impl<T,P> CompileError<P> for T where T: CompileError<()>, P: StageMarker {
+impl<T,P> CompileError<P> for T where T: Display {
     fn write(self, ccx: &mut Ccx<P, R, R>) {
-        self.write(ccx.erase())
+        use core::fmt::Write;
+        write!(ccx.host.buf, "{}", self).unwrap();
     }
 }
 
@@ -218,7 +219,30 @@ impl<P,G,I> Ccx<P,G,I> {
         Err(())
     }
 
+    // workaround because rust doesn't let me implement CompileError for &CStr
+    #[inline(always)]
+    pub fn raw_error<T>(&mut self, error: &[u8]) -> Result<T>
+    {
+        self.host.buf.clear();
+        self.host.buf.write(error);
+        Err(())
+    }
+
 }
+
+// same as ccx.error(format_args!(...)) but doesn't require borrowing the whole ccx.
+#[allow(unused_macros)]
+macro_rules! format_error {
+    ($ccx:expr, $($x:tt)*) => {{
+        use core::fmt::Write;
+        $ccx.host.buf.clear();
+        write!($ccx.host.buf, $($x)*).unwrap();
+        Err(())
+    }};
+}
+
+#[allow(unused_imports)]
+pub(crate) use format_error;
 
 impl<'a, P, T: StageMarker> CompileStage<'a, P, T> {
 

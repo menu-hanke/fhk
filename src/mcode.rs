@@ -29,11 +29,18 @@ pub enum Sym {
     Native, // which = NativeFunc
 }
 
+#[derive(Clone, Copy)]
+pub enum Segment {
+    Code,
+    Data
+}
+
 pub struct Reloc {
     pub at: MCodeOffset,
     pub add: i32,
     pub kind: cranelift_codegen::binemit::Reloc,
     pub sym: Sym,
+    pub seg: Segment,
     pub which: u32
 }
 
@@ -55,6 +62,21 @@ impl Sym {
         // FIXME replace with core::mem::variant_count when it stabilizes
         assert!(raw < <Self as enumset::__internal::EnumSetTypePrivate>::VARIANT_COUNT as _);
         unsafe { core::mem::transmute(raw) }
+    }
+
+}
+
+impl Reloc {
+
+    pub fn data_abs8(at: MCodeOffset, which: MCodeOffset) -> Reloc {
+        Reloc {
+            at,
+            add: 0,
+            kind: cranelift_codegen::binemit::Reloc::Abs8,
+            sym: Sym::Data,
+            seg: Segment::Data,
+            which
+        }
     }
 
 }
@@ -127,11 +149,22 @@ impl MCode {
         self.data.write(data).ptr() as _
     }
 
+    pub fn reserve_data<T>(&mut self, len: usize) -> (MCodeOffset, &mut [T])
+        where T: bump::FromBytes + bump::IntoBytes
+    {
+        let (p, r) = self.data.reserve_dst(len);
+        (p.ptr() as _, r)
+    }
+
+    pub fn align_data(&mut self, align: usize) -> MCodeOffset {
+        self.data.align(align);
+        self.data.end().ptr() as _
+    }
+
     pub fn align_data_for<T>(&mut self) -> MCodeOffset
         where T: ?Sized + bump::Aligned
     {
-        self.data.align(T::ALIGN);
-        self.data.end().ptr() as _
+        self.align_data(T::ALIGN)
     }
 
     pub fn data(&self) -> &[u8] {

@@ -18,9 +18,9 @@ use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
-use crate::ir::{Chunk, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
+use crate::ir::{Chunk, Conv, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
 use crate::lang::{Lang, LangState};
-use crate::mcode::{MCode, MCodeOffset, Reloc, Sym};
+use crate::mcode::{MCode, MCodeOffset, Reloc, Segment, Sym};
 use crate::mem::{CursorA, SizeClass, Slot};
 use crate::schedule::{compute_schedule, Gcm};
 use crate::support::{emitsupport, NativeFunc, SuppFunc};
@@ -215,22 +215,35 @@ impl FuncBuilder {
         self.ins().load(irt2cl(type_), MemFlags::trusted().with_readonly(), ptr, 0)
     }
 
-    pub fn coerce(&mut self, v: Value, irt: Type) -> Value {
-        use Type::*;
-        use cranelift_codegen::ir::types;
+    pub fn coerce(&mut self, v: Value, irt: Type, conv: Conv) -> Value {
+        use {Type::*, Conv::*};
         let vty = self.ctx.func.dfg.value_type(v);
         let tty = irt2cl(irt);
         if vty == tty {
-            v
-        } else {
-            match (vty, irt) {
-                (types::I8|types::I16|types::I32, I64)
-                    | (types::I8|types::I16, I32)
-                    | (types::I8, I16)
-                    => self.ins().sextend(tty, v),
-                (types::I8|types::I16|types::I32, PTR) => self.ins().uextend(tty, v),
-                _ => todo!()
+            return v
+        } else if vty.is_int() && (irt.is_int() || irt == PTR) {
+            match (irt.size() > (vty.bytes() as usize), conv) {
+                (true, Signed) => self.ins().sextend(tty, v),
+                (true, Unsigned) => self.ins().uextend(tty, v),
+                (false, _) => self.ins().ireduce(tty, v)
             }
+        } else if vty.is_int() && irt.is_fp() {
+            match conv {
+                Signed => self.ins().fcvt_from_sint(tty, v),
+                Unsigned => self.ins().fcvt_from_uint(tty, v)
+            }
+        } else if vty.is_float() && irt.is_int() {
+            match conv {
+                Signed => self.ins().fcvt_to_sint(tty, v),
+                Unsigned => self.ins().fcvt_to_uint(tty, v)
+            }
+        } else if vty.is_float() && irt.is_fp() {
+            match irt.size() > (vty.bytes() as usize) {
+                true => self.ins().fpromote(tty, v),
+                false => self.ins().fdemote(tty, v)
+            }
+        } else {
+            todo!()
         }
     }
 
@@ -382,7 +395,7 @@ fn slotptr(
         true => emit.fb.ins().load(irt2cl(Type::PTR), MEM_VMCTX, vmctx, slot.byte() as i32),
         false => emit.fb.ins().iadd_imm(vmctx, slot.byte() as i64)
     };
-    let mut idx = emit.fb.coerce(idx, Type::I64);
+    let mut idx = emit.fb.coerce(idx, Type::I64, Conv::Signed);
     if type_.size() > 1 {
         idx = emit.fb.ins().imul_imm(idx, type_.size() as i64);
     }
@@ -470,6 +483,7 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
                 add: addend as i32 + ofs as i32,
                 kind,
                 sym: Sym::Label,
+                seg: Segment::Code,
                 which: {let fid: u16 = zerocopy::transmute!(emit.fid); fid as _}
             }),
         &FinalizedRelocTarget::ExternalName(ExternalName::User(name)) => {
@@ -480,6 +494,7 @@ fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &Finalize
                 add: addend as i32,
                 kind,
                 sym: Sym::from_u8(namespace as _),
+                seg: Segment::Code,
                 which: index
             });
         },

@@ -11,7 +11,6 @@ use logos::Logos;
 
 use crate::bump::Bump;
 use crate::compile::{self, Ccx, CompileError, Stage};
-use crate::err::ErrorMessage;
 use crate::hash::HashMap;
 use crate::index::{index, IndexOption, IndexVec};
 use crate::intern::{InternPtr, Interned};
@@ -164,6 +163,36 @@ pub fn stringify(buf: &mut Bump, intern: &InternPtr, body: &[u8], sty: SequenceT
 
 /* ---- Error messages ------------------------------------------------------ */
 
+#[derive(Clone, Copy)]
+pub enum SyntaxError {
+    InvalidToken,
+    ExpectedValue,
+    ExpectedPrimitive,
+    ExpectedType,
+    CapNameInTemplate,
+    CapPosInBody,
+    UndefCap,
+    BadImplicitTab
+}
+
+impl SyntaxError {
+
+    fn str(self) -> &'static str {
+        use SyntaxError::*;
+        match self {
+            InvalidToken       => "invalid token",
+            ExpectedValue      => "expected value",
+            ExpectedPrimitive  => "expected scalar type name",
+            ExpectedType       => "expected type",
+            CapNameInTemplate  => "named capture not allowed in templates",
+            CapPosInBody       => "positional capture not allowed in macro body",
+            UndefCap           => "undefined capture",
+            BadImplicitTab     => "implicit table not allowed here"
+        }
+    }
+
+}
+
 fn nsname(ns: Namespace) -> &'static str {
     use Namespace::*;
     match ns {
@@ -224,20 +253,11 @@ fn traceback(pcx: &mut Ccx<PcxData, R, R>) {
     write!(pcx.host.buf, "on line {} col {}", loc.line, loc.col).unwrap();
 }
 
-#[derive(Clone, Copy)]
-pub struct SyntaxError {
-    pub message: ErrorMessage
-}
-
 impl<'a> CompileError<PcxData<'a>> for SyntaxError {
     fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
-        write!(pcx.host.buf, "syntax error: {}\n", self.message.str()).unwrap();
+        write!(pcx.host.buf, "syntax error: {}\n", self.str()).unwrap();
         traceback(pcx);
     }
-}
-
-pub fn syntaxerr<T>(pcx: &mut Pcx, message: ErrorMessage) -> compile::Result<T> {
-    pcx.error(SyntaxError { message })
 }
 
 #[derive(Clone, Copy)]

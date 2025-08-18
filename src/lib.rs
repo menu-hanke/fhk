@@ -13,7 +13,6 @@ mod data;
 mod dl;
 mod dump;
 mod emit;
-mod err;
 mod finalize;
 mod graph;
 mod hash;
@@ -60,9 +59,10 @@ macro_rules! foreach_lang {
     ($mac:path $(,$($extra:tt)*)?) => {
         $mac! {
             $($($extra)*)?
-            #[cfg(feature="lang-C")]   lang_C::C;
-            #[cfg(feature="lang-Lua")] lang_Lua::Lua;
-            #[cfg(feature="lang-R")]   lang_R::R;
+            #[cfg(feature="lang-C")]     lang_C::C;
+            #[cfg(feature="lang-Lua")]   lang_Lua::Lua;
+            #[cfg(feature="lang-R")]     lang_R::R;
+            #[cfg(feature="lang-Table")] lang_Table::Table;
         }
     };
 }
@@ -84,11 +84,13 @@ foreach_lang!(define_lang_mods);
 
 pub const FHK_VERSION_STRING: &[u8] = &concat::concat_slices!(u8;
     match option_env!("FHK_GITHASH") { Some(v) => v.as_bytes(), None => b"(unknown version)" },
-    #[cfg(feature="host-Lua")] b" Lua",
+    #[cfg(feature="host-Lua")]   b" Lua",
     b" [",
-    #[cfg(feature="lang-C")]   b" C",
-    #[cfg(feature="lang-Lua")] b" Lua",
-    #[cfg(feature="lang-R")]   b" R",
+    #[cfg(feature="lang-C")]     b" C",
+    #[cfg(feature="lang-Lua")]   b" Lua",
+    #[cfg(feature="lang-R")]     b" R",
+    #[cfg(feature="lang-Table")] b" Table",
+    #[cfg(all(feature="lang-Table", feature="csv"))] b"(+csv)",
     b" ]",
     b"\0"
 );

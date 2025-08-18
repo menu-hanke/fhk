@@ -112,6 +112,27 @@ impl Type {
 
 }
 
+#[derive(Clone, Copy)]
+pub enum Conv {
+    Signed,
+    Unsigned
+}
+
+impl Conv {
+
+    pub const SIGNED: u16 = Self::Signed as _;
+    pub const UNSIGNED: u16 = Self::Unsigned as _;
+
+    pub fn from_u16(raw: u16) -> Self {
+        if raw == Self::SIGNED {
+            Self::Signed
+        } else {
+            Self::Unsigned
+        }
+    }
+
+}
+
 /* ---- Opcodes ------------------------------------------------------------- */
 
 #[derive(Clone, Copy, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
@@ -338,7 +359,7 @@ define_opcodes! {
     MOV       V;
     MOVB      V;
     MOVF      V V;
-    CONV      V X;
+    CONV      V X,   decode_CONV;
 
     ADD       V V;
     SUB       V V;

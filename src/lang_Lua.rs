@@ -439,7 +439,7 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
         lib.lua_call(L, 2, 2);
         if lib.lua_type(L, -2) == LUA_TNIL {
             let msg = lib.lua_tolstring(L, -1, core::ptr::null_mut());
-            ccx.error(CStr::from_ptr(msg))
+            ccx.raw_error(CStr::from_ptr(msg).to_bytes())
         } else {
             let mem = lib.lua_tointeger(L, -2);
             lib.lua_settop(L, -3);
