@@ -9,6 +9,7 @@
 // * loop optimizations: code motion, fusion
 // * merge identical phis
 // * load-store elimination and dead store elimination
+// * size class optimization: if CINITs have statically known size, set CINIT->NOP and scl->static
 
 use core::hash::Hasher;
 

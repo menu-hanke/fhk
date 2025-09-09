@@ -686,8 +686,8 @@ fn makedensetab(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) 
             input.span = 1 + (cinfo.max - cinfo.min) as usize;
         } else {
             let size = Type::from_u8(cinfo.ty).size();
-            ecx.mcode.align_data(size);
-            let (mcode_output, data) = ecx.mcode.reserve_data::<u8>(size * dense_size);
+            ecx.image.mcode.align_data(size);
+            let (mcode_output, data) = ecx.image.mcode.reserve_data::<u8>(size * dense_size);
             let columns = &ecx.perm[cols..cols.add(ncol)];
             for r in 0..nrow {
                 let row = &ecx.perm[rows.add(r*ncol)..rows.add((r+1)*ncol)];
@@ -757,11 +757,11 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
     let mut work_start = 0;
     let mut nin = 0;
     let mut nout = 0;
-    let mcode_op = ecx.mcode.align_data_for::<InputOperator>();
+    let mcode_op = ecx.image.mcode.align_data_for::<InputOperator>();
     for (i,&col) in columns.iter().enumerate() {
         if InputOperator::is_input_u8(col.op) {
             nin += 1;
-            ecx.mcode.write_data(&col.op);
+            ecx.image.mcode.write_data(&col.op);
             let work_end = work_link.len();
             let mut r = 0;
             for j in work_start..work_end {
@@ -788,10 +788,10 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
     let nleaf = key.len() as usize - leaf_bias;
     link.push(&mut ecx.tmp, key.len());
     let work_link = work_link.as_slice(&ecx.tmp);
-    let mcode_key = ecx.mcode.write_data(key.as_slice(&ecx.tmp));
-    let mcode_link = ecx.mcode.write_data(link.as_slice(&ecx.tmp));
+    let mcode_key = ecx.image.mcode.write_data(key.as_slice(&ecx.tmp));
+    let mcode_link = ecx.image.mcode.write_data(link.as_slice(&ecx.tmp));
     if index == IndexType::TreeValues as _ {
-        let (mcode_outputs, out) = ecx.mcode.reserve_data::<f64>(nleaf * nout);
+        let (mcode_outputs, out) = ecx.image.mcode.reserve_data::<f64>(nleaf * nout);
         for i in 0..nleaf {
             let r = work_link[leaf_bias+i] as usize - 1;
             for (j,&c) in columns.iter().enumerate() {
@@ -800,7 +800,7 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
                 }
             }
         }
-        let rtq = ecx.mcode.write_data(&RtTreeQueryV {
+        let rtq = ecx.image.mcode.write_data(&RtTreeQueryV {
             key: core::ptr::null(),
             link: core::ptr::null(),
             op: core::ptr::null(),
@@ -809,13 +809,13 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
             n_out: nout as _,
             leaf_bias: leaf_bias as _
         });
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryV, key) as MCodeOffset, mcode_key));
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryV, link) as MCodeOffset, mcode_link));
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryV, op) as MCodeOffset, mcode_op));
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryV, data) as MCodeOffset, mcode_outputs));
         ecx.perm.push(TreeValuesData { rtq }).cast()
     } else /* TreeRows */ {
@@ -828,8 +828,8 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
             let col = ecx.perm[col];
             if !InputOperator::is_input_u8(col.op) {
                 let size = Type::from_u8(cinfo.ty).size();
-                ecx.mcode.align_data(size);
-                let (mcode_output, out) = ecx.mcode.reserve_data::<u8>(nleaf * size);
+                ecx.image.mcode.align_data(size);
+                let (mcode_output, out) = ecx.image.mcode.reserve_data::<u8>(nleaf * size);
                 for i in 0..nleaf {
                     let r = work_link[leaf_bias+i] as usize - 1;
                     writepacked(&mut out[i*size..(i+1)*size],cinfo,ecx.perm[rows.add(r*ncol+j)]);
@@ -840,18 +840,18 @@ fn buildtree(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -> 
                 out.sign = cinfo.sign;
             }
         }
-        let rtq = ecx.mcode.write_data(&RtTreeQueryR {
+        let rtq = ecx.image.mcode.write_data(&RtTreeQueryR {
             key: core::ptr::null(),
             link: core::ptr::null(),
             op: core::ptr::null(),
             n_in: nin as _,
             leaf_bias: leaf_bias as _
         });
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryR, key) as MCodeOffset, mcode_key));
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryR, link) as MCodeOffset, mcode_link));
-        ecx.mcode.relocs.push(
+        ecx.image.mcode.relocs.push(
             Reloc::data_abs8(rtq+offset_of!(RtTreeQueryR, op) as MCodeOffset, mcode_op));
         ecx.perm.push(TreeRowsData { rtq, outputs: outputs.base() }).cast()
     }
@@ -889,8 +889,9 @@ fn readfile(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result {
             Err(e) => return ecx.error(e)
         }
         if rec.len() != ncol {
-            return compile::format_error!(ecx, "{}: expected {} columns, found {}",
-                path, ncol, rec.len());
+            ecx.host.set_error(format_args!("{}: expected {} columns, found {}", path, ncol,
+                    rec.len()));
+            return Err(());
         }
         let start = ecx.perm.end().cast::<f64>();
         for field in &rec {

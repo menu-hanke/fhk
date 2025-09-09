@@ -78,7 +78,7 @@ fn compute_blockparams(gcm: &mut Gcm, func: &Func, phis: &mut BitMatrix<BlockId,
     let cfg = &gcm.control.cfg;
     while let Some(id) = solver.poll() {
         let pop = phis[id].popcount();
-        for &succ in cfg.inputs(id) {
+        for &succ in &cfg.forward[id] {
             // note: id=succ implies either an infinite loop or an unreachable edge.
             // * JMP/GOTO to own block can never get out
             // * IF to own block cant set phis so cond is always true or always false
@@ -93,7 +93,7 @@ fn compute_blockparams(gcm: &mut Gcm, func: &Func, phis: &mut BitMatrix<BlockId,
             phis[id].clear(phi);
         }
         if phis[id].popcount() != pop {
-            solver.queue_nodes(cfg.uses(id));
+            solver.queue_nodes(&cfg.backward[id]);
         }
     }
 }

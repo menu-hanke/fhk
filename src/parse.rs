@@ -7,12 +7,12 @@ use core::ops::Range;
 use enumset::{enum_set, EnumSet};
 
 use crate::bump::BumpRef;
-use crate::compile;
+use crate::compile::{self, FFIError};
 use crate::intern::Interned;
 use crate::lang::Lang;
 use crate::lex::Token;
 use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LEN, LET, LGET, LOAD, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
-use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, DefinitionError, DefinitionErrorType, SyntaxError, LangError, Namespace, ParenCounter, Pcx, TokenError};
+use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, DefinitionError, DefinitionErrorType, SyntaxError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
 const TOPLEVEL_KEYWORDS: EnumSet<Token> = enum_set!(
@@ -257,7 +257,13 @@ fn parse_callx(pcx: &mut Pcx, n: usize) -> compile::Result<ObjRef<CALL>> {
     consume(pcx, Token::Call)?;
     require(pcx, Token::Ident)?;
     let lang: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
-    let Some(lang) = Lang::from_name(&pcx.intern[lang]) else { return pcx.error(LangError) };
+    let name = &pcx.intern[lang];
+    let Some(lang) = Lang::from_name(&pcx.intern[lang])
+        else {
+            pcx.host.set_error(format_args!("unsupported language: {}",
+                    FFIError::from_bytes(name)));
+            return Err(());
+        };
     next(pcx)?; // skip name
     lang.parse(pcx, n)
 }

@@ -82,12 +82,8 @@ end
 
 ---- test driver ---------------------------------------------------------------
 
-local function test_query(T, tab, ...)
-	local query = T.G:newquery(tab)
-	for _,expr in ipairs({...}) do
-		query:add(expr)
-	end
-	return query
+local function test_query(T, ...)
+	return T.G:query(...)
 end
 
 local function test_compile(T)
@@ -98,19 +94,18 @@ local function test_compile(T)
 end
 
 local function test_newinstance(T, prev, mask)
-	return test_compile(T):newinstance(T.alloc, nil, prev, mask)
+	return test_compile(T):instance(T.alloc, nil, prev, mask)
 end
 
-local function test_result(T, results)
-	local query = T.G:newquery("global")
+local function test_result(T, results, params)
 	local true_, expr = {}, {}
 	for e,v in pairs(results) do
-		query:add(e)
 		table.insert(true_, v)
 		table.insert(expr, e)
 	end
+	local query = T.G:query(unpack(expr))
 	local inst = test_newinstance(T)
-	check({query.query(inst):unpack()}, true_, nil, expr)
+	check({T.image[query](inst, params):unpack()}, true_, nil, expr)
 end
 
 local function pcallfail(message, f, ...)
@@ -122,21 +117,17 @@ local function pcallfail(message, f, ...)
 end
 
 local function newquery(G, expr)
-	local query = G:newquery("global")
 	if type(expr) == "table" then
-		for _,e in ipairs(expr) do
-			query:add(e)
-		end
+		return G:query(unpack(expr))
 	else
-		query:add(expr)
+		return G:query(expr)
 	end
-	return query
 end
 
-local function test_fail(T, expr, message)
+local function test_fail(T, expr, message, params)
 	local query = newquery(T.G, expr)
 	local inst = test_newinstance(T)
-	pcallfail(message, query.query, inst)
+	pcallfail(message, T.image[query], inst, params)
 end
 
 local function test_compilefail(T, expr, message)

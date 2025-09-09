@@ -16,7 +16,6 @@ use crate::compile::Ccx;
 use crate::hash::fxhash;
 use crate::index::index;
 use crate::intern::Interned;
-use crate::mcode::MCodeOffset;
 use crate::typing::Primitive;
 
 index!(pub struct LocalId(u32));
@@ -86,7 +85,7 @@ impl<T: ?Sized> ObjRef<T> {
     // ORDER BUILTINOBJ
     pub fn is_builtin(self) -> bool {
         let raw: u32 = zerocopy::transmute!(self);
-        raw <= zerocopy::transmute!(ObjRef::GLOBAL)
+        raw <= zerocopy::transmute!(ObjRef::QUERY)
     }
 
 }
@@ -284,15 +283,14 @@ macro_rules! define_ops {
 
 // note: all fields here must be 4 byte POD types.
 define_ops! {
-    // named objects. name must be first. tab must be second for VAR and MOD.
+    // named objects. name must be first.
     VAR         { name: Name, tab: ObjRef<TAB>, ann: ObjRef/*TY*/};
     TAB         { name: Name, shape: ObjRef<TUPLE> };
     FUNC.arity  { name: Name, expr: ObjRef<EXPR>, args: ObjRef/*TTUP*/ };
     FPROT.arity { name: Name, expr: ObjRef<EXPR>, unused: u32 };
     // non-named objects.
     MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR>, value: ObjRef<EXPR> } outputs: [ObjRef<VSET>];
-    QUERY       { tab: ObjRef<TAB>, mcode: MCodeOffset } value: [ObjRef<EXPR>];
-    RESET.id    { mlo: u32, mhi: u32 /* TODO: use 32-bit offset instead */ } objs: [ObjRef/*VAR|MOD*/];
+    QUERY       { value: ObjRef<TUPLE> };
     VSET.dim    { var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     // types
     TPRI.ty     {};
@@ -304,9 +302,7 @@ define_ops! {
     SPLAT       { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     KINT        { ann: ObjRef/*TY*/, k: i32 };
     KINT64      { ann: ObjRef/*TY*/, k: Interned<i64> };
-    KINTV       { ann: ObjRef/*TY*/, k: Interned<[i64]> };
     KFP64       { ann: ObjRef/*TY*/, k: Interned<f64> };
-    KFPV        { ann: ObjRef/*TY*/, k: Interned<[f64]> };
     KSTR        { ann: ObjRef/*TY*/, k: Interned<[u8]> };
     LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
@@ -428,6 +424,7 @@ define_intrinsics! {
     ALL     b"all";
     CONV    b"conv";
     REP     b"rep";
+    EFFECT  b"effect";
 }
 
 impl Intrinsic {
@@ -847,12 +844,15 @@ default_objs! {
     pub NIL           (0)  = SPEC::new(SPEC::NIL, ObjRef::UNIT);
     pub SLURP         (2)  = SPEC::new(SPEC::SLURP, ObjRef::UNIT);
     pub UNIT:   TTUP  (4)  = TTUP::new();
-    pub B1:     TPRI  (5)  = TPRI::new(Primitive::B1 as _);
-    pub PTR:    TPRI  (6)  = TPRI::new(Primitive::PTR as _);
-    pub FALSE:  KINT  (7)  = KINT::new(ObjRef::B1.erase(), 0);
-    pub TRUE:   KINT  (10) = KINT::new(ObjRef::B1.erase(), 1);
-        EMPTY:  TUPLE (13) = TUPLE::new(ObjRef::NIL);
-    pub GLOBAL: TAB   (15) = TAB::new(Ccx::SEQ_GLOBAL, ObjRef::EMPTY);
+    pub FX:     TPRI  (5)  = TPRI::new(Primitive::FX as _);
+    pub B1:     TPRI  (6)  = TPRI::new(Primitive::B1 as _);
+    pub PTR:    TPRI  (7)  = TPRI::new(Primitive::PTR as _);
+    pub FALSE:  KINT  (8)  = KINT::new(ObjRef::B1.erase(), 0);
+    pub TRUE:   KINT  (11) = KINT::new(ObjRef::B1.erase(), 1);
+        EMPTY:  TUPLE (14) = TUPLE::new(ObjRef::NIL);
+    pub GLOBAL: TAB   (16) = TAB::new(Ccx::SEQ_GLOBAL, ObjRef::EMPTY);
+    pub STATE:  TAB   (19) = TAB::new(Ccx::SEQ_STATE, ObjRef::EMPTY);
+    pub QUERY:  TAB   (22) = TAB::new(Ccx::SEQ_QUERY, ObjRef::EMPTY);
 }
 
 impl Default for Objects {
@@ -863,11 +863,16 @@ impl Default for Objects {
             lookup: Default::default()
         };
         insert_default_objs(&mut objs);
-        objs.lookup.insert_unique(
-            fxhash((Operator::TAB as u32, Ccx::SEQ_GLOBAL)),
-            ObjRef::GLOBAL.erase(),
-            |_| unreachable!()
-        );
+        objs.lookup.reserve(4, |_| unreachable!());
+        const BUILTIN_TABLES: &[(ObjRef<TAB>, Interned<[u8]>)] = &[
+            (ObjRef::GLOBAL, Ccx::SEQ_GLOBAL),
+            (ObjRef::STATE, Ccx::SEQ_STATE),
+            (ObjRef::QUERY, Ccx::SEQ_QUERY)
+        ];
+        for &(obj, name) in BUILTIN_TABLES {
+            objs.lookup.insert_unique(fxhash((Operator::TAB as u32, name)), obj.erase(),
+                |_| unreachable!());
+        }
         objs
     }
 

@@ -5,14 +5,16 @@ use core::str;
 
 use cfg_if::cfg_if;
 
-use crate::bitmap::BitMatrix;
-use crate::bump::Bump;
+use crate::bitmap::{BitMatrix, Bitmap};
+use crate::bump::{Bump, BumpRef};
+use crate::compile::Ccx;
 use crate::controlflow::BlockId;
 use crate::emit::InsValue;
+use crate::image::ImageBuilder;
 use crate::index::{self, IndexSlice};
 use crate::intern::{Intern, Interned};
-use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, OperandData, PhiId, IR};
-use crate::mem::{BreakpointId, Layout};
+use crate::ir::{DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, OperandData, PhiId, Type, IR};
+use crate::mem::{Chunk, Offset, Reset};
 use crate::obj::{FieldType, ObjRef, ObjectRef, Objects, Operator, FUNC, MOD, TAB, VAR, VSET};
 use crate::parser::{stringify, SequenceType};
 use crate::trace::trace;
@@ -201,7 +203,7 @@ fn dump_funcheader(buf: &mut Bump, fid: FuncId, func: &Func, intern: &Intern, ob
 pub fn dump_ir(buf: &mut Bump, ir: &IR, intern: &Intern, objs: &Objects) {
     for (id, func) in ir.funcs.pairs() {
         dump_funcheader(buf, id, func, intern, objs);
-        write!(buf, "ENTRY ->{:?}\n", func.entry).unwrap();
+        write!(buf, "  ---- --- ENTRY  ->{:?}\n", func.entry).unwrap();
         dump_code(buf, id, &ir.funcs, intern, objs);
     }
 }
@@ -235,30 +237,101 @@ pub fn dump_schedule(
 
 /* ---- Memory -------------------------------------------------------------- */
 
-pub fn dump_layout(buf: &mut Bump, layout: &Layout) {
-    let Some(end_reset) = layout.reset
-        .pairs()
-        .rev()
-        .find_map(|(i,m)| (!m.is_empty()).then_some(i+1))
-        else { return };
-    write!(buf, "             ").unwrap();
-    for i in index::iter_span(end_reset) {
-        let i: u8 = zerocopy::transmute!(i);
-        write!(buf, " {:02}", i).unwrap();
+const LAYOUT_MARGIN_WIDTH: usize = 30;
+
+fn segname(image: &ImageBuilder, ofs: Offset, maxofs: Offset) -> &'static str {
+    if ofs < image.breakpoints.raw[0] {
+        "static"
+    } else if ofs < maxofs {
+        "dynamic"
+    } else {
+        "query"
     }
-    buf.push(b'\n');
-    for breakpoint in index::iter_span(BreakpointId::MAXNUM.into()) {
-        let this = layout.breakpoints[breakpoint];
-        let next = layout.breakpoints[breakpoint+1];
-        if next == 0 { break; }
-        write!(buf, "{:4} .. {:4} ", this, next).unwrap();
-        for i in index::iter_span(end_reset) {
-            buf.write(match layout.reset[i].test(breakpoint) {
-                true  => b" * ",
-                false => b"   "
-            });
+}
+
+pub fn dump_layout(ccx: &mut Ccx) {
+    write!(ccx.tmp, "Image size: {} bytes\n", ccx.image.size).unwrap();
+    let mut prevofs = ccx.image.breakpoints.raw[0];
+    for (id, &ofs) in ccx.image.breakpoints.pairs().skip(1) {
+        if ofs == 0 { break }
+        let idx: usize = id.into();
+        let start = ccx.tmp.end().index();
+        write!(ccx.tmp, "#{:02} [{}, {})", idx-1, prevofs, ofs).unwrap();
+        let end = ccx.tmp.end().index();
+        if end < start+LAYOUT_MARGIN_WIDTH {
+            write!(ccx.tmp, "{:1$}", "", start+LAYOUT_MARGIN_WIDTH-end).unwrap();
         }
-        buf.push(b'\n');
+        ccx.tmp.push(b'[');
+        for (rid, &Reset { mask }) in ccx.layout.resets.pairs() {
+            if mask.test(id-1) {
+                let ridx: usize = rid.into();
+                write!(ccx.tmp, "{ridx:^3}").unwrap();
+            } else {
+                ccx.tmp.write("   ");
+            }
+        }
+        write!(ccx.tmp, "] {} bytes\n", ofs-prevofs).unwrap();
+        prevofs = ofs;
+    }
+    for (id, func) in ccx.ir.funcs.pairs() {
+        let start = ccx.tmp.end().index();
+        let idx: usize = id.into();
+        write!(ccx.tmp, "FUNC {} ", idx).unwrap();
+        dump_debugsource(&mut ccx.tmp, &ccx.intern, &ccx.objs, func.source);
+        let end = ccx.tmp.end().index();
+        if end > start+LAYOUT_MARGIN_WIDTH-1 {
+            ccx.tmp.truncate(BumpRef::<u8>::from_ptr(start+LAYOUT_MARGIN_WIDTH-1));
+            ccx.tmp.push(b' ');
+        } else {
+            write!(ccx.tmp, "{:1$}", "", start+LAYOUT_MARGIN_WIDTH-end).unwrap();
+        }
+        ccx.tmp.push(b'[');
+        let reset = Bitmap::from_words(&ccx.intern[func.reset]);
+        for rid in index::iter_span(ccx.layout.resets.end()) {
+            if reset.test(rid) {
+                let ridx: usize = rid.into();
+                write!(ccx.tmp, "{ridx:^3}").unwrap();
+            } else {
+                ccx.tmp.write("   ");
+            }
+        }
+        write!(ccx.tmp, "] {:?}\n", func.scl).unwrap();
+        if let FuncKind::Chunk(cid) = func.kind {
+            let Chunk { check, slots, .. } = ccx.layout.chunks[cid];
+            let mut r: PhiId = 0.into();
+            loop {
+                let start = ccx.tmp.end().index();
+                let ofs = if r == func.ret {
+                    ccx.tmp.write("(check)");
+                    check
+                } else {
+                    let ty = func.phis.at(r).type_;
+                    if ty == Type::FX {
+                        r += 1;
+                        continue;
+                    }
+                    let phi: usize = r.into();
+                    write!(ccx.tmp, "#{} {}", phi, ty.name()).unwrap();
+                    ccx.perm[slots.elem(r)]
+                };
+                let end = ccx.tmp.end().index();
+                if end < start+LAYOUT_MARGIN_WIDTH {
+                    write!(ccx.tmp, "{:.<1$} ", " ", start+LAYOUT_MARGIN_WIDTH-1-end).unwrap();
+                }
+                write!(ccx.tmp, "{:10} {:?}\n", segname(&ccx.image, ofs.byte(), prevofs), ofs)
+                    .unwrap();
+                if r == func.ret { break }
+                r += 1;
+            }
+        }
+    }
+    for (id, param) in ccx.layout.params.pairs() {
+        let idx: usize = id.into();
+        write!(ccx.tmp, "PARAM {0:<1$}{2} bytes\n", idx, LAYOUT_MARGIN_WIDTH-6, param.size).unwrap();
+        for (label, slot) in [("check", param.check), ("value", param.value)] {
+            write!(ccx.tmp, "{0} {1:.<2$} {3:10} {4:?}\n", label, "", LAYOUT_MARGIN_WIDTH-7,
+                segname(&ccx.image, slot.byte(), prevofs), slot).unwrap();
+        }
     }
 }
 

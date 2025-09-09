@@ -18,10 +18,10 @@ use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
 use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
-use crate::ir::{Chunk, Conv, Func, FuncId, FuncKind, Ins, InsId, PhiId, Query, Type, IR};
+use crate::ir::{Conv, Func, FuncId, FuncKind, Ins, InsId, PhiId, Type, IR};
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeOffset, Reloc, Segment, Sym};
-use crate::mem::{CursorA, SizeClass, Slot};
+use crate::mem::{CursorA, SizeClass, BitOffset};
 use crate::schedule::{compute_schedule, Gcm};
 use crate::support::{emitsupport, NativeFunc, SuppFunc};
 use crate::trace::trace;
@@ -73,8 +73,6 @@ pub type Ecx<'a> = Ccx<Emit, RW, R<'a>>;
 
 // vmctx including dynamic memory
 pub const MEM_VMCTX: MemFlags = MemFlags::trusted().with_alias_region(Some(AliasRegion::Vmctx));
-// query result
-pub const MEM_RESULT: MemFlags = MemFlags::trusted().with_alias_region(Some(AliasRegion::Table));
 
 // this logic exists inside cranelift, but it's hidden too well behind a TargetIsa pointer.
 // no thanks, this handles all relevant platforms.
@@ -290,14 +288,11 @@ fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
             // windows-specific version
             signature.call_conv = CallConv::SystemV;
             // must match fhk_vmcall
-            signature.params.extend_from_slice(&[
-                AbiParam::new(irt2cl(Type::I32)),
-                AbiParam::new(irt2cl(Type::PTR))
-            ]);
+            signature.params.push(AbiParam::new(irt2cl(Type::PTR)));
         },
-        FuncKind::Chunk(Chunk { scl, .. }) => {
+        FuncKind::Chunk(_) => {
             signature.call_conv = CallConv::Fast;
-            if scl != SizeClass::GLOBAL {
+            if func.scl != SizeClass::GLOBAL {
                 signature.params.push(AbiParam::new(irt2cl(Type::I32)));
             }
         }
@@ -307,7 +302,8 @@ fn makesig(signature: &mut cranelift_codegen::ir::Signature, func: &Func) {
 impl FuncBuilder {
 
     pub fn importdata(&mut self, ptr: MCodeOffset) -> GlobalValue {
-        let nameref = self.ctx.func.declare_imported_user_function(UserExternalName::new(Sym::Data as _, ptr));
+        let nameref = self.ctx.func.declare_imported_user_function(
+            UserExternalName::new(Sym::Data as _, ptr));
         self.ctx.func.create_global_value(GlobalValueData::Symbol {
             name: ExternalName::user(nameref),
             offset: 0.into(),
@@ -386,7 +382,7 @@ fn slotptr(
     vmctx: Value,
     idx: Value,
     scl: SizeClass,
-    slot: Slot,
+    slot: BitOffset,
     type_: Type
 ) -> Value {
     debug_assert!(type_ != Type::FX);
@@ -407,7 +403,7 @@ pub fn loadslot(
     vmctx: Value,
     idx: Value,
     scl: SizeClass,
-    slot: Slot,
+    slot: BitOffset,
     type_: Type
 ) -> Value {
     let ptr = slotptr(emit, vmctx, idx, scl, slot, type_);
@@ -425,7 +421,7 @@ pub fn storeslot(
     vmctx: Value,
     idx: Value,
     scl: SizeClass,
-    slot: Slot,
+    slot: BitOffset,
     type_: Type,
     mut value: Value
 ) {
@@ -438,40 +434,26 @@ pub fn storeslot(
     emit.fb.ins().store(MEM_VMCTX, value, ptr, 0);
 }
 
-fn emithead(emit: &mut Emit, func: &Func) {
-    match func.kind {
-        FuncKind::User => { /* NOP */ },
-        FuncKind::Query(_) => {
-            // vmctx
-            emit.fb.ctx.func.dfg.append_block_param(block2cl(BlockId::START), irt2cl(Type::PTR));
-            // optimizer is not allowed to remove query parameters, or add new ones:
-            debug_assert!(emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START)).len() == 2);
-        },
-        FuncKind::Chunk(Chunk { check, scl, .. }) => {
-            let entry = emit.fb.newblock();
-            emit.fb.block = entry;
-            let idx = match scl {
-                SizeClass::GLOBAL => emit.fb.ins().iconst(irt2cl(Type::I32), 0),
-                _ => {
-                    emit.fb.ctx.func.dfg.append_block_param(entry, irt2cl(Type::I32));
-                    emit.fb.ctx.func.dfg.block_params(entry)[0]
-                }
-            };
-            emit.idx = idx;
-            let vmctx = emit.fb.vmctx();
-            let one = emit.fb.ins().iconst(irt2cl(Type::B1), 1);
-            storeslot(emit, vmctx, idx, scl, check, Type::B1, one);
-            let jarg = [idx];
-            let jarg: &[Value] = match emit.blockparams[BlockId::START].is_empty() {
-                true => &[],
-                false => {
-                    // entry block takes index (TODO: vector return pointers go here as well.)
-                    &jarg
-                }
-            };
-            emit.fb.ins().jump(block2cl(BlockId::START), jarg);
+fn emitchunkhead(emit: &mut Emit, check: BitOffset, scl: SizeClass) {
+    let entry = emit.fb.newblock();
+    emit.fb.block = entry;
+    let idx = match scl {
+        SizeClass::GLOBAL => emit.fb.ins().iconst(irt2cl(Type::I32), 0),
+        _ => {
+            emit.fb.ctx.func.dfg.append_block_param(entry, irt2cl(Type::I32));
+            emit.fb.ctx.func.dfg.block_params(entry)[0]
         }
-    }
+    };
+    emit.idx = idx;
+    let vmctx = emit.fb.vmctx();
+    let one = emit.fb.ins().iconst(irt2cl(Type::B1), 1);
+    storeslot(emit, vmctx, idx, scl, check, Type::B1, one);
+    let jarg = [idx];
+    let jarg: &[Value] = match emit.blockparams[BlockId::START].is_empty() {
+        true => &[],
+        false => { &jarg }
+    };
+    emit.fb.ins().jump(block2cl(BlockId::START), jarg);
 }
 
 fn emitreloc(mcode: &mut MCode, emit: &Emit, base: MCodeOffset, reloc: &FinalizedMachReloc) {
@@ -518,7 +500,8 @@ fn emitmcode(mcode: &mut MCode, buf: &[u8]) -> MCodeOffset {
     loc
 }
 
-fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
+fn compilefunc(ecx: &mut Ecx) -> MCodeOffset {
+    let emit = &mut *ecx.data;
     if let Some(frame) = &emit.frame {
         let slot = &mut emit.fb.ctx.func.sized_stack_slots[frame.slot];
         slot.size = frame.layout.ptr as _;
@@ -529,9 +512,9 @@ fn compilefunc(emit: &mut Emit, mcode: &mut MCode) -> MCodeOffset {
     }
     emit.fb.ctx.compile(&*emit.isa, &mut Default::default()).unwrap();
     let code = emit.fb.ctx.compiled_code().unwrap();
-    let loc = emitmcode(mcode, code.code_buffer());
+    let loc = emitmcode(&mut ecx.image.mcode, code.code_buffer());
     for reloc in code.buffer.relocs() {
-        emitreloc(mcode, emit, loc, reloc);
+        emitreloc(&mut ecx.image.mcode, emit, loc, reloc);
     }
     loc
 }
@@ -573,7 +556,9 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
     }
     // this must go after the blocks are created, so that they get assigned matching ids,
     // but before they are added to the layout, so that emithead can add an entry block.
-    emithead(emit, func);
+    if let FuncKind::Chunk(id) = func.kind {
+        emitchunkhead(emit, ecx.layout.chunks[id].check, func.scl);
+    }
     for id in index::iter_span(emit.blockparams.rows()) {
         emit.fb.ctx.func.layout.append_block(block2cl(id));
     }
@@ -587,11 +572,11 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
             ecx.data.fb.block = cranelift_codegen::ir::Block::from_u32(block as _);
         }
     }
-    let loc = compilefunc(&mut ecx.data, &mut ecx.mcode);
+    let loc = compilefunc(ecx);
     let label = zerocopy::transmute!({let fid: u16 = zerocopy::transmute!(fid); fid as u32});
-    ecx.mcode.labels[label] = loc;
-    if let FuncKind::Query(Query { obj, .. }) = ecx.ir.funcs[fid].kind {
-        ecx.objs[obj].mcode = loc;
+    ecx.image.mcode.labels[label] = loc;
+    if let FuncKind::Query(id) = ecx.ir.funcs[fid].kind {
+        ecx.layout.queries[id].mcode = loc;
     }
     Ok(())
 }
@@ -601,7 +586,7 @@ fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
         trace!("---------- SUPP {:?} ----------", supp);
     }
     let loc = match supp {
-        SuppFunc::SWAP => emitmcode(&mut ecx.mcode, Image::fhk_swap_bytes()),
+        SuppFunc::SWAP => emitmcode(&mut ecx.image.mcode, Image::fhk_swap_bytes()),
         _ => {
             let emit = &mut *ecx.data;
             resetemit(emit);
@@ -614,11 +599,11 @@ fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
             }
             emit.fb.block = entry;
             emitsupport(ecx, supp);
-            compilefunc(&mut ecx.data, &mut ecx.mcode)
+            compilefunc(ecx)
         }
     };
     let label = zerocopy::transmute!(ecx.ir.funcs.raw.len() as u32 + supp as u32);
-    ecx.mcode.labels[label] = loc;
+    ecx.image.mcode.labels[label] = loc;
 }
 
 fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
@@ -674,7 +659,7 @@ impl Stage for Emit {
     }
 
     fn run(ccx: &mut Ccx<Self>) -> compile::Result {
-        ccx.mcode.labels.raw.resize(ccx.ir.funcs.raw.len() + SuppFunc::COUNT, 0);
+        ccx.image.mcode.labels.raw.resize(ccx.ir.funcs.raw.len() + SuppFunc::COUNT, 0);
         ccx.freeze_ir(emitfuncs)?;
         take(&mut ccx.data.lang).finish(ccx)
     }

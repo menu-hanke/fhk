@@ -2,20 +2,37 @@
 
 use core::arch::global_asm;
 use core::marker::PhantomPinned;
-use core::mem::offset_of;
+use core::mem::{offset_of, take};
 use core::u64;
 
 use cfg_if::cfg_if;
 
-use crate::finalize::Finalizers;
+use crate::compile;
+use crate::finalize::{FinalizerBuilder, Finalizers};
 use crate::host::HostInst;
-use crate::mem::{Breakpoints, Offset};
+use crate::index::{index, IndexArray};
+use crate::mcode::MCode;
+use crate::mem::Offset;
 use crate::mmap::Mmap;
+
+index!(pub struct BreakpointId(u8));
+
+impl BreakpointId {
+    pub const MAXNUM: usize = 64;
+}
 
 pub struct Image {
     pub mem: Mmap,
-    pub breakpoints: Breakpoints,
+    pub breakpoints: IndexArray<BreakpointId, Offset, {BreakpointId::MAXNUM+1}>,
     pub fin: Finalizers,
+    pub size: Offset
+}
+
+#[derive(Default)]
+pub struct ImageBuilder {
+    pub mcode: MCode,
+    pub breakpoints: IndexArray<BreakpointId, Offset, {BreakpointId::MAXNUM+1}>,
+    pub fin: FinalizerBuilder,
     pub size: Offset
 }
 
@@ -38,6 +55,23 @@ pub struct Instance {
 pub struct DupHeader {
     pub size: Offset, // alloc size, not including header
     pub next: Offset, // slot of next dup data
+}
+
+/* ---- Image creation ------------------------------------------------------ */
+
+impl ImageBuilder {
+
+    pub fn build(&mut self) -> compile::Result<Image> {
+        self.mcode.align_code();
+        let mem = self.mcode.link()?;
+        Ok(Image {
+            mem,
+            fin: take(&mut self.fin).build(),
+            breakpoints: self.breakpoints,
+            size: self.size
+        })
+    }
+
 }
 
 /* ---- Instance creation --------------------------------------------------- */
@@ -133,7 +167,7 @@ global_asm!("
 .p2align 4
 .global fhk_vmcall
 .global fhk_vmexit
-// (vmctx[rdi], result[rsi], mcode[rdx]) -> status[rax]
+// (result[rdi], mcode[rsi], vmctx[rdx]) -> status[rax]
 fhk_vmcall:
     push r12                            // save all callee-save regs for fhk_vmexit
     push r13
@@ -141,11 +175,10 @@ fhk_vmcall:
     push r15
     push rbx
     push rbp
-    mov [rdi+{vmctx_rsp}], rsp          // save stack for fhk_vmexit
+    mov [rdx+{vmctx_rsp}], rsp          // save stack for fhk_vmexit
     push rcx                            // align stack for call
-    mov r15, rdi                        // pinned reg = vmctx
-    xor rdi, rdi                        // idx = 0 (TODO)
-    call rdx                            // call mcode(idx, result)
+    mov r15, rdx                        // pinned reg = vmctx
+    call rsi                            // call mcode(result)
     pop rcx                             // realign stack
     xor eax, eax                        // status = 0
 1:
@@ -162,12 +195,11 @@ fhk_vmexit:
     jmp 1b
 ",
     vmctx_rsp = const offset_of!(Instance, sp),
-    // vmctx_scratchpad = const offset_of!(host::State, scratchpad)
 );
 
 #[allow(improper_ctypes)]
 unsafe extern "sysv64" {
-    pub fn fhk_vmcall(vmctx: *mut Instance, result: *mut u8, mcode: *const u8) -> i32;
+    pub fn fhk_vmcall(result: *mut u8, mcode: *const u8, vmctx: *mut Instance) -> i32;
     #[cold]
     pub fn fhk_vmexit(vmctx: *mut Instance) -> !;
 }
@@ -175,11 +207,11 @@ unsafe extern "sysv64" {
 cfg_if! {
     if #[cfg(any(windows, all(target_os="macos", target_arch="aarch64")))] {
         pub unsafe extern "C" fn fhk_vmcall_native(
-            vmctx: *mut Instance,
             result: *mut u8,
-            mcode: *const u8
+            mcode: *const u8,
+            vmctx: *mut Instance
         ) -> i32 {
-            unsafe { fhk_vmcall(vmctx, result, mcode) }
+            unsafe { fhk_vmcall(result, mcode, vmctx) }
         }
     } else {
         pub use fhk_vmcall as fhk_vmcall_native;

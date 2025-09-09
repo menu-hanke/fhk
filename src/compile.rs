@@ -1,24 +1,22 @@
 //! Compiler pipeline.
 
 use core::fmt::Display;
+use core::iter::zip;
 use core::mem::{transmute, ManuallyDrop};
 
 use enumset::EnumSet;
 
 use crate::bump::Bump;
 use crate::emit::Emit;
-use crate::finalize::FinalizerBuilder;
 use crate::host::HostCtx;
-use crate::image::Image;
+use crate::image::{Image, ImageBuilder};
 use crate::index::IndexSet;
 use crate::intern::{Intern, Interned};
 use crate::ir::{InsId, IR};
 use crate::layout::ComputeLayout;
 use crate::lex::Token;
-use crate::link::Link;
 use crate::lower::Lower;
-use crate::mcode::MCode;
-use crate::mem::{Layout, ResetSeq};
+use crate::mem::Layout;
 use crate::obj::Objects;
 use crate::optimize::{OptFlag, Optimize};
 use crate::parser::Parser;
@@ -55,7 +53,6 @@ define_stages! {
     OPTIMIZE    Optimize;
     LAYOUT      ComputeLayout;
     EMIT        Emit;
-    LINK        Link;
 }
 
 impl Stage for Absent { fn new(_: &mut Ccx<Absent>) -> Result<Self> { Ok(Self) } }
@@ -69,8 +66,6 @@ pub struct Ccx<P=(), O=RW, I=RW> {
     pub objs: Access<Objects, O>,
     // IR
     pub ir: Access<IR, I>,
-    // reset id allocation
-    pub resets: ResetSeq,
     // memory for miscellaneous allocs that must live until the end of the compilation
     pub perm: Bump,
     // memory for temporary function-local allocs
@@ -82,16 +77,12 @@ pub struct Ccx<P=(), O=RW, I=RW> {
     pub tmp: Bump,
     // interned byte strings (names, templates, extfuncs etc)
     pub intern: Intern,
-    // finalizers
-    pub fin: FinalizerBuilder,
-    // vmctx memory layout information
-    pub layout: Layout,
-    // mcode functions and data
-    pub mcode: MCode,
     // host state
     pub host: HostCtx,
-    // compilation result
-    pub image: Option<Image>,
+    // image state
+    pub image: ImageBuilder,
+    // memory layout
+    pub layout: Layout,
     // optimization flags
     pub flags: EnumSet<OptFlag>,
     // markers for algorithms
@@ -107,26 +98,28 @@ pub struct CompileStage<'a, P, T: StageMarker> {
 impl Ccx<Absent> {
 
     pub const SEQ_GLOBAL: Interned<[u8]> = Interned::small_from_raw_parts(6, 5);
+    pub const SEQ_STATE: Interned<[u8]> = Interned::small_from_raw_parts(16, 5);
+    pub const SEQ_QUERY: Interned<[u8]> = Interned::small_from_raw_parts(26, 5);
 
     pub fn new(host: HostCtx) -> Self {
         let mut intern = Intern::default();
-        let global_str: Interned<[u8]> = intern.intern(b"global");
-        debug_assert!(global_str == Interned::small_from_raw_parts(0, 6));
-        let global_str: [u8; 4] = zerocopy::transmute!(global_str);
-        let global_seq: Interned<[u8]> = intern.intern(&[Token::Ident as u8, global_str[0],
-            global_str[1], global_str[2], global_str[3]]);
-        debug_assert!(global_seq == Self::SEQ_GLOBAL);
+        const BUILTIN_NAMES: &[&[u8]] = &[b"global", b"state", b"query"];
+        const BUILTIN_SEQS: &[Interned<[u8]>] = &[Ccx::SEQ_GLOBAL, Ccx::SEQ_STATE, Ccx::SEQ_QUERY];
+        for (&name, &seq) in zip(BUILTIN_NAMES, BUILTIN_SEQS) {
+            let name_intern = intern.intern(name);
+            let name_intern: [u8; 4] = zerocopy::transmute!(name_intern);
+            let seq_intern: Interned<[u8]> = intern.intern(&[Token::Ident as u8, name_intern[0],
+                name_intern[1], name_intern[2], name_intern[3]]);
+            debug_assert!(seq_intern == seq);
+        }
         Self {
             host,
             ir: Default::default(),
             objs: Default::default(),
-            resets: Default::default(),
             perm: Default::default(),
             tmp: Default::default(),
             intern,
-            fin: Default::default(),
             data: Default::default(),
-            mcode: Default::default(),
             image: Default::default(),
             layout: Default::default(),
             flags: EnumSet::all(),
@@ -178,14 +171,36 @@ impl<P,I> Ccx<P, RW, I> {
 }
 
 pub trait CompileError<P=()> {
-    #[cold]
-    fn write(self, ccx: &mut Ccx<P, R, R>);
+    fn report(self, ccx: &mut Ccx<P, R, R>);
 }
 
+#[repr(transparent)]
+pub struct FFIError([u8]);
+
 impl<T,P> CompileError<P> for T where T: Display {
-    fn write(self, ccx: &mut Ccx<P, R, R>) {
-        use core::fmt::Write;
-        write!(ccx.host.buf, "{}", self).unwrap();
+    fn report(self, ccx: &mut Ccx<P, R, R>) {
+        ccx.host.set_error(format_args!("{}", self));
+    }
+}
+
+impl FFIError {
+
+    pub fn from_bytes(bytes: &[u8]) -> &Self {
+        unsafe { core::mem::transmute(bytes) }
+    }
+
+    pub fn from_cstr(s: &core::ffi::CStr) -> &Self {
+        Self::from_bytes(s.to_bytes())
+    }
+
+}
+
+impl Display for FFIError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match str::from_utf8(&self.0) {
+            Ok(message) => f.write_str(message),
+            Err(err) => write!(f, "bad utf-8: {} (raw bytes: {:?})", err, &self.0)
+        }
     }
 }
 
@@ -199,50 +214,17 @@ impl<P,G,I> Ccx<P,G,I> {
         unsafe { transmute(self) }
     }
 
-    #[inline(never)]
     #[cold]
-    fn do_error<E>(&mut self, e: E)
-        where E: CompileError<P>
-    {
-        self.host.buf.clear();
-        // safety: this is basically the same as calling erase+freeze_ir+freeze_graph but without
-        // the necessary type acrobatics
-        e.write(unsafe { transmute(self) });
-    }
-
-    // this is split to avoid monomorphization for each T
-    #[inline(always)]
     pub fn error<T,E>(&mut self, e: E) -> Result<T>
         where E: CompileError<P>
     {
-        self.do_error(e);
-        Err(())
-    }
-
-    // workaround because rust doesn't let me implement CompileError for &CStr
-    #[inline(always)]
-    pub fn raw_error<T>(&mut self, error: &[u8]) -> Result<T>
-    {
-        self.host.buf.clear();
-        self.host.buf.write(error);
+        // safety: this is basically the same as calling erase+freeze_ir+freeze_graph but without
+        // the necessary type acrobatics
+        e.report(unsafe { transmute(self) });
         Err(())
     }
 
 }
-
-// same as ccx.error(format_args!(...)) but doesn't require borrowing the whole ccx.
-#[allow(unused_macros)]
-macro_rules! format_error {
-    ($ccx:expr, $($x:tt)*) => {{
-        use core::fmt::Write;
-        $ccx.host.buf.clear();
-        write!($ccx.host.buf, $($x)*).unwrap();
-        Err(())
-    }};
-}
-
-#[allow(unused_imports)]
-pub(crate) use format_error;
 
 impl<'a, P, T: StageMarker> CompileStage<'a, P, T> {
 
@@ -274,14 +256,13 @@ fn run<P: StageMarker>(ccx: &mut Ccx<Absent>) -> Result {
 
 impl Ccx<Absent> {
 
-    pub fn compile(&mut self) -> Result {
+    pub fn compile(&mut self) -> Result<Image> {
         run::<TypeInfer>(self)?;
         run::<Lower>(self)?;
         run::<Optimize>(self)?;
         run::<ComputeLayout>(self)?;
         run::<Emit>(self)?;
-        run::<Link>(self)?;
-        Ok(())
+        self.image.build()
     }
 
 }

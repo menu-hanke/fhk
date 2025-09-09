@@ -20,6 +20,7 @@ const WORD_BITS: usize = 8*size_of::<Word>();
 const SHIFT: usize = WORD_BITS.ilog2() as _;
 const MASK: usize = WORD_BITS - 1;
 
+#[derive(zerocopy::FromBytes, zerocopy::Immutable, zerocopy::IntoBytes)]
 #[repr(transparent)]
 pub struct Bitmap<I: Index = usize> {
     _marker: PhantomData<fn(&I)>,
@@ -164,6 +165,7 @@ impl<I: Index> Bitmap<I> {
         unsafe { core::mem::transmute(self) }
     }
 
+    // TODO: remove this and from_raw_mut and just use BitmapWord everywhere
     fn from_raw(raw: &[Word]) -> &Self {
         // safety: see above
         unsafe { core::mem::transmute(raw) }
@@ -172,6 +174,16 @@ impl<I: Index> Bitmap<I> {
     fn from_raw_mut(raw: &mut [Word]) -> &mut Self {
         // safety: see above
         unsafe { core::mem::transmute(raw) }
+    }
+
+    pub fn as_words(&self) -> &[BitmapWord<I>] {
+        // safety: see above
+        unsafe { core::mem::transmute(self) }
+    }
+
+    pub fn from_words(words: &[BitmapWord<I>]) -> &Self {
+        // safety: see above
+        unsafe { core::mem::transmute(words) }
     }
 
 }
@@ -259,17 +271,17 @@ impl<const W: usize> BitmapArray<W> {
     pub const BITS: usize = W * WORD_BITS;
 }
 
-macro_rules! bitmap_array {
-    ($index:ty; $bits:expr) => {
-        $crate::bitmap::BitmapArray<
-            { ($bits + $crate::bitmap::BitmapWord::BITS - 1) / $crate::bitmap::BitmapWord::BITS },
-            $index
-        >
-    };
-    ($bits:expr) => { $crate::bitmap::bitmap_array![usize; $bits] };
-}
-
-pub(crate) use bitmap_array;
+// macro_rules! bitmap_array {
+//     ($index:ty; $bits:expr) => {
+//         $crate::bitmap::BitmapArray<
+//             { ($bits + $crate::bitmap::BitmapWord::BITS - 1) / $crate::bitmap::BitmapWord::BITS },
+//             $index
+//         >
+//     };
+//     ($bits:expr) => { $crate::bitmap::bitmap_array![usize; $bits] };
+// }
+// 
+// pub(crate) use bitmap_array;
 
 impl<const W: usize, I: Index> BitmapArray<W, I> {
 
@@ -280,21 +292,6 @@ impl<const W: usize, I: Index> BitmapArray<W, I> {
     pub fn ones() -> Self {
         Self { _marker: PhantomData, raw: [!0; W] }
     }
-}
-
-// if more generality is needed, these can be implemented for every power-of-two bitmap array
-impl<I: Index> BitmapArray<1, I> {
-
-    pub fn bloom_set(&mut self, idx: I) {
-        let idx: usize = idx.into();
-        self.raw[0] |= 1 << (idx & MASK);
-    }
-
-    pub fn bloom_test(&self, idx: I) -> bool {
-        let idx: usize = idx.into();
-        self.raw[0] & (1 << (idx & MASK)) != 0
-    }
-
 }
 
 impl<const W: usize, I: Index> Deref for BitmapArray<W, I> {
@@ -453,6 +450,22 @@ impl<I: Index, J: Index> BitMatrix<I, J> {
 
     pub fn rows(&self) -> I {
         (self.data.len()/self.width).into()
+    }
+
+    // constraints: (i, j) => row[i] ⊂ row[j]
+    // the reason this takes arrays instead of tuples is that zerocopy doesn't like tuples
+    pub fn solve(&mut self, constraints: &[[I; 2]]) {
+        loop {
+            let mut fixpoint = true;
+            for &[i,j] in constraints {
+                let [ri, rj] = self.get_rows_mut([i, j]);
+                if !ri.is_subset(rj) {
+                    fixpoint = false;
+                    rj.union(ri);
+                }
+            }
+            if fixpoint { break }
+        }
     }
 
 }

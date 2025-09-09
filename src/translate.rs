@@ -6,10 +6,10 @@ use cranelift_codegen::ir::{InstBuilder, MemFlags, TrapCode, Value};
 use crate::controlflow::BlockId;
 use crate::intern::Interned;
 use crate::lang::Lang;
-use crate::mem::{CursorType, SizeClass};
+use crate::mem::{CursorType, Offset, SizeClass};
 use crate::compile;
-use crate::emit::{block2cl, cast_values, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_RESULT};
-use crate::ir::{Chunk, Conv, FuncKind, InsId, LangOp, Opcode, PhiId, Query, Type};
+use crate::emit::{block2cl, cast_values, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_VMCTX};
+use crate::ir::{Conv, FuncKind, InsId, LangOp, Opcode, PhiId, Type};
 use crate::support::{NativeFunc, SuppFunc};
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
@@ -51,28 +51,11 @@ fn ins_jmp(ecx: &mut Ecx, id: InsId) {
     let func = &ecx.ir.funcs[emit.fid];
     debug_assert!(emit.code[value].type_() == func.phis.at(phi).type_);
     let ty = emit.code[value].type_();
-    'jret: {
-        if phi < func.ret && ty != Type::FX {
-            let phi: usize = phi.into();
-            match func.kind {
-                FuncKind::User => {
-                    // user funcs return normally
-                    break 'jret;
-                },
-                FuncKind::Query(Query { offsets, .. }) => {
-                    let res = emit.fb.ctx.func.dfg.block_params(block2cl(BlockId::START))[1];
-                    let ofs = ecx.perm[offsets.offset(phi as _)];
-                    emit.fb.ins().store(MEM_RESULT, emit.values[value].value(), res, ofs as i32);
-                },
-                FuncKind::Chunk(Chunk { scl, slots, .. }) => {
-                    let vmctx = emit.fb.vmctx();
-                    let slot = ecx.perm[slots.offset(phi as _)];
-                    storeslot(emit, vmctx, emit.idx, scl, slot, ty, emit.values[value].value());
-                }
-            }
-        }
+    if phi < func.ret && ty != Type::FX && let FuncKind::Chunk(cid) = func.kind {
+        let vmctx = emit.fb.vmctx();
+        let slot = ecx.perm[ecx.layout.chunks[cid].slots.elem(phi)];
+        storeslot(emit, vmctx, emit.idx, func.scl, slot, ty, emit.values[value].value());
     }
-    // TODO: handle fx types properly (whatever that means)
     let jmp = match ty {
         Type::FX => None,
         _ => Some((phi, ecx.data.values[value].value()))
@@ -183,8 +166,8 @@ fn ins_kintx(ecx: &mut Ecx, id: InsId) {
         I8 | I16 | I32 | I64 | PTR | B1 => ecx.data.fb.ins().iconst(irt2cl(type_), k),
         F32 | F64 => {
             let data = match type_ {
-                F32 => ecx.mcode.intern_data(&(k as f32)),
-                _   => ecx.mcode.intern_data(&(k as f64)),
+                F32 => ecx.image.mcode.intern_data(&(k as f32)),
+                _   => ecx.image.mcode.intern_data(&(k as f64)),
             };
             let ptr = ecx.data.fb.usedata(data);
             ecx.data.fb.kload(type_, ptr)
@@ -201,8 +184,8 @@ fn ins_kfp64(ecx: &mut Ecx, id: InsId) {
     let k = ecx.intern[b];
     let type_ = ins.type_();
     let data = match type_ {
-        Type::F32 => ecx.mcode.intern_data(&(k as f32)),
-        Type::F64 => ecx.mcode.intern_data(&k),
+        Type::F32 => ecx.image.mcode.intern_data(&(k as f32)),
+        Type::F64 => ecx.image.mcode.intern_data(&k),
         _ => unreachable!()
     };
     let ptr = emit.fb.usedata(data);
@@ -346,6 +329,8 @@ fn ins_store(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let ins = emit.code[id];
     let (ptr, value) = ins.decode_VV();
+    debug_assert!(emit.code[ptr].type_() == Type::PTR);
+    debug_assert!(emit.code[value].type_().size() > 0);
     emit.fb.ins().store(MemFlags::trusted(), emit.values[value].value(), emit.values[ptr].value(), 0);
 }
 
@@ -357,6 +342,22 @@ fn ins_load(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = InsValue::from_value(
         emit.fb.ins().load(ty, MemFlags::trusted(), emit.values[ptr].value(), 0)
     );
+}
+
+fn ins_qload(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let (param, mut ofs) = emit.code[id].decode_QLOAD();
+    let param = &ecx.layout.params[param];
+    let slot = if ofs == !0 {
+        ofs = 0;
+        param.check
+    } else {
+        param.value
+    };
+    debug_assert!(slot.bit() == 0); // qload should never be colocated (at least for now)
+    let vmctx = emit.fb.vmctx();
+    emit.values[id] = InsValue::from_value(emit.fb.ins().load(irt2cl(emit.code[id].type_()),
+        MEM_VMCTX, vmctx, (slot.byte() + (ofs as Offset)) as i32));
 }
 
 // TODO: use BOX in lang_C (but lang_Lua can't use it because the "frame" address is fixed)
@@ -432,10 +433,11 @@ fn ins_call(ecx: &mut Ecx, id: InsId) {
 fn ins_callc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (idx, _, chunk) = emit.code[id].decode_CALLC();
-    let FuncKind::Chunk(Chunk { scl, check, .. }) = ecx.ir.funcs[chunk].kind
-        else { unreachable!() };
+    let func = &ecx.ir.funcs[chunk];
+    let FuncKind::Chunk(cid) = func.kind else { unreachable!() };
     let vmctx = emit.fb.vmctx();
-    let bit = loadslot(emit, vmctx, emit.values[idx].value(), scl, check, Type::B1);
+    let bit = loadslot(emit, vmctx, emit.values[idx].value(), func.scl,
+        ecx.layout.chunks[cid].check, Type::B1);
     let merge_block = emit.fb.newblock();
     let call_block = emit.fb.newblock();
     emit.fb.ctx.func.layout.set_cold(call_block);
@@ -443,7 +445,7 @@ fn ins_callc(ecx: &mut Ecx, id: InsId) {
     emit.fb.block = call_block;
     let funcref = emit.fb.importfunc(&ecx.ir, chunk);
     let args = [emit.values[idx].value()];
-    emit.fb.ins().call(funcref, match scl { SizeClass::GLOBAL => &[], _ => &args });
+    emit.fb.ins().call(funcref, match func.scl { SizeClass::GLOBAL => &[], _ => &args });
     emit.fb.ins().jump(merge_block, &[]);
     emit.fb.block = merge_block;
 }
@@ -467,12 +469,12 @@ fn ins_res(ecx: &mut Ecx, id: InsId) {
         },
         Opcode::CALLC | Opcode::CALLCI => {
             let (idx, _, chunk) = emit.code[call].decode_CALLC();
-            let FuncKind::Chunk(Chunk { scl, slots, .. }) = ecx.ir.funcs[chunk].kind
-                else { unreachable!() };
+            let func = &ecx.ir.funcs[chunk];
+            let FuncKind::Chunk(cid) = func.kind else { unreachable!() };
             debug_assert!(ecx.ir.funcs[chunk].phis.at(phi).type_ == ty);
             let vmctx = emit.fb.vmctx();
-            let phi: usize = phi.into();
-            loadslot(emit, vmctx, emit.values[idx].value(), scl, ecx.perm[slots.offset(phi as _)], ty)
+            loadslot(emit, vmctx, emit.values[idx].value(), func.scl,
+                ecx.perm[ecx.layout.chunks[cid].slots.elem(phi)], ty)
         },
         _ => unreachable!()
     };
@@ -483,10 +485,10 @@ fn ins_cinit(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (size, chunk) = emit.code[id].decode_CINIT();
     let func = &ecx.ir.funcs[chunk];
-    let FuncKind::Chunk(chunk) = &func.kind else { unreachable!() };
-    if !chunk.scl.is_dynamic() { /* NOP */ return }
+    if !func.scl.is_dynamic() { /* NOP */ return }
+    let FuncKind::Chunk(cid) = func.kind else { unreachable!() };
     let dsinit = emit.fb.importsupp(&ecx.ir, SuppFunc::INIT);
-    let tab = emit.fb.usedata(chunk.dynslots);
+    let tab = emit.fb.usedata(ecx.layout.chunks[cid].dynslots);
     let nret: usize = func.ret.into();
     // bitmap + one for each return
     let num = emit.fb.ins().iconst(irt2cl(Type::I32), (1 + nret) as i64);
@@ -527,6 +529,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             ALLOC => ins_alloc(ecx, id),
             STORE => ins_store(ecx, id),
             LOAD => ins_load(ecx, id),
+            QLOAD => ins_qload(ecx, id),
             BOX => ins_box(ecx, id),
             ABOX => ins_abox(ecx, id),
             BREF => ins_bref(ecx, id),

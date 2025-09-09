@@ -36,6 +36,7 @@ define_primitives! {
     U16 b"u16";
     U8  b"u8";
     B1  b"b1";
+    FX  b"fx";
     PTR b"ptr";
     STR b"str";
 }
@@ -52,7 +53,7 @@ impl Primitive {
         const PRI2IR: &'static [Type] = {
             use Type::*;
             // ORDER PRI
-            &[F64, F32, I64, I32, I16, I8, I64, I32, I16, I8, B1, PTR]
+            &[F64, F32, I64, I32, I16, I8, I64, I32, I16, I8, B1, FX, PTR]
         };
         PRI2IR[self as usize]
     }
@@ -75,7 +76,7 @@ pub enum Constructor {
     Func,   // (arg ret)
     Next,   // (prev)
     Unit,   // ()
-    Never,  // !
+    Never   // !
 }
 
 impl Constructor {

@@ -1,7 +1,7 @@
 # vim: ft=fhk
 
 table t[3]
-model t[i] v = [i]
+model t[i] v = effect([i], state.reset1)
 
 ### local ffi = require "ffi"
 ### local MEM_SIZE, ptr = 4096, 0
@@ -14,14 +14,14 @@ model t[i] v = [i]
 ###     assert(ptr <= MEM_SIZE)
 ###     return ret
 ### end)
-### local queryV0 = G:newquery("global", "t.v[0]")
-### local queryV = G:newquery("global", "t.v")
+### local queryV0 = G:query("t.v[0]")
+### local queryV = G:query("t.v")
 ### compile()
 ### local inst1 = newinstance()
-### check({queryV0.query(inst1):unpack()}, {{0}})
+### check({image[queryV0](inst1):unpack()}, {{0}})
 ### local start = ptr
-### local inst2 = newinstance(inst1, 0)
-### check({queryV.query(inst2):unpack()}, {{{0},{1},{2}}})
+### local inst2 = newinstance(inst1, {})
+### check({image[queryV](inst2):unpack()}, {{{0},{1},{2}}})
 ### for i=tonumber(start), MEM_SIZE-1 do mem[i] = 0x29 end
 ### ptr = start
-### check({queryV.query(inst1):unpack()}, {{{0},{1},{2}}})
+### check({image[queryV](inst1):unpack()}, {{{0},{1},{2}}})

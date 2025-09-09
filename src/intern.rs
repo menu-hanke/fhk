@@ -123,6 +123,12 @@ impl<T> Interned<[T]> {
 
 }
 
+impl<T> Default for Interned<[T]> {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
 impl Default for Intern {
     fn default() -> Self {
         let mut tab = HashTable::new();

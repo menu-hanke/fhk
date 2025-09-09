@@ -6,17 +6,17 @@ use core::ops::Range;
 use core::slice;
 use enumset::{EnumSet, EnumSetType};
 
-use crate::bump::BumpRef;
+use crate::bitmap::BitmapWord;
 use crate::foreach_lang;
 use crate::index::{index, IndexValueVec, IndexVec, InvalidValue};
+use crate::intern::Interned;
 use crate::lang::Lang;
-use crate::mcode::MCodeOffset;
-use crate::mem::{Offset, ResetId, ResetSet, SizeClass, Slot};
-use crate::obj::{ObjRef, QUERY};
+use crate::mem::{ChunkId, ParamId, QueryId, ResetId, SizeClass};
+use crate::obj::ObjRef;
 
-index!(pub struct FuncId(u16) invalid(!0) debug("f{}"));
-index!(pub struct InsId(u16)  invalid(!0) debug("{:04}"));
-index!(pub struct PhiId(u16)  invalid(!0) debug("ϕ{}"));
+index!(pub struct FuncId(u16)  invalid(!0) debug("f{}"));
+index!(pub struct InsId(u16)   invalid(!0) debug("{:04}"));
+index!(pub struct PhiId(u16)   invalid(!0) debug("ϕ{}"));
 
 /* ---- Types --------------------------------------------------------------- */
 
@@ -230,6 +230,7 @@ define_operands! {
     C:  InsId,  "->";   // control
     P:  PhiId;          // phi
     F:  FuncId;         // function
+    Q:  ParamId;        // query parameter
     L:  LangOp;         // language-specific opcode
     X:  u16,    i16;    // 16-bit literal
     XX: u32,    i32;    // 32-bit literal
@@ -381,6 +382,8 @@ define_opcodes! {
     ALLOC.PTR V V C;                   // size align control
     STORE.FX  V V;                     // ptr value
     LOAD      V;                       // ptr
+
+    QLOAD     Q X,   decode_QLOAD;
 
     BOX.LSV   V;
     ABOX.LSV  C X X, decode_ABOX;      // control size align
@@ -722,29 +725,16 @@ pub(crate) use {ins_matches, value_matches};
 
 /* ---- IR ------------------------------------------------------------------ */
 
-pub struct Chunk {
-    pub scl: SizeClass,
-    pub check: Slot,
-    pub slots: BumpRef<Slot>, // slot info in ccx.bump, one for each ret phi
-    pub dynslots: MCodeOffset
-}
-
-pub struct Query {
-    pub obj: ObjRef<QUERY>,
-    pub offsets: BumpRef<Offset> // return offsets in ccx.bump, one for each ret phi
-}
-
 #[derive(Clone, Copy)]
 pub struct Phi {
     pub type_: Type
 }
 
-pub type Code = IndexValueVec<InsId, Ins>;
-
+#[derive(Clone, Copy)]
 pub enum FuncKind {
     User,
-    Query(Query),
-    Chunk(Chunk)
+    Query(QueryId),
+    Chunk(ChunkId)
 }
 
 #[derive(EnumSetType)]
@@ -763,13 +753,14 @@ pub enum DebugFlag {
 pub struct DebugSource(u32);
 
 pub struct Func {
-    pub code: Code,
+    pub code: IndexValueVec<InsId, Ins>,
     pub entry: InsId,
     pub ret: PhiId, // one past last return value
     pub arg: PhiId, // one past last argument
     pub phis: IndexValueVec<PhiId, Phi>,
     pub kind: FuncKind,
-    pub reset: ResetSet,
+    pub scl: SizeClass,
+    pub reset: Interned<[BitmapWord<ResetId>]>,
     pub source: DebugSource
 }
 
@@ -788,17 +779,31 @@ impl Phi {
 
 impl Func {
 
-    pub fn new(kind: FuncKind, source: DebugSource) -> Self {
+    fn new(kind: FuncKind, scl: SizeClass, source: DebugSource) -> Self {
         Self {
             kind,
-            entry: InsId::INVALID.into(),
+            scl,
+            source,
             code: Default::default(),
-            phis: Default::default(),
+            entry: InsId::INVALID.into(),
             ret: 0.into(),
             arg: 0.into(),
-            reset: ResetSet::default() | ResetId::GLOBAL,
-            source
+            phis: Default::default(),
+            reset: Interned::EMPTY
         }
+    }
+
+    pub fn user(source: DebugSource) -> Self {
+        Self::new(FuncKind::User, SizeClass::GLOBAL, source)
+    }
+
+    pub fn query(id: QueryId, source: DebugSource) -> Self {
+        Self::new(FuncKind::Query(id), SizeClass::GLOBAL, source)
+    }
+
+    pub fn chunk(scl: SizeClass, source: DebugSource) -> Self {
+        // chunk id is allocated at layout time
+        Self::new(FuncKind::Chunk(ChunkId::INVALID.into()), scl, source)
     }
 
     pub fn returns(&self) -> Range<PhiId> {
@@ -807,30 +812,6 @@ impl Func {
 
     pub fn params(&self) -> Range<PhiId> {
         self.ret .. self.arg
-    }
-
-}
-
-impl Chunk {
-
-    pub fn new(scl: SizeClass) -> Self {
-        Self {
-            scl,
-            check: Default::default(),
-            slots: BumpRef::zero(),
-            dynslots: 0
-        }
-    }
-
-}
-
-impl Query {
-
-    pub fn new(obj: ObjRef<QUERY>) -> Self {
-        Self {
-            obj,
-            offsets: BumpRef::zero()
-        }
     }
 
 }

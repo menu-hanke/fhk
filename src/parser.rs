@@ -207,22 +207,22 @@ fn nsname(ns: Namespace) -> &'static str {
 fn traceback(pcx: &mut Ccx<PcxData, R, R>) {
     use Namespace::*;
     for frame in pcx.data.stack.iter().rev() {
-        pcx.host.buf.write(nsname(frame.ns));
-        pcx.host.buf.push(b' ');
+        pcx.tmp.write(nsname(frame.ns));
+        pcx.tmp.push(b' ');
         match frame.ns {
             Var | Table | Snippet => {
                 let macro_ = &pcx.data.macros[zerocopy::transmute!(frame.this)];
                 if !macro_.table_pattern.is_empty() {
                     stringify(
-                        &mut pcx.host.buf,
+                        &mut pcx.tmp,
                         &pcx.intern,
                         &pcx.intern[macro_.table_pattern],
                         SequenceType::Pattern
                     );
-                    pcx.host.buf.push(b'.');
+                    pcx.tmp.push(b'.');
                 }
                 stringify(
-                    &mut pcx.host.buf,
+                    &mut pcx.tmp,
                     &pcx.intern,
                     &pcx.intern[macro_.name_pattern],
                     SequenceType::Pattern
@@ -231,7 +231,7 @@ fn traceback(pcx: &mut Ccx<PcxData, R, R>) {
             Capture => {
                 let Range { start, end } = pcx.data.captures[frame.this as usize];
                 stringify(
-                    &mut pcx.host.buf,
+                    &mut pcx.tmp,
                     &pcx.intern,
                     &pcx.intern.as_slice()[start as usize .. end as usize],
                     SequenceType::Body
@@ -240,23 +240,26 @@ fn traceback(pcx: &mut Ccx<PcxData, R, R>) {
             Template => {
                 let template: Interned<[u8]> = zerocopy::transmute!(frame.this);
                 stringify(
-                    &mut pcx.host.buf,
+                    &mut pcx.tmp,
                     &pcx.intern,
                     &pcx.intern[template],
                     SequenceType::Body
                 );
             }
         }
-        pcx.host.buf.push(b'\n');
+        pcx.tmp.push(b'\n');
     }
     let loc = lex::loc(&pcx.data.lex);
-    write!(pcx.host.buf, "on line {} col {}", loc.line, loc.col).unwrap();
+    write!(pcx.tmp, "on line {} col {}", loc.line, loc.col).unwrap();
 }
 
 impl<'a> CompileError<PcxData<'a>> for SyntaxError {
-    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
-        write!(pcx.host.buf, "syntax error: {}\n", self.str()).unwrap();
+    fn report(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        let base = pcx.tmp.end();
+        write!(pcx.tmp, "syntax error: {}\n", self.str()).unwrap();
         traceback(pcx);
+        pcx.host.set_error_bytes(&pcx.tmp[base..]);
+        pcx.tmp.truncate(base);
     }
 }
 
@@ -266,15 +269,18 @@ pub struct TokenError {
 }
 
 impl<'a> CompileError<PcxData<'a>> for TokenError {
-    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
-        write!(pcx.host.buf, "unexpected token: `{}` (expected ", pcx.data.token.str()).unwrap();
+    fn report(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        let base = pcx.tmp.end();
+        write!(pcx.tmp, "unexpected token: `{}` (expected ", pcx.data.token.str()).unwrap();
         let mut comma = "";
         for tok in self.want {
-            write!(pcx.host.buf, "{}`{}`", comma, tok.str()).unwrap();
+            write!(pcx.tmp, "{}`{}`", comma, tok.str()).unwrap();
             comma = ", ";
         }
-        pcx.host.buf.write(b")\n");
-        traceback(pcx)
+        pcx.tmp.write(b")\n");
+        traceback(pcx);
+        pcx.host.set_error_bytes(&pcx.tmp[base..]);
+        pcx.tmp.truncate(base);
     }
 }
 
@@ -291,32 +297,24 @@ pub struct DefinitionError {
 }
 
 impl<'a> CompileError<PcxData<'a>> for DefinitionError {
-    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
-        pcx.host.buf.write(match self.what {
+    fn report(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
+        let base = pcx.tmp.end();
+        pcx.tmp.write(match self.what {
             DefinitionErrorType::Undefined => "undefined ",
             DefinitionErrorType::Redefinition => "redefinition of"
         });
-        pcx.host.buf.write(nsname(self.ns));
-        pcx.host.buf.write(b": ");
+        pcx.tmp.write(nsname(self.ns));
+        pcx.tmp.write(b": ");
         stringify(
-            &mut pcx.host.buf,
+            &mut pcx.tmp,
             &pcx.intern,
             &pcx.intern[self.body],
             SequenceType::Body
         );
-        pcx.host.buf.push(b'\n');
-        traceback(pcx)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct LangError;
-
-impl<'a> CompileError<PcxData<'a>> for LangError {
-    fn write(self, pcx: &mut Ccx<PcxData<'a>, R, R>) {
-        let name: Interned<[u8]> = zerocopy::transmute!(pcx.data.tdata);
-        pcx.host.buf.write(b"unsupported language: ");
-        pcx.host.buf.write(&pcx.intern[name]);
+        pcx.tmp.push(b'\n');
+        traceback(pcx);
+        pcx.host.set_error_bytes(&pcx.tmp[base..]);
+        pcx.tmp.truncate(base);
     }
 }
 

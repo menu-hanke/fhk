@@ -226,6 +226,11 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             FoldStatus::New(value)
         },
 
+        // MOVF x NOP -> x
+        // MOVF NOP x -> x
+        MOVF if m!(_ (NOP)) => FoldStatus::New(ins.decode_V()),
+        MOVF if m!((NOP) _) => FoldStatus::New(ins.decode_VV().1),
+
         // eliminate nop CONVs
         CONV if ins.type_() == code[ins.decode_V()].type_() => FoldStatus::New(ins.decode_V()),
 

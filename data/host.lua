@@ -4,6 +4,8 @@ require "table.clear"
 require "table.new"
 local version, tensor, API, OP_NAMEPTR, OP_NAMEOFS, OP_FDESC, OP_FOFS, OP_NUM = ...
 local API = ffi.cast("fhk_Api *", API)
+local assert, pairs, type = assert, pairs, type
+local bor = bit.bor
 
 ---- String buffer management --------------------------------------------------
 
@@ -379,29 +381,58 @@ end
 
 ---- Queries -------------------------------------------------------------------
 
-local function query_add(query, expr)
-	query.vnum = query.vnum+1
-	query.values[query.vnum] = graph_expr(query.graph, query.tab, expr)
-	return string.format("v%d", query.vnum)
+local function graph_query(graph, ...)
+	local exprs = {...}
+	for i,v in ipairs(exprs) do
+		exprs[i] = graph_expr(graph, "global", v)
+	end
+	local idx = #graph.queries+1
+	graph.queries[idx] = graph.objs[API.fhk_newquery(graph.G, setbufo(graph, exprs))]
+	return string.format("q%d", idx)
 end
 
-local query_mt = {
-	add = query_add
-}
-query_mt.__index = query_mt
+---- Instances -----------------------------------------------------------------
 
-local function graph_newquery(graph, tab, ...)
-	local query = setmetatable({
-		graph  = graph,
-		tab    = graph_tab(graph, tab),
-		values = {},
-		vnum   = 0
-	}, query_mt)
-	table.insert(graph.queries, query)
-	for _,v in ipairs({...}) do
-		query_add(query, v)
+-- TODO: consider unrolling this when there are only few resets
+local function image_mask(image, mask)
+	local m = 0ULL
+	local rmask = image.reset
+	for f,v in pairs(mask) do
+		if v == true then
+			m = bor(m, rmask[f] or 0ull)
+		end
 	end
-	return query
+	return m
+end
+
+local fhk_newinstance = API.fhk_newinstance
+local function image_instance(image, alloc, udata, template, mask)
+	if mask then
+		if type(mask) == "table" then
+			mask = image_mask(image, mask)
+		end
+	else
+		mask = -1ULL
+	end
+	return fhk_newinstance(image.ptr, alloc, udata, template, mask)
+end
+
+local function image_exec(image, query, params)
+	-- TODO: shortcut function: create a temp allocator here and attach finalizer to result
+	error("TODO")
+end
+
+local image_mt = {
+	mask = image_mask,
+	instance = image_instance,
+	exec = image_exec
+}
+image_mt.__index = image_mt
+
+---- Compilation ---------------------------------------------------------------
+
+local function decodeslot(slot)
+	return bit.rshift(slot, 3), bit.band(slot, 0x7)
 end
 
 local function ann2ct(obj)
@@ -417,6 +448,34 @@ local function ann2ct(obj)
 	end
 end
 
+local function newparam(check, value, var)
+	local cbyte, cbit = decodeslot(check)
+	local vbyte = decodeslot(value)
+	local ctype = ann2ct(var)
+	local buf = buffer.new()
+	buf:put("local ffi_cast, band, bor, ctptr = require('ffi').cast, bit.band, bit.bor, ...\n")
+	buf:put("return function(instance, params)\n")
+	buf:putf("local value = params['%s']\n", var.name)
+	buf:putf("if value == nil then instance[%d] = band(instance[%d], %d) return end\n",
+		cbyte, cbyte, bit.band(0xff, bit.bnot(bit.lshift(1, cbit))))
+	buf:putf("instance[%d] = bor(instance[%d], %d)\n", cbyte, cbyte, bit.lshift(1, cbit))
+	if ctype then
+		if var.ann.op == "TPRI" then
+			buf:putf("ffi_cast(ctptr, instance+%d)[0] = value\n", vbyte)
+		else
+			-- TODO: call utility function:
+			-- * if c value -> set pointers
+			-- * if lua value -> alloc from instance + copy
+			error("TODO")
+		end
+	end
+	buf:put("end")
+	return {
+		func = load(buf)(ctype and ffi.typeof("$*", ctype)),
+		cbyte = cbyte
+	}
+end
+
 local function queryunpack(n)
 	local buf = buffer.new()
 	buf:put("return function(x)\nreturn ")
@@ -428,134 +487,89 @@ local function queryunpack(n)
 	return load(buf)()
 end
 
-local function queryctype(query)
+local fhk_vmcall = API.fhk_vmcall
+local function vmcall(result, mcode, instance)
+	local r = fhk_vmcall(result, mcode, instance)
+	if r ~= 0 then
+		error(ffi.string(API.fhk_vmerr(instance)), 2)
+	end
+	return result
+end
+
+local function query__call(query, ...)
+	return query.exec(...)
+end
+
+local query_mt = { __call = query__call }
+
+local function compilequery(mcode, ty, params)
 	local buf = buffer.new()
 	buf:put("struct {\n")
-	local args = {}
-	for i,v in ipairs(query.obj.value) do
+	local ctargs = {}
+	for i,e in ipairs(ty.elems) do
 		buf:putf("$ v%d;\n", i)
-		args[i] = ann2ct(v)
+		ctargs[i] = ann2ct(e)
 	end
 	buf:put("}")
-	return ffi.metatype(
-		ffi.typeof(tostring(buf), unpack(args)),
-		{
-			__index = {
-				unpack = queryunpack(query.vnum)
-			}
-		}
-	)
-end
-
-local fhk_vmcall = API.fhk_vmcall
-local function vmcall(inst, ret, mcode)
-	local r = fhk_vmcall(inst, ret, mcode)
-	if r ~= 0 then
-		error(ffi.string(API.fhk_vmerr(inst)), 2)
+	local ctype = ffi.typeof(buf:get(), unpack(ctargs))
+	ffi.metatype(ctype, {__index = { unpack = queryunpack(#ty.elems) }})
+	buf:put("local ctype, vmcall")
+	local pf = {}
+	local minofs, maxofs = math.huge, 0
+	for i,p in ipairs(params) do
+		buf:putf(", setparam%d", i)
+		pf[i] = p.func
+		minofs = math.min(minofs, p.cbyte)
+		maxofs = math.max(maxofs, p.cbyte)
 	end
-	return r
-end
-
-local function queryfunc(ctype, mcode)
-	-- TODO: index parameter
-	return load(string.format([[
-		local ctype, vmcall = ...
-		return function(instance, res)
-			local ret = res or ctype()
-			vmcall(instance, ret, %s)
-			return ret
-		end
-	]], ffi.cast("uintptr_t", mcode)))(ctype, vmcall)
-end
-
-local function compilequery(query, image)
-	local ct = queryctype(query)
-	local mcode = ffi.cast("const uint8_t *", image) + query.obj.mcode
-	query.ctype = ct
-	query.query = queryfunc(ct, mcode)
-end
-
----- Resets --------------------------------------------------------------------
-
-local function reset_add(reset, obj)
-	if not isobj(obj) then
-		obj = reset.graph.objs[checkparse(reset.graph, 0, PARSE_VAR+PARSE_CREATE, obj)]
+	buf:put("= ...\nreturn function(instance, params, res)\n")
+	for i=1, #params do
+		buf:putf("setparam%d(instance, params)\n", i)
 	end
-	assert(obj.op == "VAR" or obj.op == "MOD", "only variables or models can be reset")
-	table.insert(reset.objs, obj)
+	buf:put("if not res then res = ctype() end\n")
+	buf:putf("return vmcall(res, %dull, instance)\n", mcode)
+	buf:put("end\n")
+	local exec = load(buf)(ctype, vmcall, unpack(pf))
+	return setmetatable({
+		exec = exec,
+		ctype = ctype,
+	}, query_mt)
 end
-
-local reset_mt = {
-	add = reset_add
-}
-reset_mt.__index = reset_mt
-
-local function graph_newreset(graph, ...)
-	local reset = setmetatable({
-		graph = graph,
-		objs  = {}
-	}, reset_mt)
-	table.insert(graph.resets, reset)
-	for _,e in ipairs({...}) do
-		reset_add(reset, e)
-	end
-	return reset
-end
-
-local function computemask(reset)
-	if reset.obj.mhi == 0 then
-		reset.mask = reset.obj.mlo
-	else
-		reset.mask = bit.bor(0ull+reset.obj.mlo, bit.lshift(0ull+reset.obj.mhi, 32))
-	end
-end
-
----- Instances -----------------------------------------------------------------
-
-local function image_newinstance(image, alloc, udata, prev, mask)
-	return API.fhk_newinstance(image, alloc, udata or nil, prev or nil, mask or -1ull)
-end
-
--- TODO index parameter
--- TODO remove query __call and always use this
-local function instance_exec(instance, query, res)
-	return query(instance, res)
-end
-
-local image_mt = {
-	newinstance = image_newinstance
-}
-image_mt.__index = image_mt
-
-ffi.metatype("fhk_Image", image_mt)
-
-local instance_mt = {
-	exec = instance_exec
-}
-instance_mt.__index = instance_mt
-
-ffi.metatype("fhk_Instance", instance_mt)
-
----- Compilation ---------------------------------------------------------------
 
 local function graph_compile(graph)
-	for _,query in ipairs(graph.queries) do
-		query.obj = graph.objs[API.fhk_newquery(graph.G, query.tab.i, setbufo(graph, query.values))]
+	local result = ffi.new("fhk_CompileResult")
+	assert(checkres(graph, API.fhk_compile(graph.G, result)))
+	local params, resets = {}, {}
+	local nparam, nreset = 0, 1
+	local tabs = {}
+	for o in graph:objects() do
+		if o.op == "TAB" then
+			tabs[tostring(o.name)] = o
+		elseif o.op == "VAR" then
+			if o.tab == tabs.state then
+				resets[tostring(o.name)] = result.resets[nreset].mask
+				nreset = nreset+1
+			elseif o.tab == tabs.query then
+				local rp = result.params[nparam]
+				params[nparam] = newparam(rp.check, rp.value, o)
+				nparam = nparam+1
+			end
+		end
 	end
-	for _,reset in ipairs(graph.resets) do
-		reset.obj = graph.objs[API.fhk_newreset(graph.G, setbufo(graph, reset.objs))]
+	local image = setmetatable({}, image_mt)
+	image.ptr = ffi.gc(result.image, API.fhk_destroyimage)
+	image.reset = resets
+	local params_start = 0
+	for i,q in ipairs(graph.queries) do
+		local rq = result.queries[i-1]
+		local qparm = {}
+		for j=params_start, rq.params_end-1 do
+			table.insert(qparm, params[result.query_params[j]])
+		end
+		params_start = rq.params_end
+		image[string.format("q%d", i)] = compilequery(result.mcode+rq.mcode, q.value.ann, qparm)
 	end
-	local image = ffi.new("fhk_Image *[1]");
-	assert(checkres(graph, API.fhk_compile(graph.G, image)))
-	local ptr = image[0]
-	local base = API.fhk_mcode(ptr)
-	for _,query in ipairs(graph.queries) do
-		compilequery(query, base)
-	end
-	for _,reset in ipairs(graph.resets) do
-		computemask(reset)
-	end
-	return ffi.gc(ptr, API.fhk_destroyimage)
+	return image
 end
 
 --------------------------------------------------------------------------------
@@ -565,8 +579,7 @@ local graph_mt = {
 	define   = graph_define,
 	var      = graph_var,
 	expr     = graph_expr,
-	newquery = graph_newquery,
-	newreset = graph_newreset,
+	query    = graph_query,
 	dump     = graph_dump,
 	optimize = graph_optimize,
 	compile  = graph_compile
@@ -579,8 +592,7 @@ local function newgraph()
 		buf     = ffi.new("int32_t[?]", 8),
 		bufsz   = 8,
 		num     = 0,
-		queries = {},
-		resets  = {},
+		queries = {}
 	}, graph_mt)
 	graph.obj_mt = makeobjmts(graph)
 	graph.objs   = makeobjtab(graph)

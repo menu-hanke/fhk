@@ -9,7 +9,7 @@ use zerocopy::Unalign;
 
 use crate::bitmap::BitmapWord;
 use crate::bump::{self, BumpRef, BumpVec};
-use crate::compile::{self, Ccx};
+use crate::compile::{self, Ccx, FFIError};
 use crate::data::{CALL_LUA, TENSOR_LUA};
 use crate::emit::{irt2cl, Ecx, Emit, InsValue};
 use crate::image::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance, SwapInit};
@@ -439,7 +439,7 @@ unsafe fn makejumptab(ccx: &mut Ccx, lib: &LuaLib, L: *mut lua_State) -> compile
         lib.lua_call(L, 2, 2);
         if lib.lua_type(L, -2) == LUA_TNIL {
             let msg = lib.lua_tolstring(L, -1, core::ptr::null_mut());
-            ccx.raw_error(CStr::from_ptr(msg).to_bytes())
+            ccx.error(FFIError::from_cstr(CStr::from_ptr(msg)))
         } else {
             let mem = lib.lua_tointeger(L, -2);
             lib.lua_settop(L, -3);
@@ -672,7 +672,7 @@ impl Language for Lua {
             }
         };
         unsafe { init(&self, stack.base() as usize + CORO_STACK); }
-        ccx.fin.push(LuaFinalizer {
+        ccx.image.fin.push(LuaFinalizer {
             L: self.L,
             base: self.base,
             _stack: stack

@@ -1,6 +1,7 @@
 //! Lua host support.
 
 use core::ffi::{c_char, c_int, c_void};
+use core::fmt::Write;
 use core::u64;
 
 use alloc::boxed::Box;
@@ -11,7 +12,8 @@ use crate::data::{HOST_LUA, TENSOR_LUA};
 use crate::dump::dump_objs;
 use crate::image::{Image, Instance};
 use crate::intern::Interned;
-use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, RESET, TAB};
+use crate::mem::{Param, ParamId, Query, Reset};
+use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, TAB, TUPLE};
 use crate::optimize::parse_optflags;
 use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_toplevel_def, parse_toplevel_expr, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
@@ -23,24 +25,29 @@ type lua_State = c_void;
 
 #[cfg_attr(windows, link(name="lua51"))]
 unsafe extern "C-unwind" {
-    fn luaL_loadbuffer(L: *mut lua_State, buff: *const u8, sz: usize, name: *const c_char) -> c_int;
+    fn luaL_loadbuffer(L: *mut lua_State, buff: *const u8, sz: usize, name: *const c_char)
+        -> c_int;
     fn lua_call(L: *mut lua_State, nargs: c_int, nresults: c_int);
     fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void);
     fn lua_pushinteger(L: *mut lua_State, n: isize);
     fn lua_pushstring(L: *mut lua_State, s: *const c_char);
 }
 
+// all of the following are accessed by ffi:
 type fhk_Graph = Ccx<Parser>;
 type fhk_Image = Image;
 type fhk_Instance = Instance;
 type fhk_ObjRef<T=Obj> = ObjRef<T>;
 type fhk_SeqRef = Interned<[u8]>;
+type fhk_Query = Query;
+type fhk_Param = Param;
+type fhk_Reset = Reset;
 type fhk_Result = i32;
 type fhk_Alloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut u8;
 
 #[derive(Default)]
 pub struct HostCtx {
-    pub buf: Bump
+    buf: Bump,
 }
 
 pub struct HostInst {
@@ -49,12 +56,29 @@ pub struct HostInst {
     err: *const c_char
 }
 
+impl HostCtx {
+
+    #[cold]
+    pub fn set_error(&mut self, error: core::fmt::Arguments) {
+        self.buf.clear();
+        self.buf.write_fmt(error).unwrap();
+    }
+
+    #[cold]
+    pub fn set_error_bytes(&mut self, error: &[u8]) {
+        self.buf.clear();
+        self.buf.write(error);
+    }
+
+}
+
 impl HostInst {
 
     pub fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
         unsafe { (self.alloc)(self.udata, size, align) }
     }
 
+    #[cold]
     pub fn set_error(&mut self, err: &[u8]) {
         let ptr = self.alloc(err.len()+1, 1);
         let data: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(ptr, err.len()+1) };
@@ -176,32 +200,17 @@ unsafe extern "C" fn fhk_tparse(
 
 extern "C" fn fhk_getstr(G: &mut fhk_Graph, string: fhk_SeqRef) {
     G.host.buf.clear();
-    stringify(
-        &mut G.host.buf,
-        &G.intern,
-        &G.intern[string],
-        SequenceType::Pattern
-    );
+    stringify(&mut G.host.buf, &G.intern, &G.intern[string], SequenceType::Pattern);
 }
 
 unsafe extern "C" fn fhk_newquery(
     G: &mut fhk_Graph,
-    tab: fhk_ObjRef<TAB>,
     values: *const fhk_ObjRef<EXPR>,
     num: usize
 ) -> fhk_ObjRef<QUERY> {
-    G.objs.push_args(QUERY::new(tab, 0), unsafe { slice_from_raw_parts(values, num) })
-}
-
-unsafe extern "C" fn fhk_newreset(
-    G: &mut fhk_Graph,
-    objs: *const fhk_ObjRef,
-    num: usize
-) -> fhk_ObjRef<RESET> {
-    G.objs.push_args(
-        RESET::new(zerocopy::transmute!(G.resets.next()), 0, 0),
-        unsafe { slice_from_raw_parts(objs, num) }
-    )
+    let value = G.objs.push_args::<TUPLE>(TUPLE::new(ObjRef::NIL),
+        unsafe { slice_from_raw_parts(values, num) });
+    G.objs.push(QUERY::new(value))
 }
 
 extern "C" fn fhk_dumpobjs(G: &mut fhk_Graph) {
@@ -213,19 +222,27 @@ unsafe extern "C" fn fhk_optimize(G: &mut fhk_Graph, flags: *const c_char, len: 
     G.flags = parse_optflags(unsafe { slice_from_raw_parts(flags as _, len) })
 }
 
-unsafe extern "C" fn fhk_compile(G: &mut fhk_Graph, image: *mut *mut fhk_Image) -> fhk_Result {
-    let result = G.begin().unwrap().ccx.compile();
-    match result {
-        Ok(()) => {
-            unsafe { *image = Box::leak(Box::new(G.image.take().unwrap())); }
-            0
-        },
-        Err(()) => -1
-    }
+#[repr(C)]
+struct fhk_CompileResult {
+    image: *mut fhk_Image,
+    mcode: *const u8,
+    queries: *const fhk_Query,
+    query_params: *const ParamId,
+    params: *const fhk_Param,
+    resets: *const fhk_Reset
 }
 
-extern "C" fn fhk_mcode(image: &fhk_Image) -> *const u8 {
-    image.mem.base()
+unsafe extern "C" fn fhk_compile(G: &mut fhk_Graph, out: &mut fhk_CompileResult) -> fhk_Result {
+    let ccx = &mut G.begin().unwrap().ccx;
+    ccx.host.buf.clear();
+    let Ok(image) = ccx.compile() else { return -1 };
+    out.mcode = image.mem.base();
+    out.image = Box::leak(Box::new(image));
+    out.queries = ccx.layout.queries.raw.as_ptr();
+    out.query_params = ccx.layout.query_params.as_ptr();
+    out.params = ccx.layout.params.raw.as_ptr();
+    out.resets = ccx.layout.resets.raw.as_ptr();
+    0
 }
 
 extern "C" fn fhk_vmerr(instance: &fhk_Instance) -> *const c_char {
@@ -234,15 +251,20 @@ extern "C" fn fhk_vmerr(instance: &fhk_Instance) -> *const c_char {
 
 unsafe extern "C" fn fhk_newinstance(
     image: &fhk_Image,
-    alloc: fhk_Alloc,
+    alloc: Option<fhk_Alloc>,
     udata: *mut c_void,
-    prev: *const fhk_Instance,
+    template: *const fhk_Instance,
     reset: u64
 ) -> *mut fhk_Instance {
     // TODO: only reset if this query depends on the reset mask (save mask for queries too)
     // TODO: instead of copy-then-zero, just do both copying and zeroing in a single loop
     unsafe {
-        let inst = image.instantiate(prev, reset, |size, align| alloc(udata, size, align));
+        let (alloc, udata) = match alloc {
+            Some(alloc) => (alloc, udata),
+            None => ((*template).host.alloc,
+                if udata.is_null() { (*template).host.udata } else { udata })
+        };
+        let inst = image.instantiate(template, reset, |size, align| alloc(udata, size, align));
         (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
         inst
     }
@@ -262,12 +284,42 @@ macro_rules! define_api {
     };
     ($($t:tt)*) => {
         const HOST_APIDEF: &str = concat!(
-"require('ffi').cdef [[
+            "require('ffi').cdef [[",
+            // layouts of all fhk_* structs must match this
+            "
 typedef struct fhk_Graph fhk_Graph;
-typedef struct fhk_Image fhk_Image;
-typedef struct fhk_Instance fhk_Instance;
-typedef union fhk_Obj { uint32_t raw; struct { uint8_t n; uint8_t op; uint8_t mark; uint8_t data; } obj; } fhk_Obj;
-typedef void *(fhk_Alloc)(void *, size_t, size_t);",
+
+typedef union {
+    uint32_t raw;
+    struct { uint8_t n; uint8_t op; uint8_t mark; uint8_t data; } obj;
+} fhk_Obj;
+
+typedef void *(fhk_Alloc)(void *, size_t, size_t);
+
+typedef struct {
+    uint32_t check;
+    uint32_t value;
+    uint32_t size;
+} fhk_Param;
+
+typedef struct {
+    uint32_t mcode;
+    uint32_t params_end;
+} fhk_Query;
+
+typedef struct {
+    uint64_t mask;
+} fhk_Reset;
+
+typedef struct {
+    void *image;
+    uintptr_t mcode;
+    fhk_Query *queries;
+    uint16_t *query_params;
+    fhk_Param *params;
+    fhk_Reset *resets;
+} fhk_CompileResult;
+",
             stringify! {
                 typedef struct {
                     $($t)*
@@ -282,22 +334,20 @@ typedef void *(fhk_Alloc)(void *, size_t, size_t);",
 define_api! {
     fhk_Graph *(*fhk_newgraph)();
     void (*fhk_destroygraph)(fhk_Graph *);
-    void (*fhk_destroyimage)(fhk_Image *);
+    void (*fhk_destroyimage)(void *);
     char *(*fhk_buf)(fhk_Graph *);
     fhk_Obj *(*fhk_objs)(fhk_Graph *);
     uint32_t (*fhk_objnum)(fhk_Graph *);
     int32_t (*fhk_parse)(fhk_Graph *, int32_t, const char *, size_t, int);
     int32_t (*fhk_tparse)(fhk_Graph *, int32_t, int32_t, int32_t *, size_t, int);
     void (*fhk_getstr)(fhk_Graph *, uint32_t);
-    int32_t (*fhk_newquery)(fhk_Graph *, int32_t, int32_t *, size_t);
-    int32_t (*fhk_newreset)(fhk_Graph *, int32_t *, size_t);
+    int32_t (*fhk_newquery)(fhk_Graph *, int32_t *, size_t);
     void (*fhk_dumpobjs)(fhk_Graph *);
     void (*fhk_optimize)(fhk_Graph *, const char *, size_t);
-    int32_t (*fhk_compile)(fhk_Graph *, fhk_Image **);
-    void *(*fhk_mcode)(fhk_Image *);
-    fhk_Instance *(*fhk_newinstance)(fhk_Image *, fhk_Alloc *, void *, fhk_Instance *, uint64_t);
-    int32_t (*fhk_vmcall)(fhk_Instance *, void *, uintptr_t);
-    char *(*fhk_vmerr)(fhk_Instance *);
+    int32_t (*fhk_compile)(fhk_Graph *, void *);
+    uint8_t *(*fhk_newinstance)(void *, fhk_Alloc *, void *, uint8_t *, uint64_t);
+    int32_t (*fhk_vmcall)(void *, uintptr_t, uint8_t *);
+    char *(*fhk_vmerr)(uint8_t *);
 }
 
 #[unsafe(no_mangle)]

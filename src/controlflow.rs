@@ -8,9 +8,9 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
 
 use crate::bitmap::{BitMatrix, BitmapVec, Bitmap};
-use crate::graph::{Graph, GraphPtr};
 use crate::index::{self, index, Index, IndexSet, IndexSlice, IndexVec, InvalidValue};
 use crate::ir::{Func, Ins, InsId, Opcode};
+use crate::relation::{Graph, Relation};
 
 /* ---- Control flow graph -------------------------------------------------- */
 
@@ -108,7 +108,7 @@ fn compute_cfg(
         placeins1(inst, place, ctr, block);
     }
     for (block, &ctr) in blocks.pairs() {
-        cfg.add_inputs_iter(
+        cfg.forward.collect(
             block,
             code[ctr]
             .controls()
@@ -116,6 +116,7 @@ fn compute_cfg(
             .map(|&id| place[inst[id].start as usize])
         );
     }
+    cfg.compute_backward();
 }
 
 fn lca(idom: &IndexSlice<BlockId, BlockId>, mut a: BlockId, mut b: BlockId) -> BlockId {
@@ -140,14 +141,17 @@ pub fn dom(idom: &IndexSlice<BlockId, BlockId>, a: BlockId, mut b: BlockId) -> b
 
 // "A Simple, Fast Dominance Algorithm", KD Cooper
 // [https://www.cs.tufts.edu/comp/150FP/archive/keith-cooper/dom14.pdf]
-fn compute_domtree(cfg: &GraphPtr<BlockId>, idom: &mut IndexSlice<BlockId, BlockId>) {
+fn compute_domtree(
+    cfg_back: &Relation<BlockId, BlockId>,
+    idom: &mut IndexSlice<BlockId, BlockId>
+) {
     for (id, dom) in idom.pairs_mut() {
-        *dom = cfg.uses(id).get(0).cloned().unwrap_or(BlockId::START);
+        *dom = cfg_back[id].get(0).cloned().unwrap_or(BlockId::START);
     }
     loop {
         let mut fixpoint = true;
         for id in index::iter_range(1.into()..idom.end()) {
-            if let &[mut new_idom, ref rest@..] = cfg.uses(id) {
+            if let &[mut new_idom, ref rest@..] = &cfg_back[id] {
                 for &p in rest {
                     new_idom = lca(idom, p, new_idom);
                 }
@@ -270,7 +274,7 @@ fn addintersect(
 fn compute_cmat(
     code: &IndexSlice<InsId, Ins>,
     blocks: &IndexSlice<BlockId, InsId>,
-    cfg: &GraphPtr<BlockId>,
+    cfg_back: &Relation<BlockId, BlockId>,
     inst: &IndexSlice<InsId, Range<u16>>,
     place: &[BlockId],
     mat: &mut BitMatrix<BlockId, InsId>,
@@ -303,7 +307,7 @@ fn compute_cmat(
                 })
             );
             addintersect(mat, i, &work_blocks, work);
-            addintersect(mat, i, cfg.uses(i), work);
+            addintersect(mat, i, &cfg_back[i], work);
             work_blocks.clear();
             fixpoint &= mat[i].popcount() == pop;
         }
@@ -366,7 +370,7 @@ struct WorkIns {
 fn schedule_next(
     work_state: &mut Vec<WorkIns>,
     work_blocks: &mut Vec<BlockId>,
-    dfg: &GraphPtr<InsId>,
+    dfg_users: &Relation<InsId, InsId>,
     idom: &IndexSlice<BlockId, BlockId>,
     mat: &BitMatrix<BlockId, InsId>,
     inst: &mut IndexVec<InsId, Range<u16>>,
@@ -383,7 +387,7 @@ fn schedule_next(
         }
     };
     'outer: loop {
-        let users = dfg.uses(state.id);
+        let users = &dfg_users[state.id];
         while (state.user as usize) < users.len() {
             let user = users[state.user as usize];
             if inst[user] == UNPLACED {
@@ -435,9 +439,11 @@ fn schedule_next(
 // [https://courses.cs.washington.edu/courses/cse501/04wi/papers/click-pldi95.pdf]
 // the `ControlFlow` type maps instructions (either all or a subset) to basic blocks.
 // note that it does *not* determine the ordering among instructions in a basic block.
+// TODO: cfg forward edges are now only used in schedule, change cfg to Relation<BlockId, BlockId>
+//       when they are no longer needed.
 #[derive(Default)]
 pub struct ControlFlow {
-    pub dfg: Graph<InsId>,
+    pub dfg_users: Relation<InsId, InsId>,
     pub cfg: Graph<BlockId>,
     pub idom: IndexVec<BlockId, BlockId>,
     pub code: IndexVec<InsId, Ins>,
@@ -467,12 +473,12 @@ impl ControlFlow {
     pub fn set_func(&mut self, func: &Func, mark: &mut IndexSet<InsId>) {
         func.code.swap_inner(&mut self.code);
         compute_blocks(&mut self.code, &mut self.blocks, mark, func.entry);
-        self.cfg.clear(self.blocks.end());
+        self.cfg.clear();
+        self.dfg_users.clear();
         debug_assert!(self.blocks.raw.len()
             == self.code.raw.iter().filter(|i| i.opcode().is_control()).count());
-        self.dfg.clear(self.code.end());
         for (id, ins) in self.code.pairs() {
-            self.dfg.add_inputs(id, ins.inputs_and_controls());
+            self.dfg_users.add_reverse(ins.inputs_and_controls(), id);
         }
         // by default all instructions are based outside basic blocks
         self.place.clear();
@@ -481,12 +487,12 @@ impl ControlFlow {
         self.inst.raw.resize(self.code.raw.len(), UNPLACED);
         compute_cfg(&self.code, &mut self.cfg, &self.blocks, &mut self.inst, &mut self.place);
         self.idom.raw.resize(self.blocks.raw.len(), BlockId::INVALID.into());
-        compute_domtree(&self.cfg, &mut self.idom);
+        compute_domtree(&self.cfg.backward, &mut self.idom);
         place_pinned(&self.code, &mut self.inst, &mut self.place);
         compute_cmat(
             &self.code,
             &self.blocks,
-            &self.cfg,
+            &self.cfg.backward,
             &self.inst,
             &self.place,
             &mut self.cmat,
@@ -522,7 +528,7 @@ impl ControlFlow {
         schedule_next(
             &mut self.state,
             &mut self.work_blocks,
-            &self.dfg,
+            &self.dfg_users,
             &mut self.idom,
             &self.cmat,
             &mut self.inst,

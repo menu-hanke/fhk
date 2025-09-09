@@ -9,7 +9,7 @@ use crate::bump::BumpRef;
 use crate::compile::Ccx;
 use crate::controlflow::{dom, BlockId, ControlFlow, InstanceMap};
 use crate::index::{self, IndexOption, IndexSet, IndexSlice, IndexVec, InvalidValue};
-use crate::ir::{FuncId, FuncKind, Ins, InsId, Opcode, IR};
+use crate::ir::{FuncId, FuncKind, Ins, InsId, Opcode, PhiId, IR};
 use crate::optimize::{Ocx, Pass};
 use crate::trace::trace;
 use crate::typestate::Absent;
@@ -39,7 +39,7 @@ define_costs! {
     NOP | JMP | GOTO | UB | ABORT | PHI | KINT | KINT64 | KFP64 | KSTR | KREF
        | MOV | MOVB | MOVF | CONV | ABOX | BREF | CARG | RES | RET  => 0,
     ADD | SUB | MUL | DIV | UDIV | NEG | ADDP | EQ | NE | LT | LE | ULT | ULE
-        | STORE | LOAD | BOX | IF => 1,
+        | STORE | LOAD | QLOAD | BOX | IF => 1,
     POW | ALLOC | CALLC | CALLCI => 5,
     CALL | CINIT | LO | LOV | LOVV | LOVX | LOX | LOXX => 255
 }
@@ -76,7 +76,8 @@ struct FuncData {
 enum Action {
     Fixup(/*pos in new code:*/ InsId, /*replace:*/ InsId, /*with:*/ InsId),
     Inline(/*pos in new code:*/ InsId, /*jump target in new code:*/ InsId),
-    Phi(/*pos in new code:*/InsId)
+    Phi(/*pos in new code:*/InsId),
+    PinEntry(/*pos in new code:*/InsId)
 }
 
 #[derive(Default)]
@@ -114,7 +115,6 @@ fn visitcallers(ir: &IR, inline: &mut Inline, fid: FuncId) {
         if op.is_call() {
             let f = ins.decode_F();
             let fd = &mut inline.func[f];
-            debug_assert!(ir.funcs[f].reset.is_subset(&ir.funcs[fid].reset));
             let callers = fd.callers;
             if op != Opcode::CALLCI || ir.funcs[f].reset != ir.funcs[fid].reset {
                 fd.callers |= CALLER_CALLX;
@@ -135,25 +135,30 @@ fn visitins(
     cursor: &mut InsId,
     bb: &mut IndexSlice<BlockId, InsId>,
     iselim: &IndexSet<InsId>,
+    arg: PhiId,
     id: InsId
 ) {
     if inst.is_placed(id) {
         return;
     }
-    for &user in ctr.dfg.uses(id) {
-        visitins(actions, inst, ctr, cursor, bb, iselim, user);
+    for &user in &ctr.dfg_users[id] {
+        visitins(actions, inst, ctr, cursor, bb, iselim, arg, user);
     }
     let ins = ctr.code[id];
     let new = inst.get_mut(id);
     if let Some(blocks) = ctr.get_blocks(id) {
         debug_assert!(blocks.len() == new.len());
         for (j, &block) in blocks.iter().enumerate() {
-            if ins.opcode().is_pinned() {
+            if ins.opcode() == Opcode::PHI && ins.decode_PHI().1 < arg {
+                // entry may move but we want arg phis to stay attached to the new entry
+                // for control flow optimizations
+                actions.push(Action::PinEntry(*cursor));
+            } else if ins.opcode().is_pinned() {
                 actions.push(Action::Fixup(*cursor, zerocopy::transmute!(block), bb[block]));
             } else if iselim.contains(id) {
                 actions.push(Action::Inline(*cursor, bb[block]));
                 actions.extend(
-                    ctr.dfg.uses(id)
+                    ctr.dfg_users[id]
                     .iter()
                     .flat_map(|&i| zip(ctr.get_blocks(i).unwrap(), inst.get(i)))
                     .filter_map(|(&b,&i)| dom(&ctr.idom, block, b).then(|| Action::Phi(i)))
@@ -192,7 +197,8 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
         cursor += 1;
     }
     for id in index::iter_span(inl.control.code.end()) {
-        visitins(&mut inl.actions, &mut inl.inst, &inl.control, &mut cursor, bb_ctr, &ccx.mark1, id);
+        visitins(&mut inl.actions, &mut inl.inst, &inl.control, &mut cursor, bb_ctr, &ccx.mark1,
+            func.arg, id);
     }
     for (bb, &ctr) in inl.control.blocks.pairs() {
         for &c in inl.control.code[ctr].controls() {
@@ -283,6 +289,10 @@ fn inlinecalls(ccx: &mut Ocx, fid: FuncId, calls: Range<BumpRef<InsId>>, cost: &
                     // dominate it.
                     debug_assert!(code[at].opcode() == Opcode::PHI);
                 }
+            },
+            &Action::PinEntry(at) => {
+                debug_assert!(code[at].decode_PHI().1 < func.arg);
+                code[at] = code[at].set_a(zerocopy::transmute!(func.entry));
             }
         }
     }

@@ -12,10 +12,10 @@ use core::iter::zip;
 use crate::bitmap::BitmapWord;
 use crate::bump::{Bump, BumpRef};
 use crate::controlflow::BlockId;
-use crate::graph::{Graph, GraphPtr};
 use crate::index::{self, index, IndexArray, IndexOption, IndexSet, IndexSlice, IndexVec};
 use crate::ir::{ins_matches, FuncId, Ins, InsId, Opcode, Phi, PhiId, Type};
 use crate::optimize::{Ocx, OptFlag};
+use crate::relation::Relation;
 use crate::trace::trace;
 use crate::zerocopy_union::zerocopy_union;
 
@@ -58,7 +58,7 @@ zerocopy_union! {
 
 fn ifchain_run(
     code: &mut IndexSlice<InsId, Ins>,
-    dfg: &mut Graph<InsId>,
+    dfg_users: &mut Relation<InsId, InsId>,
     blocks: &IndexSlice<BlockId, BlockData>,
     ctr_data: &IndexSlice<InsId, InsData>
 ) {
@@ -75,10 +75,8 @@ fn ifchain_run(
                     && blocks[ctr_data[target].block().unwrap()].pin == 0
             {
                 code[ctr].controls_mut()[i] = tins.controls()[i];
-                // TODO: here (and other places where replace_input is used), it should
-                // reconstruct the input list instead. this may cause problems if both
-                // inputs are the same (although this will only happen when fold is not enabled)
-                dfg.replace_input(ctr, target, tins.controls()[i]);
+                dfg_users.remove(target, ctr);
+                dfg_users.add(tins.controls()[i], ctr);
             }
         }
     }
@@ -95,7 +93,7 @@ fn ifchain_run(
 
 fn hasnonswitchuser(
     code: &IndexSlice<InsId, Ins>,
-    dfg: &GraphPtr<InsId>,
+    dfg_users: &Relation<InsId, InsId>,
     isswitch: &IndexSet<InsId>,
     visited: &mut IndexSet<InsId>,
     id: InsId
@@ -106,9 +104,9 @@ fn hasnonswitchuser(
     if code[id].opcode().is_control() {
         return !isswitch.contains(id);
     }
-    dfg.uses(id)
+    dfg_users[id]
         .iter()
-        .any(|&i| hasnonswitchuser(code, dfg, isswitch, visited, i))
+        .any(|&i| hasnonswitchuser(code, dfg_users, isswitch, visited, i))
 }
 
 fn switch_run(
@@ -116,7 +114,7 @@ fn switch_run(
     blocks: &IndexSlice<BlockId, BlockData>,
     isswitch: &mut IndexSet<InsId>,
     visited: &mut IndexSet<InsId>,
-    dfg: &mut Graph<InsId>
+    dfg_users: &mut Relation<InsId, InsId>,
 ) {
     'blocks: for &BlockData { ctr, pin } in &blocks.raw {
         if pin != 1 { /* failed (1a) or (1c) */ continue }
@@ -132,7 +130,7 @@ fn switch_run(
         if code[phiv].type_().is_fp() { continue } // TODO floats (nan handling)
         let (_, phi) = code[phiv].decode_PHI();
         // check (1b)
-        for &user in dfg.uses(ctr) {
+        for &user in &dfg_users[ctr] {
             if user == phiv { continue }
             let uins = code[user];
             if !ins_matches!(code, uins; JMP const) || uins.decode_JMP().2 != phi {
@@ -146,7 +144,7 @@ fn switch_run(
             trace!(OPTIMIZE "SWITCH eliminate chain {:?} {:?}", chain, code[chain]);
             isswitch.insert(chain);
             for &next in code[chain].controls() {
-                if dfg.use_count(next) == 1 && match isbool {
+                if dfg_users[next].len() == 1 && match isbool {
                     true => code[next].opcode() == Opcode::IF && code[next].decode_V() == phiv,
                     false => ins_matches!(code, code[next]; IF ((EQ|NE) (PHI) const))
                         && code[code[code[next].decode_V()].decode_V()].decode_PHI().1 == phi
@@ -170,12 +168,12 @@ fn switch_run(
         // }
         // check (1d)
         visited.clear();
-        if hasnonswitchuser(code, dfg, isswitch, visited, phiv) {
+        if hasnonswitchuser(code, dfg_users, isswitch, visited, phiv) {
             continue 'blocks;
         }
         // this is a switch IF. redirect incoming JMPs.
         let mut u = 0;
-        while let Some(&user) = dfg.uses(ctr).get(u) {
+        while let Some(&user) = dfg_users[ctr].get(u) {
             if user == phiv {
                 u += 1;
             } else {
@@ -207,9 +205,9 @@ fn switch_run(
                 }
                 trace!(OPTIMIZE "SWITCH redirect jump {:?} {:?}  =>  {:?}", user, code[user], chain);
                 code[user] = Ins::GOTO(chain);
-                dfg.remove_input(user, ctr);
-                dfg.remove_input(user, jmpval);
-                dfg.add_input(user, chain);
+                dfg_users.remove(ctr, user);
+                dfg_users.remove(jmpval, user);
+                dfg_users.add(chain, user);
             }
         }
     }
@@ -249,7 +247,7 @@ fn loop_checkbody(
 
 fn loop_isloopuse(
     code: &IndexSlice<InsId, Ins>,
-    dfg: &GraphPtr<InsId>,
+    dfg_users: &Relation<InsId, InsId>,
     isloop: &mut IndexSet<InsId>,
     id: InsId
 ) -> bool {
@@ -259,9 +257,9 @@ fn loop_isloopuse(
     if code[id].opcode().is_control() {
         return false
     }
-    if dfg.uses(id)
+    if dfg_users[id]
         .iter()
-        .all(|&user| loop_isloopuse(code, dfg, isloop, user))
+        .all(|&user| loop_isloopuse(code, dfg_users, isloop, user))
     {
         isloop.insert(id);
         true
@@ -273,13 +271,13 @@ fn loop_isloopuse(
 fn loop_checkpinuse(
     code: &IndexSlice<InsId, Ins>,
     isloop: &mut IndexSet<InsId>,
-    dfg: &GraphPtr<InsId>,
+    dfg_users: &Relation<InsId, InsId>,
     mut body: InsId,
     tail: InsId
 ) -> bool {
     loop {
-        for &user in dfg.uses(body) {
-            if code[user].opcode().is_pinned() && !loop_isloopuse(code, dfg, isloop, user) {
+        for &user in &dfg_users[body] {
+            if code[user].opcode().is_pinned() && !loop_isloopuse(code, dfg_users, isloop, user) {
                 return false
             }
         }
@@ -295,11 +293,11 @@ fn loop_checkphiuse(
     blocks: &IndexSlice<BlockId, BlockData>,
     isloop: &IndexSet<InsId>,
     isloopphi: &IndexSet<PhiId>,
-    dfg: &GraphPtr<InsId>
+    dfg_users: &Relation<InsId, InsId>
 ) -> bool {
     for &BlockData { ctr, .. } in &blocks.raw {
         if !isloop.contains(ctr) {
-            for &user in dfg.uses(ctr) {
+            for &user in &dfg_users[ctr] {
                 let ins = code[user];
                 if ins.opcode() == Opcode::PHI {
                     let (_, phi) = ins.decode_PHI();
@@ -318,7 +316,7 @@ fn loop_run(
     blocks: &IndexSlice<BlockId, BlockData>,
     isloop: &mut IndexSet<InsId>,
     isloopphi: &mut IndexSet<PhiId>,
-    dfg: &mut Graph<InsId>
+    dfg_users: &mut Relation<InsId, InsId>
 ) {
     for &BlockData { ctr, .. } in &blocks.raw {
         let ins = code[ctr];
@@ -329,17 +327,17 @@ fn loop_run(
             // check (1a)
             if !loop_checkbody(code, isloop, isloopphi, branch, ctr) { continue }
             // check (1b): are all uses of pins inside the loop?
-            if !loop_checkpinuse(code, isloop, dfg, branch, ctr) { continue }
+            if !loop_checkpinuse(code, isloop, dfg_users, branch, ctr) { continue }
             // check (1b): are all uses of phis inside the loop?
-            if !loop_checkphiuse(code, blocks, isloop, isloopphi, dfg) { continue }
+            if !loop_checkphiuse(code, blocks, isloop, isloopphi, dfg_users) { continue }
             // this IF is a side-effect-free loop. eliminate it.
             let (cond, tru, fal) = code[ctr].decode_IF();
             let dest = if branch == tru { fal } else { tru };
             let notdest = if branch == tru { tru } else { fal };
             trace!(OPTIMIZE "LOOP eliminate {:?} {:?}  =>  {:?}", ctr, code[ctr], dest);
             code[ctr] = Ins::GOTO(dest);
-            dfg.remove_input(ctr, cond);
-            dfg.remove_input(ctr, notdest);
+            dfg_users.remove(cond, ctr);
+            dfg_users.remove(notdest, ctr);
             break
         }
     }
@@ -365,7 +363,7 @@ fn phi_run(
     code: &mut IndexSlice<InsId, Ins>,
     phis: &mut IndexVec<PhiId, Phi>,
     blocks: &mut IndexSlice<BlockId, BlockData>,
-    dfg: &mut Graph<InsId>,
+    dfg_users: &mut Relation<InsId, InsId>,
     phi_data: &mut IndexSlice<PhiId, PhiData>,
     arg: PhiId
 ) {
@@ -386,7 +384,7 @@ fn phi_run(
             }
         }
         // check (2)
-        for &user in dfg.uses(ctr) {
+        for &user in &dfg_users[ctr] {
             let uins = code[user];
             if uins.opcode() == Opcode::PHI {
                 let (_, phi) = uins.decode_PHI();
@@ -427,13 +425,13 @@ fn phi_run(
                 None => {
                     trace!(OPTIMIZE "PHI patch jump {:?} {:?}", ctr, *ins);
                     *ins = Ins::GOTO(dest);
-                    dfg.remove_input(ctr, value);
+                    dfg_users.remove(value, ctr);
                 }
             }
         }
         // patch (2)
         let mut u = 0;
-        while let Some(&user) = dfg.uses(ctr).get(u) {
+        while let Some(&user) = dfg_users[ctr].get(u) {
             let uins = &mut code[user];
             if uins.opcode() == Opcode::PHI {
                 let (_, phi) = uins.decode_PHI();
@@ -442,7 +440,8 @@ fn phi_run(
                     PhiData { value, .. } => {
                         trace!(OPTIMIZE "PHI patch read {:?} {:?}  =>  {:?}", user, uins, value);
                         block.pin -= 1;
-                        dfg.replace_input(user, ctr, value);
+                        dfg_users.remove(ctr, user);
+                        dfg_users.add(value, user);
                         *uins = uins.set_opcode(Opcode::MOV).set_a(zerocopy::transmute!(value));
                         continue;
                     }
@@ -465,7 +464,7 @@ fn goto_run(
     code: &mut IndexSlice<InsId, Ins>,
     blocks: &mut IndexSlice<BlockId, BlockData>,
     ctr_data: &IndexSlice<InsId, InsData>,
-    dfg: &mut Graph<InsId>,
+    dfg_users: &mut Relation<InsId, InsId>
 ) {
     'blocks: for block in index::iter_span(blocks.end()) {
         let BlockData { ctr, pin } = blocks[block];
@@ -478,11 +477,11 @@ fn goto_run(
                     break 'pins None
                 }
                 // case (2)
-                if dfg.use_count(succ) == blocks[ctr_data[succ].block().unwrap()].pin as usize + 1 {
+                if dfg_users[succ].len() == blocks[ctr_data[succ].block().unwrap()].pin as usize+1 {
                     break 'pins Some(succ)
                 }
                 // case (3)
-                let users = dfg.uses(ctr);
+                let users = &dfg_users[ctr];
                 if users.len() == pin as usize + 1 {
                     let pred = users
                         .iter()
@@ -513,8 +512,8 @@ fn goto_run(
             blocks[block].pin = 0;
             let succ = code[ctr].decode_C();
             code[ctr] = code[ctr].set_opcode(Opcode::NOP);
-            dfg.remove_input(ctr, succ);
-            while let Some(&user) = dfg.uses(ctr).get(0) {
+            dfg_users.remove(succ, ctr);
+            while let Some(&user) = dfg_users[ctr].get(0) {
                 let uins = &mut code[user];
                 let repl = if uins.opcode().is_pinned() {
                     let mp = movepins.unwrap();
@@ -524,7 +523,8 @@ fn goto_run(
                     succ
                 };
                 for c in uins.controls_mut() { if *c == ctr { *c = repl; } }
-                dfg.replace_input(user, ctr, repl);
+                dfg_users.remove(ctr, user);
+                dfg_users.add(repl, user);
             }
         }
     }
@@ -553,7 +553,7 @@ fn ccp_collect(
     ins_data: &mut IndexSlice<InsId, InsData>,
     fix_ins: &mut IndexArray<FixId, InsId, MAX_CCPFIX>,
     fixed: &mut IndexSet<InsId>,
-    dfg: &GraphPtr<InsId>
+    dfg_users: &Relation<InsId, InsId>
 ) -> usize {
     fixed.clear();
     let mut numfix = 0usize;
@@ -562,9 +562,9 @@ fn ccp_collect(
         if ins.opcode() != Opcode::IF { continue }
         let cond = ins.decode_V();
         if fixed.contains(cond) { continue }
-        if dfg.use_count(cond) > 1
+        if dfg_users[cond].len() > 1
             || (ins_matches!(code, code[cond]; (EQ|NE) _ const)
-                && dfg.use_count(code[cond].decode_V()) > 1)
+                && dfg_users[code[cond].decode_V()].len() > 1)
         {
             let fact = fix2fact(numfix.into());
             trace!(OPTIMIZE "CCP fix #{} ins={:?} facts={:?},{:?}", numfix, cond, fact, fact+1);
@@ -584,14 +584,14 @@ fn ccp_init(
     blocks_ccp: &mut IndexSlice<BlockId, CCPBlock>,
     ins_data: &IndexSlice<InsId, InsData>,
     fixed: &IndexSet<InsId>,
-    dfg: &GraphPtr<InsId>
+    dfg_users: &Relation<InsId, InsId>
 ) -> usize {
     let mut numfactblock = 0;
     for (id, &BlockData { ctr, .. }) in blocks.pairs() {
         let mut fact_bit: BitmapWord<FactId> = Default::default();
         'ok: {
             'fail: {
-                for &user in dfg.uses(ctr) {
+                for &user in &dfg_users[ctr] {
                     let uins = code[user];
                     match uins.opcode() {
                         Opcode::IF => {
@@ -631,13 +631,13 @@ fn ccp_propagate(
     blocks: &IndexSlice<BlockId, BlockData>,
     blocks_ccp: &mut IndexSlice<BlockId, CCPBlock>,
     ins_data: &IndexSlice<InsId, InsData>,
-    dfg: &GraphPtr<InsId>
+    dfg_users: &Relation<InsId, InsId>
 ) {
     loop {
         let mut fixpoint = true;
         for (id, &BlockData { ctr, .. }) in blocks.pairs().skip(1) {
             let mut w: BitmapWord<FactId> = BitmapWord::ones();
-            for &user in dfg.uses(ctr) {
+            for &user in &dfg_users[ctr] {
                 if code[user].opcode().is_control() {
                     if let Some(block) = ins_data[user].block().unpack() {
                         w &= blocks_ccp[block].fix;
@@ -736,11 +736,11 @@ fn ccp_run(
     ins_data: &mut IndexSlice<InsId, InsData>,
     fix_ins: &mut IndexArray<FixId, InsId, MAX_CCPFIX>,
     fixed: &mut IndexSet<InsId>,
-    dfg: &mut GraphPtr<InsId>
+    dfg_users: &mut Relation<InsId, InsId>
 ) {
-    if ccp_collect(code, blocks, ins_data, fix_ins, fixed, dfg) == 0 { return }
-    if ccp_init(code, blocks, blocks_ccp, ins_data, fixed, dfg) == 0 { return }
-    ccp_propagate(code, blocks, blocks_ccp, ins_data, dfg);
+    if ccp_collect(code, blocks, ins_data, fix_ins, fixed, dfg_users) == 0 { return }
+    if ccp_init(code, blocks, blocks_ccp, ins_data, fixed, dfg_users) == 0 { return }
+    ccp_propagate(code, blocks, blocks_ccp, ins_data, dfg_users);
     ccp_patch(code, blocks, blocks_ccp, ins_data, fix_ins, fixed);
 }
 
@@ -769,11 +769,11 @@ fn scandata(
     blocks: &mut IndexSlice<BlockId, BlockData>,
     iscontrol: &IndexSet<InsId>,
     ctr_data: &mut IndexSlice<InsId, InsData>,
-    dfg: &mut Graph<InsId>,
+    dfg_users: &mut Relation<InsId, InsId>
 ) {
-    dfg.clear(code.end());
+    dfg_users.clear();
     for (id, &ins) in code.pairs() {
-        dfg.add_inputs(id, ins.inputs_and_controls());
+        dfg_users.add_reverse(ins.inputs_and_controls(), id);
         if ins.opcode().is_control() && !iscontrol.contains(id) {
             *ctr_data[id].block_mut() = None.into();
         } else if ins.opcode().is_pinned() {
@@ -805,28 +805,28 @@ pub fn run(ocx: &mut Ocx, fid: FuncId) {
     let (data, fix_ins) = data.get_mut_split(fixins_ptr);
     let (data, phi_data) = data.get_dst_mut_split(phi_ptr, func.phis.end().into());
     let ins_data = data.get_dst_mut(insdata_ptr, code.raw.len());
-    scandata(code, blocks, &ocx.mark1, ins_data, &mut opt.cf.dfg);
+    scandata(code, blocks, &ocx.mark1, ins_data, &mut opt.cf.dfg_users);
     if ocx.flags.contains(OptFlag::IFCHAIN) {
-        ifchain_run(code, &mut opt.cf.dfg, blocks, ins_data);
+        ifchain_run(code, &mut opt.cf.dfg_users, blocks, ins_data);
     }
     if ocx.flags.contains(OptFlag::SWITCH) {
-        switch_run(code, blocks, &mut ocx.mark1, &mut ocx.mark2, &mut opt.cf.dfg);
+        switch_run(code, blocks, &mut ocx.mark1, &mut ocx.mark2, &mut opt.cf.dfg_users);
     }
     if ocx.flags.contains(OptFlag::LOOP) {
-        loop_run(code, blocks, &mut ocx.mark1, &mut opt.phi_mark, &mut opt.cf.dfg);
+        loop_run(code, blocks, &mut ocx.mark1, &mut opt.phi_mark, &mut opt.cf.dfg_users);
     }
     if ocx.flags.contains(OptFlag::PHI) {
-        phi_run(code, func.phis.inner_mut(), blocks, &mut opt.cf.dfg, phi_data, func.arg);
+        phi_run(code, func.phis.inner_mut(), blocks, &mut opt.cf.dfg_users, phi_data, func.arg);
     }
     if ocx.flags.contains(OptFlag::GOTO) {
-        goto_run(code, blocks, ins_data, &mut opt.cf.dfg);
+        goto_run(code, blocks, ins_data, &mut opt.cf.dfg_users);
         while code[func.entry].opcode() == Opcode::NOP {
             func.entry = zerocopy::transmute!(code[func.entry].a());
         }
     }
     if ocx.flags.contains(OptFlag::CCP) {
         // CCP must run last because it adds new instructions and doesn't maintain dfg.
-        ccp_run(code, blocks, blocks_ccp, ins_data, fix_ins, &mut ocx.mark1, &mut opt.cf.dfg);
+        ccp_run(code, blocks, blocks_ccp, ins_data, fix_ins, &mut ocx.mark1, &mut opt.cf.dfg_users);
     }
     ocx.tmp.truncate(base);
 }

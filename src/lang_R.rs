@@ -16,7 +16,7 @@ use zerocopy::Unalign;
 
 use crate::array::{Array, ArrayBuf, ArrayMut, ArrayType};
 use crate::bump::AlignedBytes;
-use crate::compile::Ccx;
+use crate::compile::{Ccx, FFIError};
 use crate::data::CALL_R;
 use crate::dl::LibBox;
 use crate::emit::{irt2cl, signature, Ecx, Emit, InsValue, Signature, NATIVE_CALLCONV};
@@ -351,7 +351,7 @@ fn begin_emit(ccx: &mut Ccx) -> compile::Result<R> {
     // load the loader. this cannot fail.
     let loader = unsafe { lib.R_ParseEvalString(CALL_R.as_ptr().cast(), *lib.R_GlobalEnv) };
     // define the runtime library.
-    let rt = ccx.mcode.intern_data(&RuntimeLibR::new(&lib));
+    let rt = ccx.image.mcode.intern_data(&RuntimeLibR::new(&lib));
     Ok(R { lib, loader, rt })
 }
 
@@ -383,8 +383,8 @@ fn emit_call(ecx: &mut Ecx, id: InsId) -> compile::Result<InsValue> {
             let fun = lib.R_tryEval(call, *lib.R_GlobalEnv, &mut err);
             lib.Rf_unprotect(2);
             if err != 0 {
-                ecx.host.buf.write(CStr::from_ptr(lib.R_curErrorBuf()).to_bytes());
-                return Err(());
+                let error = lib.R_curErrorBuf();
+                return ecx.error(FFIError::from_cstr(CStr::from_ptr(error)));
             }
             fun
         }
@@ -413,7 +413,7 @@ fn emit_call(ecx: &mut Ecx, id: InsId) -> compile::Result<InsValue> {
     }
     ecx.tmp[info] = [narg, nret];
     let calldata = emit.fb.usedata(
-        ecx.mcode.intern_data(AlignedBytes::<{align_of::<Call>()}>::new(&ecx.tmp[base..])));
+        ecx.image.mcode.intern_data(AlignedBytes::<{align_of::<Call>()}>::new(&ecx.tmp[base..])));
     ecx.tmp.truncate(base);
     let rt = emit.fb.usedata(rt);
     let mut sig = cranelift_codegen::ir::Signature::new(NATIVE_CALLCONV);
@@ -436,7 +436,8 @@ fn pri2sexp(pri: Primitive) -> SEXPTYPE {
         I64 | I32 | I16 | I8 | U64 | U32 | U16 | U8 => SEXPTYPE::INTSXP,
         B1 => SEXPTYPE::LGLSXP,
         STR => SEXPTYPE::STRSXP,
-        PTR => todo!("pri2sexp ptr") // does this even make sense to implement?
+        PTR => todo!("pri2sexp ptr"), // does this even make sense to implement?
+        FX => unreachable!()
     }
 }
 
@@ -452,7 +453,8 @@ unsafe fn importprivalue(dst: *mut (), src: *const (), pri: Primitive) {
             I8  => *dst.cast::<c_int>()     = *src.cast::<i8>() as _,
             U16 => *dst.cast::<c_int>()     = *src.cast::<u16>() as _,
             U8|B1 => *dst.cast::<c_int>()   = *src.cast::<u8>() as _,
-            STR|PTR => todo!("importprivalue ptr") // is str c_char?
+            STR|PTR => todo!("importprivalue ptr"), // is str c_char?
+            FX => unreachable!()
         }
     }
 }
@@ -761,7 +763,7 @@ impl Language for R {
     }
 
     fn finish_emit(self, ccx: &mut Ccx<Emit>) -> compile::Result {
-        ccx.fin.push(RFinalizer {
+        ccx.image.fin.push(RFinalizer {
             _lib: self.lib.lib,
             loader: self.loader,
             R_ReleaseObject: self.lib.R_ReleaseObject,

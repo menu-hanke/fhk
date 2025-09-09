@@ -17,6 +17,7 @@ use crate::dump::trace_objs;
 use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intern::Interned;
 use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LEN, LET, LGET, LOAD, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::relation::Relation;
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
 use crate::typing::{Constructor, Primitive, PRI_IDX};
@@ -87,11 +88,6 @@ struct Func {
     type_: Ty
 }
 
-struct FuncSub {
-    generics: u32,
-    constraints: u32,
-}
-
 struct Monomorphization {
     func: FuncId,
     obj: ObjRef<FUNC>,
@@ -102,10 +98,9 @@ pub struct TypeInfer {
     sub: IndexVec<TypeVar, Tv>,
     con: Vec<Constraint>,
     locals: IndexVec<LocalId, TypeVar>,
-    func_generic: Vec</* packed Option<EnumSet<Primitive>>: */u16>,
-    func_con: Vec<Constraint>,
     func: IndexVec<FuncId, Func>,
-    func_sub: IndexVec<FuncId, FuncSub>,
+    func_generic: Relation<FuncId, /* packed Option<EnumSet<Primitive>>: */u16>,
+    func_con: Relation<FuncId, Constraint>,
     tobj: HashTable<ObjRef>,
     monotab: HashTable<MonoId>,
     mono: IndexVec<MonoId, Monomorphization>,
@@ -470,28 +465,28 @@ fn unifytpri(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: EnumSet<Primitive>) {
     }
 }
 
-fn generalizev(ctx: &mut TypeInfer, base: usize, a: TypeVar) {
+fn generalizev(ctx: &mut TypeInfer, func: FuncId, a: TypeVar) {
     use TVar::*;
     // trace!(TYPE "generalize {:?} = {:?}", a, ctx.sub[a]);
     match ctx.sub[a].unpack() {
-        Bound(t) => generalizet(ctx, base, t),
+        Bound(t) => generalizet(ctx, func, t),
         Unbound(Scope::Local, pri) => {
-            ctx.sub[a] = Tv::bound(Ty::generic(ctx.func_generic.len() - base));
-            ctx.func_generic.push(pri2raw(pri));
+            ctx.sub[a] = Tv::bound(Ty::generic(ctx.func_generic[func].len()));
+            ctx.func_generic.add(func, pri2raw(pri));
             trace!(TYPE "generalize {:?}: {:?} ({:?})", a, ctx.sub[a], pri);
         },
         Unbound(Scope::Global, _) => {}
     }
 }
 
-fn generalizet(ctx: &mut TypeInfer, base: usize, a: Ty) {
+fn generalizet(ctx: &mut TypeInfer, func: FuncId, a: Ty) {
     use Type::*;
     // trace!(TYPE "generalize {:?}", a);
     match a.unpack() {
-        Link(i) => generalizev(ctx, base, i),
+        Link(i) => generalizev(ctx, func, i),
         Constructor(c, b) => {
             for i in 0..c.arity() as isize {
-                generalizev(ctx, base, b + i)
+                generalizev(ctx, func, b + i)
             }
         },
         _ => {}
@@ -507,20 +502,20 @@ fn isconcretec(sub: &IndexSlice<TypeVar, Tv>, con: &Constraint) -> bool {
     }
 }
 
-fn generalizec(ctx: &mut TypeInfer) {
+fn generalizec(ctx: &mut TypeInfer, func: FuncId) {
     let mut idx = 0;
     while idx < ctx.con.len() {
         if isconcretec(&ctx.sub, &ctx.con[idx]) {
             idx += 1;
         } else {
-            ctx.func_con.push(ctx.con.swap_remove(idx));
+            ctx.func_con.add(func, ctx.con.swap_remove(idx));
         }
     }
 }
 
-fn generalizef(ctx: &mut TypeInfer, fid: FuncId) {
-    generalizec(ctx);
-    generalizet(ctx, ctx.func_sub[fid].generics as usize, ctx.func[fid].type_);
+fn generalizef(ctx: &mut TypeInfer, func: FuncId) {
+    generalizec(ctx, func);
+    generalizet(ctx, func, ctx.func[func].type_);
 }
 
 fn func2scope(args: Option<Ty>) -> Scope {
@@ -574,22 +569,18 @@ fn instantiatec(sub: &mut IndexVec<TypeVar, Tv>, generics: TypeVar, con: &Constr
 }
 
 fn instantiatef(ctx: &mut TypeInfer, fid: FuncId) -> (TypeVar, Ty) {
-    let &FuncSub { generics, constraints } = &ctx.func_sub[fid];
-    let &FuncSub { generics: generics_end, constraints: constraints_end } = &ctx.func_sub[fid+1];
     let &Func { type_, .. } = &ctx.func[fid];
-    if generics == generics_end {
-        debug_assert!(constraints == constraints_end);
+    let generics = &ctx.func_generic[fid];
+    if generics.is_empty() {
+        debug_assert!(ctx.func_con[fid].is_empty());
         return (TypeVar(0), type_);
     }
     let generics_base = ctx.sub.end();
     let scope = func2scope(ctx.func_args);
-    ctx.sub.raw.extend(
-        ctx.func_generic[generics as usize .. generics_end as usize]
-        .iter()
-        .map(|&c| Tv::unbound(scope, EnumSet::try_from_u16(c)))
-    );
-    for i in constraints as usize .. constraints_end as usize {
-        let con = instantiatec(&mut ctx.sub, generics_base, &ctx.func_con[i]);
+    ctx.sub.raw.extend(generics.iter().map(|&c| Tv::unbound(scope, EnumSet::try_from_u16(c))));
+    let ncon = ctx.func_con[fid].len();
+    for i in 0..ncon {
+        let con = instantiatec(&mut ctx.sub, generics_base, &ctx.func_con[fid][i]);
         constraint(ctx, con);
     }
     (generics_base, instantiatet(&mut ctx.sub, generics_base, type_))
@@ -1066,6 +1057,9 @@ macro_rules! instantiate {
     (@type $con:ident $($t:expr)+ ; $tcx:expr) => {
         newcontype(&mut $tcx.data.sub, Constructor::$con, &[$($t),+])
     };
+    (@type Unit ; $($_:tt)*) => {
+        Ty::UNIT
+    };
     (@type $v:tt ; $($_:tt)*) => {
         $v
     };
@@ -1127,6 +1121,17 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
         ANY | ALL => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => pri Primitive::B1),
         CONV => I!(a,b e n :: a[Tensor e n] => Tensor b n),
         REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
+        EFFECT => {
+            // TODO: proper varargs support, for intrinsics at least
+            if let &[a, ref effects @ ..] = aty {
+                for &e in effects {
+                    unifytt(&mut tcx.data.sub, e, Ty::primitive(Primitive::FX));
+                }
+                a
+            } else {
+                Ty::primitive(Primitive::FX)
+            }
+        }
     };
     tcx.tmp.truncate(base);
     ty
@@ -1335,9 +1340,6 @@ fn collectfuncs(ccx: &mut Ccx<TypeInfer>) {
 
 fn visitfuncs(ccx: &mut Ccx<TypeInfer>) {
     ccx.data.tab = ObjRef::GLOBAL;
-    let nfunc = ccx.data.func.raw.len();
-    ccx.data.func_sub.raw.reserve_exact(nfunc+1);
-    ccx.data.func_sub.push(FuncSub { generics: 0, constraints: 0 });
     for fid in index::iter_span(ccx.data.func.end()) {
         let obj = ccx.data.func[fid].obj;
         trace!(TYPE "func {:?}", obj);
@@ -1349,12 +1351,6 @@ fn visitfuncs(ccx: &mut Ccx<TypeInfer>) {
         ccx.data.func[fid].type_ = ty;
         simplify(&mut ccx.data);
         generalizef(&mut ccx.data, fid);
-        let next_generics = ccx.data.func_generic.len();
-        let next_constraints = ccx.data.func_con.len();
-        ccx.data.func_sub.push(FuncSub {
-            generics: next_generics as _,
-            constraints: next_constraints as _
-        });
     }
     ccx.data.func_args = None;
 }
@@ -1431,12 +1427,10 @@ fn visitglobals(tcx: &mut Tcx) {
                 let ety = visitexpr(tcx, value);
                 unifyvt(&mut tcx.data.sub, ety, ty);
             },
-            ObjectRef::QUERY(&QUERY { tab, ref value, .. }) => {
+            ObjectRef::QUERY(&QUERY { value, .. }) => {
                 trace!(TYPE "query {:?}", idx);
-                tcx.data.tab = tab;
-                for &v in value {
-                    visitexpr(tcx, v);
-                }
+                tcx.data.tab = ObjRef::GLOBAL;
+                visitexpr(tcx, value.cast());
             },
             _ => {}
         }
@@ -1466,6 +1460,9 @@ fn deannotate(ccx: &mut Ccx<TypeInfer>) {
             if !ann.is_nil() {
                 let ty = ccx.freeze_graph(|ccx| createtype(ccx, ann, scope));
                 ccx.data.sub[tv] = Tv::bound(ty);
+            } else if op == Obj::VAR && ccx.objs[idx.cast::<VAR>()].tab == ObjRef::STATE {
+                // hack: force state vars to FX (TODO: allow non-unit state vars, too)
+                ccx.data.sub[tv] = Tv::unbound(Scope::Global, Some(Primitive::FX.into()));
             }
             trace!(TYPE "{:?} -> {:?} ({:?})", idx, tv, ccx.data.sub[tv].unpack());
         }
@@ -1671,7 +1668,7 @@ fn visitmonoapply(ccx: &mut Ccx<TypeInfer>, apply: ObjRef<APPLY>, callee_generic
     let APPLY { mark, func, .. } = ccx.objs[apply];
     debug_assert!(mark == MARK_MONO);
     let fid: FuncId = zerocopy::transmute!(ccx.objs[func].name);
-    let ngenerics = ctx.func_sub[fid+1].generics - ctx.func_sub[fid].generics;
+    let ngenerics = ctx.func_generic[fid].len();
     let newcallee = match ctx.monotab.entry(
         hashmonofunc(&ctx.sub, ctx.func_generics, callee_generics,
             callee_generics + ngenerics as isize, fid),
@@ -1680,7 +1677,7 @@ fn visitmonoapply(ccx: &mut Ccx<TypeInfer>, apply: ObjRef<APPLY>, callee_generic
                 ctx.mono[id].generics + i as isize) == Some(true)),
         |&id| {
             let mono = &ctx.mono[id];
-            let n = ctx.func_sub[mono.func+1].generics - ctx.func_sub[mono.func].generics;
+            let n = ctx.func_generic[mono.func].len();
             hashmonofunc(&ctx.sub, zerocopy::transmute!(!0), mono.generics,
                 mono.generics + n  as isize, mono.func)
         }
@@ -1802,7 +1799,7 @@ fn monomorphizefuncs(ccx: &mut Ccx<TypeInfer>) {
         let expr = ccx.objs[prototype_obj].expr;
         ccx.data.func_generics = generics;
         if trace!(TYPE) {
-            let ngenerics = ccx.data.func_sub[func+1].generics - ccx.data.func_sub[func].generics;
+            let ngenerics = ccx.data.func_generic[func].len();
             trace!(TYPE "monomorphize {:?}", obj);
             for i in 0..ngenerics as isize {
                 trace!(TYPE "<{}>: {:?}", i, ccx.data.sub[generics+i].unwrap_bound());
@@ -1822,7 +1819,7 @@ fn restorefuncs(ccx: &mut Ccx<TypeInfer>) {
     for fid in index::iter_span(ccx.data.func.end()) {
         let Func { obj, name, .. } = ccx.data.func[fid];
         ccx.objs[obj].name = name;
-        if ccx.data.func_sub[fid+1].generics > ccx.data.func_sub[fid].generics {
+        if !ccx.data.func_generic[fid].is_empty() {
             ccx.objs[obj].op = Obj::FPROT;
         }
     }
@@ -1849,7 +1846,6 @@ impl Stage for TypeInfer {
             func_generic: Default::default(),
             func_con: Default::default(),
             func: Default::default(),
-            func_sub: Default::default(),
             tobj: Default::default(),
             monotab: Default::default(),
             mono: Default::default(),

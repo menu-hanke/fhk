@@ -10,7 +10,7 @@ use enumset::EnumSetType;
 
 use crate::bitmap::BitmapWord;
 use crate::bump::{BumpPtr, BumpRef, BumpVec};
-use crate::compile::{self, Ccx};
+use crate::compile::{self, Ccx, FFIError};
 use crate::dl::{self, LibBox};
 use crate::emit::{cast_values, irt2cl, Ecx, InsValue, NATIVE_CALLCONV};
 use crate::index::InvalidValue;
@@ -726,10 +726,12 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
                         ccx.tmp.write(libname);
                         ccx.tmp.push(0u8);
                         let Some(handle) = dl::open(&ccx.tmp[tmp_base..]) else {
-                            ccx.host.buf.clear();
-                            ccx.host.buf.write("failed to load library: `");
-                            ccx.host.buf.write(libname);
-                            ccx.host.buf.write("'");
+                            ccx.host.set_error(
+                                format_args!(
+                                    "failed to load library: `{}'",
+                                    FFIError::from_bytes(libname)
+                                )
+                            );
                             return Err(());
                         };
                         libs.push((lib, handle));
@@ -740,12 +742,11 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
                 ccx.tmp.truncate(tmp_base);
                 ccx.tmp.write(symname);
                 ccx.tmp.push(0u8);
-                let fp = handle.sym(unsafe { CStr::from_bytes_with_nul_unchecked(&ccx.tmp[tmp_base..]) });
+                let fp = handle.sym(
+                    unsafe { CStr::from_bytes_with_nul_unchecked(&ccx.tmp[tmp_base..]) });
                 if fp.is_null() {
-                    ccx.host.buf.clear();
-                    ccx.host.buf.write("undefined symbol: `");
-                    ccx.host.buf.write(symname);
-                    ccx.host.buf.write("'");
+                    ccx.host.set_error(
+                        format_args!("undefined symbol: `{}'", FFIError::from_bytes(symname)));
                     return Err(());
                 }
                 let fp = ccx.intern.intern(&(fp as u64));
@@ -755,7 +756,7 @@ fn loadsyms(ccx: &mut Ccx) -> compile::Result {
     }
     ccx.tmp.truncate(tmp_base);
     for (_, handle) in libs {
-        ccx.fin.push(handle);
+        ccx.image.fin.push(handle);
     }
     Ok(())
 }
