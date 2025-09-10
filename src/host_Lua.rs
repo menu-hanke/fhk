@@ -305,6 +305,8 @@ typedef struct {
 typedef struct {
     uint32_t mcode;
     uint32_t params_end;
+    uint32_t vmctx_start;
+    uint32_t vmctx_end;
 } fhk_Query;
 
 typedef struct {

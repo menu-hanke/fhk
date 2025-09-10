@@ -453,11 +453,10 @@ local function newparam(check, value, var)
 	local vbyte = decodeslot(value)
 	local ctype = ann2ct(var)
 	local buf = buffer.new()
-	buf:put("local ffi_cast, band, bor, ctptr = require('ffi').cast, bit.band, bit.bor, ...\n")
+	buf:put("local ffi_cast, bor, ctptr = require('ffi').cast, bit.bor, ...\n")
 	buf:put("return function(instance, params)\n")
 	buf:putf("local value = params['%s']\n", var.name)
-	buf:putf("if value == nil then instance[%d] = band(instance[%d], %d) return end\n",
-		cbyte, cbyte, bit.band(0xff, bit.bnot(bit.lshift(1, cbit))))
+	buf:put("if value == nil then return end\n")
 	buf:putf("instance[%d] = bor(instance[%d], %d)\n", cbyte, cbyte, bit.lshift(1, cbit))
 	if ctype then
 		if var.ann.op == "TPRI" then
@@ -502,7 +501,7 @@ end
 
 local query_mt = { __call = query__call }
 
-local function compilequery(mcode, ty, params)
+local function compilequery(mcode, ty, params, vmctx_start, vmctx_end)
 	local buf = buffer.new()
 	buf:put("struct {\n")
 	local ctargs = {}
@@ -513,7 +512,7 @@ local function compilequery(mcode, ty, params)
 	buf:put("}")
 	local ctype = ffi.typeof(buf:get(), unpack(ctargs))
 	ffi.metatype(ctype, {__index = { unpack = queryunpack(#ty.elems) }})
-	buf:put("local ctype, vmcall")
+	buf:put("local ffi_fill, ctype, vmcall")
 	local pf = {}
 	local minofs, maxofs = math.huge, 0
 	for i,p in ipairs(params) do
@@ -523,13 +522,16 @@ local function compilequery(mcode, ty, params)
 		maxofs = math.max(maxofs, p.cbyte)
 	end
 	buf:put("= ...\nreturn function(instance, params, res)\n")
+	if vmctx_end > vmctx_start then
+		buf:putf("ffi_fill(instance+%d, %d)\n", vmctx_start, vmctx_end-vmctx_start)
+	end
 	for i=1, #params do
 		buf:putf("setparam%d(instance, params)\n", i)
 	end
 	buf:put("if not res then res = ctype() end\n")
 	buf:putf("return vmcall(res, %dull, instance)\n", mcode)
 	buf:put("end\n")
-	local exec = load(buf)(ctype, vmcall, unpack(pf))
+	local exec = load(buf)(ffi.fill, ctype, vmcall, unpack(pf))
 	return setmetatable({
 		exec = exec,
 		ctype = ctype,
@@ -567,7 +569,8 @@ local function graph_compile(graph)
 			table.insert(qparm, params[result.query_params[j]])
 		end
 		params_start = rq.params_end
-		image[string.format("q%d", i)] = compilequery(result.mcode+rq.mcode, q.value.ann, qparm)
+		image[string.format("q%d", i)] = compilequery(result.mcode+rq.mcode, q.value.ann, qparm,
+			rq.vmctx_start, rq.vmctx_end)
 	end
 	return image
 end

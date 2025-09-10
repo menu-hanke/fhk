@@ -158,6 +158,8 @@ pub struct Param {
 pub struct Query {
     pub mcode: MCodeOffset,
     pub params_end: u32,
+    pub vmctx_start: u32,
+    pub vmctx_end: u32
 }
 
 #[derive(Default)]

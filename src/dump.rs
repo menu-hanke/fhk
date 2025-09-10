@@ -14,7 +14,7 @@ use crate::image::ImageBuilder;
 use crate::index::{self, IndexSlice};
 use crate::intern::{Intern, Interned};
 use crate::ir::{DebugFlag, DebugSource, Func, FuncId, FuncKind, Ins, InsId, OperandData, PhiId, Type, IR};
-use crate::mem::{Chunk, Offset, Reset};
+use crate::mem::{Chunk, Offset, Reset, ResetId};
 use crate::obj::{FieldType, ObjRef, ObjectRef, Objects, Operator, FUNC, MOD, TAB, VAR, VSET};
 use crate::parser::{stringify, SequenceType};
 use crate::trace::trace;
@@ -264,8 +264,14 @@ pub fn dump_layout(ccx: &mut Ccx) {
         ccx.tmp.push(b'[');
         for (rid, &Reset { mask }) in ccx.layout.resets.pairs() {
             if mask.test(id-1) {
-                let ridx: usize = rid.into();
-                write!(ccx.tmp, "{ridx:^3}").unwrap();
+                if rid == ResetId::QUERY {
+                    // zero is a pseudo-reset that resets all breakpoints and does not correspond
+                    // to any state variable
+                    ccx.tmp.write(" * ");
+                } else {
+                    let ridx: usize = rid.into();
+                    write!(ccx.tmp, "{ridx:^3}").unwrap();
+                }
             } else {
                 ccx.tmp.write("   ");
             }
@@ -289,39 +295,52 @@ pub fn dump_layout(ccx: &mut Ccx) {
         let reset = Bitmap::from_words(&ccx.intern[func.reset]);
         for rid in index::iter_span(ccx.layout.resets.end()) {
             if reset.test(rid) {
-                let ridx: usize = rid.into();
-                write!(ccx.tmp, "{ridx:^3}").unwrap();
+                if rid == ResetId::QUERY {
+                    ccx.tmp.write(" q ");
+                } else {
+                    let ridx: usize = rid.into();
+                    write!(ccx.tmp, "{ridx:^3}").unwrap();
+                }
             } else {
                 ccx.tmp.write("   ");
             }
         }
-        write!(ccx.tmp, "] {:?}\n", func.scl).unwrap();
-        if let FuncKind::Chunk(cid) = func.kind {
-            let Chunk { check, slots, .. } = ccx.layout.chunks[cid];
-            let mut r: PhiId = 0.into();
-            loop {
-                let start = ccx.tmp.end().index();
-                let ofs = if r == func.ret {
-                    ccx.tmp.write("(check)");
-                    check
-                } else {
-                    let ty = func.phis.at(r).type_;
-                    if ty == Type::FX {
-                        r += 1;
-                        continue;
+        match func.kind {
+            FuncKind::User => {
+                ccx.tmp.write("]\n");
+            },
+            FuncKind::Query(qid) => {
+                let query = &ccx.layout.queries[qid];
+                write!(ccx.tmp, "] {}..{}\n", query.vmctx_start, query.vmctx_end).unwrap();
+            },
+            FuncKind::Chunk(cid) => {
+                write!(ccx.tmp, "] {:?}\n", func.scl).unwrap();
+                let Chunk { check, slots, .. } = ccx.layout.chunks[cid];
+                let mut r: PhiId = 0.into();
+                loop {
+                    let start = ccx.tmp.end().index();
+                    let ofs = if r == func.ret {
+                        ccx.tmp.write("(check)");
+                        check
+                    } else {
+                        let ty = func.phis.at(r).type_;
+                        if ty == Type::FX {
+                            r += 1;
+                            continue;
+                        }
+                        let phi: usize = r.into();
+                        write!(ccx.tmp, "#{} {}", phi, ty.name()).unwrap();
+                        ccx.perm[slots.elem(r)]
+                    };
+                    let end = ccx.tmp.end().index();
+                    if end < start+LAYOUT_MARGIN_WIDTH {
+                        write!(ccx.tmp, "{:.<1$} ", " ", start+LAYOUT_MARGIN_WIDTH-1-end).unwrap();
                     }
-                    let phi: usize = r.into();
-                    write!(ccx.tmp, "#{} {}", phi, ty.name()).unwrap();
-                    ccx.perm[slots.elem(r)]
-                };
-                let end = ccx.tmp.end().index();
-                if end < start+LAYOUT_MARGIN_WIDTH {
-                    write!(ccx.tmp, "{:.<1$} ", " ", start+LAYOUT_MARGIN_WIDTH-1-end).unwrap();
+                    write!(ccx.tmp, "{:10} {:?}\n", segname(&ccx.image, ofs.byte(), prevofs), ofs)
+                        .unwrap();
+                    if r == func.ret { break }
+                    r += 1;
                 }
-                write!(ccx.tmp, "{:10} {:?}\n", segname(&ccx.image, ofs.byte(), prevofs), ofs)
-                    .unwrap();
-                if r == func.ret { break }
-                r += 1;
             }
         }
     }

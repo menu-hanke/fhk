@@ -12,7 +12,7 @@ use crate::image::{BreakpointId, Instance};
 use crate::index::{self, index, IndexSlice, IndexVec, InvalidValue};
 use crate::intern::Interned;
 use crate::ir::{Func, FuncId, FuncKind, Opcode, Type};
-use crate::mem::{BitOffset, Chunk, Offset, ParamId, QueryId, ResetId, SizeClass};
+use crate::mem::{BitOffset, Chunk, Offset, ParamId, Query, QueryId, ResetId, SizeClass};
 use crate::support::DynSlot;
 use crate::trace::trace;
 use crate::typestate::Absent;
@@ -296,24 +296,15 @@ fn layoutreset(
     cursor.byte()
 }
 
-fn qalloc_new(
-    ccx: &mut Ccx<ComputeLayout>,
-    cursor: Offset
-) -> BumpRef<IndexSlice<QueryId, BitOffset>> {
-    // create at least 1 cursor, even if there are no queries, so that the allocator doesn't
-    // crash when no queries are defined
-    ccx.tmp.extend(repeat_n(BitOffset::new_byte(cursor),
-       max(ccx.layout.queries.raw.len(), 1))).cast()
-}
-
 fn qalloc_put(
     tmp: &mut BumpPtr,
+    queries: &mut IndexSlice<QueryId, Query>,
     cursors: BumpRef<IndexSlice<QueryId, BitOffset>>,
     size: Offset,
     sty: SlotType,
-    queries: &Bitmap<QueryId>
+    quse: &Bitmap<QueryId>
 ) -> BitOffset {
-    let pos = queries
+    let pos = quse
         .ones()
         .map(|qid| {
             let pos = tmp[cursors.elem(qid)];
@@ -326,14 +317,13 @@ fn qalloc_put(
         .max()
         .unwrap();
     let end = match sty { SlotType::Data => pos.next_byte(size), _ => pos.next_bit() };
-    for q in queries {
+    for q in quse {
+        if queries[q].vmctx_start == 0 {
+            queries[q].vmctx_start = pos.byte();
+        }
         tmp[cursors.elem(q)] = end;
     }
     pos
-}
-
-fn qalloc_end(tmp: &BumpPtr, cursors: BumpRef<IndexSlice<QueryId, BitOffset>>) -> Offset {
-    tmp[cursors.base()..].iter().map(|cursor| cursor.byte()).max().unwrap()
 }
 
 fn layoutquery(
@@ -342,22 +332,16 @@ fn layoutquery(
     cursor: Offset
 ) -> Offset {
     let base = ccx.tmp.end();
-    let cursors = qalloc_new(ccx, cursor);
+    // create at least 1 cursor, even if there are no queries, so that the allocator doesn't
+    // crash when no queries are defined
+    let cursors = ccx.tmp.extend(repeat_n(BitOffset::new_byte(cursor),
+       max(ccx.layout.queries.raw.len(), 1))).cast();
     for pid in bump::iter_range(order) {
         let id = ccx.tmp[pid];
         let SlotDef { owner, size, sty, .. } = ccx.data.slots[id];
-        ccx.data.slots[id].loc = qalloc_put(&mut ccx.tmp, cursors, size as _, sty,
-            &ccx.data.func_quse[owner]);
+        ccx.data.slots[id].loc = qalloc_put(&mut ccx.tmp, &mut ccx.layout.queries, cursors,
+            size as _, sty, &ccx.data.func_quse[owner]);
     }
-    let end = qalloc_end(&ccx.tmp, cursors);
-    ccx.tmp.truncate(base);
-    (end + 7) & !7
-}
-
-fn layoutparams(ccx: &mut Ccx<ComputeLayout>, cursor: Offset) -> Offset {
-    let base = ccx.tmp.end();
-    let cursors = qalloc_new(ccx, cursor);
-    let cursors_end = ccx.tmp.end();
     #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
     struct ParamDef {
         id: ParamId,
@@ -377,8 +361,8 @@ fn layoutparams(ccx: &mut Ccx<ComputeLayout>, cursor: Offset) -> Offset {
     ccx.tmp[params..].sort_unstable_by_key(|p| (!p.pop, !p.size));
     for pd in bump::iter_range(params..ccx.tmp.end().cast()) {
         let ParamDef { id, size, .. } = ccx.tmp[pd];
-        let loc = qalloc_put(&mut ccx.tmp, cursors, if size == 0xffff { 1 } else { size as _ },
-            SlotType::Data, &ccx.data.param_quse[id]);
+        let loc = qalloc_put(&mut ccx.tmp, &mut ccx.layout.queries, cursors,
+            if size == 0xffff { 1 } else { size as _ }, SlotType::Data, &ccx.data.param_quse[id]);
         let param = &mut ccx.layout.params[id];
         if size == 0xffff {
             param.check = loc;
@@ -386,8 +370,15 @@ fn layoutparams(ccx: &mut Ccx<ComputeLayout>, cursor: Offset) -> Offset {
             param.value = loc;
         }
     }
-    ccx.tmp.truncate(cursors_end);
-    let end = qalloc_end(&ccx.tmp, cursors);
+    let cursors = ccx.tmp.get_dst(cursors, ccx.layout.queries.raw.len());
+    let mut end = 0;
+    for (query,&cursor) in zip(&mut ccx.layout.queries.raw, &cursors.raw) {
+        let qend = cursor.align_byte(1).byte();
+        end = max(end, qend);
+        if query.vmctx_start > 0 {
+            query.vmctx_end = qend;
+        }
+    }
     ccx.tmp.truncate(base);
     (end + 7) & !7
 }
@@ -459,8 +450,6 @@ impl Stage for ComputeLayout {
             cursor);
         trace!(MEM "{} query slots, start {}", segn[2], cursor);
         cursor = layoutquery(ccx, slots_start.add(segn[0]+segn[1])..slots_end, cursor);
-        trace!(MEM "query params start {}", cursor);
-        cursor = layoutparams(ccx, cursor);
         trace!(MEM "image size: {}", cursor);
         ccx.image.size = cursor as _;
         saveslots(ccx);
