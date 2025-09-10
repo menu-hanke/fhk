@@ -107,6 +107,7 @@ fn computequse(ccx: &mut Ccx<ComputeLayout>) {
         swap(f, g);
     }
     ccx.data.func_quse.solve(constraints);
+    // collect query parameters
     for (qid,&fid) in ccx.tmp.get_dst(query_func, ccx.layout.queries.raw.len()).pairs() {
         let puse = &func_puse[fid];
         for p in puse {
@@ -114,6 +115,34 @@ fn computequse(ccx: &mut Ccx<ComputeLayout>) {
             ccx.layout.query_params.push(p);
         }
         ccx.layout.queries[qid].params_end = ccx.layout.query_params.len() as _;
+    }
+    // demote functions to query-dependent if:
+    // (1) the function is only called by one query; and
+    // (2) the function has the exact same reset set as the query; and
+    // (3) the query has no parameters
+    let tmp_words = (ccx.layout.resets.raw.len() + BitmapWord::BITS - 1) / BitmapWord::BITS;
+    let (tmp_bitmap, _) = ccx.tmp.reserve_dst::<[BitmapWord<ResetId>]>(tmp_words);
+    for (fid,queries) in ccx.data.func_quse.pairs() {
+        let func = &ccx.ir.funcs[fid];
+        if matches!(func.kind, FuncKind::Chunk(_)) && queries.popcount() == 1 {
+            let qfid = ccx.tmp[query_func.elem(queries.ffs().unwrap())];
+            if func.reset == ccx.ir.funcs[qfid].reset {
+                let tmp_bitmap = ccx.tmp.get_dst_mut(tmp_bitmap, tmp_words);
+                tmp_bitmap.copy_from_slice(&ccx.intern[func.reset]);
+                tmp_bitmap[0].set(ResetId::QUERY);
+                ccx.ir.funcs[fid].reset = ccx.intern.intern(tmp_bitmap);
+            }
+        }
+    }
+    for qid in index::iter_span(ccx.layout.queries.end()) {
+        let func = &mut ccx.ir.funcs[ccx.tmp[query_func.elem(qid)]];
+        let reset = &ccx.intern[func.reset];
+        if !reset[0].test(ResetId::QUERY) {
+            let tmp_bitmap = ccx.tmp.get_dst_mut(tmp_bitmap, tmp_words);
+            tmp_bitmap.copy_from_slice(reset);
+            tmp_bitmap[0].set(ResetId::QUERY);
+            func.reset = ccx.intern.intern(tmp_bitmap);
+        }
     }
     ccx.tmp.truncate(base);
 }
