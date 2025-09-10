@@ -455,7 +455,7 @@ local function newparam(check, value, var)
 	local buf = buffer.new()
 	buf:put("local ffi_cast, bor, ctptr = require('ffi').cast, bit.bor, ...\n")
 	buf:put("return function(instance, params)\n")
-	buf:putf("local value = params['%s']\n", var.name)
+	buf:putf("local value = params and params['%s']\n", var.name)
 	buf:put("if value == nil then return end\n")
 	buf:putf("instance[%d] = bor(instance[%d], %d)\n", cbyte, cbyte, bit.lshift(1, cbit))
 	if ctype then
