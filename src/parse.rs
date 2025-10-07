@@ -11,7 +11,7 @@ use crate::compile::{self, FFIError};
 use crate::intern::Interned;
 use crate::lang::Lang;
 use crate::lex::Token;
-use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LEN, LET, LGET, LOAD, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, LookupEntry, Obj, ObjRef, ObjectRef, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KINT, LET, LGET, MOD, PGET, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::parser::{check, consume, defmacro, next, parse_name, parse_name_pattern, pushmacro, require, save, DefinitionError, DefinitionErrorType, SyntaxError, Namespace, ParenCounter, Pcx, TokenError};
 use crate::typing::Primitive;
 
@@ -95,9 +95,8 @@ fn parse_vref(pcx: &mut Pcx) -> compile::Result<ObjRef<VAR>> {
     Ok(refvar(pcx, tab, name))
 }
 
-fn builtincall(pcx: &mut Pcx, name: Interned<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<EXPR>> {
+fn builtincall(pcx: &mut Pcx, name: Interned<[u8]>, base: BumpRef<u8>) -> Option<ObjRef<INTR>> {
     const IDENT: u8 = Token::Ident as _;
-    const INT: u8 = Token::Int as _;
     const APOSTROPHE: u8 = Token::Apostrophe as _;
     const LCURLY: u8 = Token::LCurly as _;
     const RCURLY: u8 = Token::RCurly as _;
@@ -105,40 +104,26 @@ fn builtincall(pcx: &mut Pcx, name: Interned<[u8]>, base: BumpRef<u8>) -> Option
     let stem: [u8; 4] = name[1..5].try_into().unwrap();
     let stem: Interned<[u8]> = zerocopy::transmute!(stem);
     let stem: &[u8] = &pcx.intern[stem];
-    let args: &[ObjRef<EXPR>] = &pcx.tmp[base.cast_up()..];
-    if let Some(intrin) = Intrinsic::from_func(stem) {
-        return match rest.is_empty() {
-            true => Some(pcx.objs.push_args::<INTR>(INTR::new(intrin as _, ObjRef::NIL), args)
-                .cast()),
-            false => None
-        };
-    }
-    // TODO: this needs some cleanup
-    match stem {
-        b"load" => {
-            let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
-            let ty: [u8; 4] = tail[3..7].try_into().unwrap();
-            let ty: Interned<[u8]> = zerocopy::transmute!(ty);
-            let pri = pcx.objs.push(TPRI::new(Primitive::from_name(&pcx.intern[ty])? as u8)).erase();
-            let ann = match args.len() {
+    let intr = Intrinsic::from_stem(stem)?;
+    let mut ann = ObjRef::NIL;
+    if intr == Intrinsic::LOAD {
+        let tail @ [APOSTROPHE, LCURLY, IDENT, _, _, _, _, RCURLY] = rest else { return None };
+        let ty: [u8; 4] = tail[3..7].try_into().unwrap();
+        let ty: Interned<[u8]> = zerocopy::transmute!(ty);
+        let pri = pcx.objs.push(TPRI::new(Primitive::from_name(&pcx.intern[ty])? as u8))
+            .erase();
+        ann = match pcx.tmp.end().cast::<ObjRef<EXPR>>().index()
+            - base.cast_up::<ObjRef<EXPR>>().index()
+            {
                 1 => pri,
                 n => pcx.objs.push(TTEN::new(n as u8 - 1, pri)).erase()
             };
-            // TODO: allow some special syntax eg. `_` here to elide the size when returning
-            // a full table variable.
-            Some(pcx.objs.push_args::<LOAD>(LOAD::new(ann, args[0]), &args[1..]).cast())
-        },
-        b"len" => {
-            let dim: u32 = match rest {
-                &[] => 0,
-                &[APOSTROPHE, LCURLY, INT, x0, x1, x2, x3, RCURLY] =>
-                    zerocopy::transmute!([x0, x1, x2, x3]),
-                _ => return None
-            };
-            Some(pcx.objs.push(LEN::new(dim as _, ObjRef::NIL, args[0])).cast())
-        },
-        _ => None
+        // TODO: allow some special syntax eg. `_` here to elide the size when returning
+        // a full table variable.
+    } else if !rest.is_empty() {
+        return None
     }
+    Some(pcx.objs.push_args(INTR::new(intr as _, ann), &pcx.tmp[base.cast_up()..]))
 }
 
 fn usercall(
@@ -159,9 +144,8 @@ fn parse_apply(pcx: &mut Pcx, name: Interned<[u8]>) -> compile::Result<ObjRef<EX
         if !check(pcx, Token::Comma)? { break }
     }
     consume(pcx, Token::RParen)?;
-    // TODO: remove the builtin check here, and make then normal functions
     let expr = match builtincall(pcx, name, base) {
-        Some(expr) => expr,
+        Some(expr) => expr.cast(),
         None => usercall(pcx, name, base.cast_up()).cast()
     };
     pcx.tmp.truncate(base);

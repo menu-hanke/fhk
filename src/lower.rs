@@ -17,7 +17,7 @@ use crate::index::{self, index, IndexOption, IndexVec, InvalidValue};
 use crate::ir::{DebugFlag, DebugSource, Func, FuncId, Ins, InsId, Opcode, Phi, PhiId, Type, IR};
 use crate::lang::Lang;
 use crate::mem::{BitOffset, Param, ParamId, QueryId, ResetId, SizeClass};
-use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, KSTR, LEN, LET, LGET, LOAD, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, VAR, VGET, VSET};
+use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, KSTR, LET, LGET, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::relation::Relation;
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
@@ -1212,7 +1212,7 @@ impl<'b> Visit<'_, 'b> {
 fn isnoniterable(op: u8) -> bool {
     use Operator::*;
     // TODO: make LET/LGET iterable
-    (CAT|LET|LGET|APPLY|PGET|LOAD|CALL).as_u64_truncated() & (1 << op) != 0
+    (CAT|LET|LGET|APPLY|PGET|CALL).as_u64_truncated() & (1 << op) != 0
 }
 
 fn alwaysmaterialize(op: u8) -> bool {
@@ -1258,10 +1258,6 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         Obj::KINT|Obj::KINT64|Obj::KFP64|Obj::KSTR => {
             visit.unwrap_materialize().value = emitk(lcx, expr)
         },
-        Obj::LEN => {
-            let slot = visit.unwrap_materialize();
-            slot.value = emitlen(lcx, expr.cast(), &mut slot.ctr);
-        },
         Obj::LET => visitlet(lcx, expr.cast(), visit),
         Obj::LGET => visitlget(lcx, expr.cast(), visit),
         Obj::VGET => visitvget(lcx, expr.cast(), visit),
@@ -1271,7 +1267,6 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         Obj::IDX => todo!(),
         Obj::BINOP => visitbinop(lcx, expr.cast(), visit),
         Obj::INTR => visitintrinsic(lcx, expr.cast(), visit),
-        Obj::LOAD => visitload(lcx, expr.cast(), visit),
         Obj::NEW => visitnew(lcx, expr.cast(), visit),
         Obj::TGET => visittget(lcx, expr.cast(), visit.unwrap_materialize()),
         Obj::CALL => visitcallx(lcx, expr.cast(), visit),
@@ -1434,11 +1429,6 @@ fn emitk(lcx: &mut Lcx, expr: ObjRef<EXPR>) -> InsId {
 fn emitdim(lcx: &mut Lcx, axis: usize) -> InsId {
     let source = lcx.data.tab_axes[lcx.data.tab].len();
     axisidx(lcx, lcx.data.tab, source as _, (axis+1) as _, INS_FLATIDX)
-}
-
-fn emitlen(lcx: &mut Lcx, expr: ObjRef<LEN>, ctr: &mut InsId) -> InsId {
-    let LEN { axis, value, .. } = lcx.objs[expr];
-    emitexprs(lcx, value, ctr) + axis as isize
 }
 
 fn visitlet(lcx: &mut Lcx, let_: ObjRef<LET>, mut visit: Visit) {
@@ -2451,6 +2441,38 @@ fn emitscalarbinop(
     }
 }
 
+fn emitscalarintrinsic(lcx: &mut Lcx, intr: Intrinsic, arg: InsId, ty: Type) -> InsId {
+    use Intrinsic::*;
+    match intr {
+        UNM|NOT => lcx.data.func.code.push(Ins::NEG(ty, arg)),
+        EXP     => todo!(),
+        LOG     => todo!(),
+        _       => unreachable!()
+    }
+}
+
+fn visitbroadcastintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit) {
+    let INTR { ann, func, args: [arg], .. } = lcx.objs[expr] else { unreachable!() };
+    match visit.reborrow_mut() {
+        Visit::Materialize(slot) if lcx.objs[ann].op == Obj::TTEN => {
+            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
+        },
+        Visit::Materialize(slot) => {
+            let v = emitexprv(lcx, arg, &mut slot.ctr);
+            slot.value = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
+                Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty).to_ir());
+        },
+        Visit::Iterate(iter) => {
+            let v = emitexpri(lcx, arg, &mut iter.loop_, iter.shape.as_mut());
+            iter.element = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
+                elementtype(&lcx.objs, ann).to_ir());
+        },
+        Visit::Shape(_) | Visit::None(_) => {
+            visitexpr(lcx, arg, visit);
+        }
+    }
+}
+
 fn visitbinop(lcx: &mut Lcx, expr: ObjRef<BINOP>, visit: Visit) {
     let objs = Access::borrow(&lcx.objs);
     let BINOP { binop, ann, left, right, .. } = objs[expr];
@@ -2482,38 +2504,6 @@ fn visitbinop(lcx: &mut Lcx, expr: ObjRef<BINOP>, visit: Visit) {
         Visit::None(ctr) => {
             visitexpr(lcx, left, Visit::None(ctr));
             visitexpr(lcx, right, Visit::None(ctr));
-        }
-    }
-}
-
-fn emitscalarintrinsic(lcx: &mut Lcx, intr: Intrinsic, arg: InsId, ty: Type) -> InsId {
-    use Intrinsic::*;
-    match intr {
-        UNM|NOT => lcx.data.func.code.push(Ins::NEG(ty, arg)),
-        EXP     => todo!(),
-        LOG     => todo!(),
-        _       => unreachable!()
-    }
-}
-
-fn visitbroadcastintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit) {
-    let INTR { ann, func, args: [arg], .. } = lcx.objs[expr] else { unreachable!() };
-    match visit.reborrow_mut() {
-        Visit::Materialize(slot) if lcx.objs[ann].op == Obj::TTEN => {
-            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
-        },
-        Visit::Materialize(slot) => {
-            let v = emitexprv(lcx, arg, &mut slot.ctr);
-            slot.value = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
-                Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty).to_ir());
-        },
-        Visit::Iterate(iter) => {
-            let v = emitexpri(lcx, arg, &mut iter.loop_, iter.shape.as_mut());
-            iter.element = emitscalarintrinsic(lcx, Intrinsic::from_u8(func), v,
-                elementtype(&lcx.objs, ann).to_ir());
-        },
-        Visit::Shape(_) | Visit::None(_) => {
-            visitexpr(lcx, arg, visit);
         }
     }
 }
@@ -2687,30 +2677,9 @@ fn visiteffect(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit) {
     }
 }
 
-// TODO: split these into their own nodes?
-fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+fn visitload(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
     let objs = Access::borrow(&lcx.objs);
-    let &INTR { ann, func, ref args, .. } = &objs[expr];
-    let func = Intrinsic::from_u8(func);
-    match func {
-        Intrinsic::UNM | Intrinsic::NOT | Intrinsic::EXP | Intrinsic::LOG => {
-            visitbroadcastintrinsic(lcx, expr, visit);
-        },
-        Intrinsic::SUM | Intrinsic::ANY | Intrinsic::ALL => {
-            let &[arg] = args else { unreachable!() };
-            let ObjectRef::TPRI(&TPRI { ty, .. }) = objs.get(ann) else { unreachable!() };
-            visitreduceintrinsic(lcx, func, Primitive::from_u8(ty).to_ir(), arg, visit);
-        },
-        Intrinsic::WHICH => visitwhich(lcx, expr, visit),
-        Intrinsic::CONV => todo!(),
-        Intrinsic::REP => todo!(),
-        Intrinsic::EFFECT => visiteffect(lcx, expr, visit),
-    }
-}
-
-fn visitload(lcx: &mut Lcx, expr: ObjRef<LOAD>, visit: Visit) {
-    let objs = Access::borrow(&lcx.objs);
-    let &LOAD { ann, addr, ref shape, .. } = &objs[expr];
+    let &INTR { ann, args: [addr, ref shape@..], .. } = &objs[expr] else { unreachable!() };
     let is_materialize = visit.is_materialize();
     match visit {
         Visit::Materialize(slot) if shape.is_empty() => {
@@ -2737,7 +2706,49 @@ fn visitload(lcx: &mut Lcx, expr: ObjRef<LOAD>, visit: Visit) {
                 lcx.data.func.code.set(nums + i as isize, Ins::MOV(IRT_IDX, ev));
             }
         },
-        _ => unreachable!() // short-circuited in emitexpr
+        Visit::Iterate(iter) => {
+            iter.element = emitexprmi(lcx, expr.cast(), &mut iter.loop_, iter.shape.as_mut());
+        }
+        Visit::None(_) => unreachable!() // short-circuited in emitexpr
+    }
+}
+
+fn visitlen(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit)  {
+    let args = &lcx.objs[expr].args;
+    let expr = args[0];
+    let axis = match args.get(1) {
+        Some(&kint) => {
+            let ObjectRef::KINT(&KINT { k, .. }) = lcx.objs.get(kint.erase())
+                else { unreachable!() /* TODO: check earlier and raise if not constant */ };
+            k
+        },
+        None => 0
+    };
+    let slot = visit.unwrap_materialize();
+    slot.value = emitexprs(lcx, expr, &mut slot.ctr) + axis as isize;
+}
+
+// TODO: split these into their own nodes?
+fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+    use Intrinsic::*;
+    let objs = Access::borrow(&lcx.objs);
+    let &INTR { ann, func, ref args, .. } = &objs[expr];
+    let func = Intrinsic::from_u8(func);
+    match func {
+        UNM | EXP | LOG | NOT => {
+            visitbroadcastintrinsic(lcx, expr, visit);
+        },
+        ANY | ALL | SUM => {
+            let &[arg] = args else { unreachable!() };
+            let ObjectRef::TPRI(&TPRI { ty, .. }) = objs.get(ann) else { unreachable!() };
+            visitreduceintrinsic(lcx, func, Primitive::from_u8(ty).to_ir(), arg, visit);
+        },
+        CONV => todo!(),
+        LEN => visitlen(lcx, expr, visit),
+        LOAD => visitload(lcx, expr, visit),
+        REP => todo!(),
+        EFFECT => visiteffect(lcx, expr, visit),
+        WHICH => visitwhich(lcx, expr, visit),
     }
 }
 

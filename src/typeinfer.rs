@@ -16,7 +16,7 @@ use crate::compile::{self, Ccx, Stage};
 use crate::dump::trace_objs;
 use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intern::Interned;
-use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LEN, LET, LGET, LOAD, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
+use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LET, LGET, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::relation::Relation;
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
@@ -445,6 +445,8 @@ fn unifytt(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: Ty) {
             unifyvt(sub, base, a);
             unifyvt(sub, base+1, Ty::UNIT);
         },
+        (Constructor(self::Constructor::Never, _), _)
+            | (_, Constructor(self::Constructor::Never, _)) => { /* ok */ },
         _ => {
             // TODO: type error
             todo!()
@@ -1049,6 +1051,18 @@ fn indextuple(sub: &mut IndexVec<TypeVar, Tv>, mut ty: Ty, mut field: usize) -> 
     }
 }
 
+fn unpackvarg(sub: &mut IndexVec<TypeVar, Tv>, args: &[Ty]) -> Ty {
+    match args {
+        [] => Ty::NEVER,
+        &[first, ref rest@..] => {
+            for &r in rest {
+                unifytt(sub, first, r);
+            }
+            first
+        }
+    }
+}
+
 // TODO: replace this with generic functions
 macro_rules! instantiate {
     (@type pri $v:expr ; $($_:tt)*) => {
@@ -1056,9 +1070,6 @@ macro_rules! instantiate {
     };
     (@type $con:ident $($t:expr)+ ; $tcx:expr) => {
         newcontype(&mut $tcx.data.sub, Constructor::$con, &[$($t),+])
-    };
-    (@type Unit ; $($_:tt)*) => {
-        Ty::UNIT
     };
     (@type $v:tt ; $($_:tt)*) => {
         $v
@@ -1068,6 +1079,7 @@ macro_rules! instantiate {
         $scope:expr,
         $args:expr;
         $($unpack:ident)*
+        $(...$varg:ident)?
         $(, $($new:ident $([$bound:expr])? )*)?
         $(
             ::
@@ -1076,7 +1088,9 @@ macro_rules! instantiate {
         =>
         $($ret:tt)*
     ) => {{
-        let &[ $($unpack),* ] = $args else { unreachable!() };
+        let &[ $($unpack,)* $(ref $varg@..)? ] = $args
+            else { unreachable!() /* TODO: should be type error */ };
+        $(let $varg = unpackvarg(&mut $tcx.data.sub, $varg);)?
         $(
             $(
                 let $new = Ty::link(
@@ -1113,25 +1127,17 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
     macro_rules! I { ($($t:tt)*) => { instantiate!(tcx, scope, aty; $($t)*) }; }
     let ty = match func {
         UNM | EXP | LOG => I!(a,e[PRI_NUM] n :: a[Tensor e n] => a),
+        ALL | ANY => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => pri Primitive::B1),
+        CONV => I!(a,b e n :: a[Tensor e n] => Tensor b n),
+        EFFECT => I!(a ...b :: b[pri Primitive::FX] => a),
+        LEN => I!(_a ...b :: b[pri PRI_IDX] => pri PRI_IDX),
+        LOAD => I!(p ...s,r :: p[pri Primitive::PTR], s[pri PRI_IDX] => r),
         NOT => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => a),
+        REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
         SUM => I!(a,e[PRI_NUM] n :: a[Tensor e n] => e),
         // TODO (?): generalize WHICH to return tuples.
         WHICH => I!(a :: a[Tensor Ty::primitive(Primitive::B1) Ty::V1D]
             => Tensor Ty::primitive(PRI_IDX) Ty::V1D),
-        ANY | ALL => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => pri Primitive::B1),
-        CONV => I!(a,b e n :: a[Tensor e n] => Tensor b n),
-        REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
-        EFFECT => {
-            // TODO: proper varargs support, for intrinsics at least
-            if let &[a, ref effects @ ..] = aty {
-                for &e in effects {
-                    unifytt(&mut tcx.data.sub, e, Ty::primitive(Primitive::FX));
-                }
-                a
-            } else {
-                Ty::primitive(Primitive::FX)
-            }
-        }
     };
     tcx.tmp.truncate(base);
     ty
@@ -1167,11 +1173,6 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
         ObjectRef::KINT64(&KINT64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kintpri(tcx.intern[k])),
         ObjectRef::KFP64(&KFP64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kfpri(tcx.intern[k])),
         ObjectRef::KSTR(_) => unifyvt(&mut tcx.data.sub, tv, Ty::primitive(Primitive::STR)),
-        ObjectRef::LEN(&LEN { value, .. }) => {
-            // TODO: make sure here that it has at least as many dimensions as our axis.
-            unifyvt(&mut tcx.data.sub, tv, Ty::primitive(PRI_IDX));
-            visitexpr(tcx, value);
-        },
         ObjectRef::TUPLE(TUPLE { fields, .. }) => {
             let ty = visittuple(tcx, fields);
             unifyvt(&mut tcx.data.sub, tv, ty);
@@ -1229,28 +1230,19 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
             }
         },
         ObjectRef::IDX(_) => todo!(),
-        ObjectRef::LOAD(&LOAD { addr, ref shape, .. }) => {
-            let aty = visitexpr(tcx, addr);
-            unifyvt(&mut tcx.data.sub, aty, Ty::primitive(Primitive::PTR));
-            for &d in shape {
-                // TODO: this should support all types of integers, but currently lower
+        ObjectRef::NEW(NEW { shape, .. }) => {
+            for &s in shape {
+                // TODO: this (and LOAD) should support all types of integers, but currently lower
                 // assumes all lengths are IRT_IDX (this is hardcoded in return slots).
                 // this should probably convert to IRT_IDX because there's not much benefit
                 // in supporting other length sizes.
-                let dty = visitexpr(tcx, d);
-                unifyvt(&mut tcx.data.sub, dty, Ty::primitive(PRI_IDX));
-            }
-            // result type annotation is generated by parser
-        },
-        ObjectRef::NEW(NEW { shape, .. }) => {
-            for &s in shape {
-                // nb. see TODO comment in LOAD
                 let sty = visitexpr(tcx, s);
                 unifyvt(&mut tcx.data.sub, sty, Ty::primitive(PRI_IDX));
             }
             let elem = newtypevar(&mut tcx.data.sub, scope);
             let dim = createdimtype(&mut tcx.data, shape.len() as _);
-            let ty = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[Ty::link(elem), Ty::link(dim)]);
+            let ty = newcontype(&mut tcx.data.sub, Constructor::Tensor,
+                &[Ty::link(elem), Ty::link(dim)]);
             unifyvt(&mut tcx.data.sub, tv, ty);
         },
         ObjectRef::TGET(&TGET { value, idx, .. }) => {

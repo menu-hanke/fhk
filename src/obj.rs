@@ -304,7 +304,6 @@ define_ops! {
     KINT64      { ann: ObjRef/*TY*/, k: Interned<i64> };
     KFP64       { ann: ObjRef/*TY*/, k: Interned<f64> };
     KSTR        { ann: ObjRef/*TY*/, k: Interned<[u8]> };
-    LEN.axis    { ann: ObjRef/*TPRI.IDX*/, value: ObjRef<EXPR> };
     TUPLE       { ann: ObjRef/*TY*/ } fields: [ObjRef<EXPR>];
     TGET.idx    { ann: ObjRef/*TY*/, value: ObjRef<EXPR> };
     LET         { ann: ObjRef/*TY*/, value: ObjRef<EXPR>, expr: ObjRef<EXPR> };
@@ -316,7 +315,6 @@ define_ops! {
     IDX         { ann: ObjRef/*TY*/, value: ObjRef<EXPR> } idx: [ObjRef<EXPR>];
     BINOP.binop { ann: ObjRef/*TY*/, left: ObjRef<EXPR>, right: ObjRef<EXPR> };
     INTR.func   { ann: ObjRef/*TY*/ } args: [ObjRef<EXPR>];
-    LOAD        { ann: ObjRef/*TY*/, addr: ObjRef<EXPR> } shape: [ObjRef<EXPR>];
     NEW         { ann: ObjRef/*TY*/ } shape: [ObjRef<EXPR>];
     CALL.lang   { ann: ObjRef/*TY*/, func: u32 } inputs: [ObjRef<EXPR>];
 }
@@ -403,8 +401,8 @@ macro_rules! define_intrinsics {
         }
 
         impl Intrinsic {
-            pub fn from_func(name: &[u8]) -> Option<Intrinsic> {
-                match name {
+            pub fn from_stem(stem: &[u8]) -> Option<Intrinsic> {
+                match stem {
                     $($($func => Some(Intrinsic::$name),)?)*
                     _ => None
                 }
@@ -414,17 +412,19 @@ macro_rules! define_intrinsics {
 }
 
 define_intrinsics! {
-    UNM;
-    NOT;
+    UNM     b"-";
+    ALL     b"all";
+    ANY     b"any";
+    CONV    b"conv";
+    EFFECT  b"effect";
     EXP     b"exp";
+    LEN     b"len";
+    LOAD    b"load";
     LOG     b"log";
+    NOT     b"not";
+    REP     b"rep";
     SUM     b"sum";
     WHICH   b"which";
-    ANY     b"any";
-    ALL     b"all";
-    CONV    b"conv";
-    REP     b"rep";
-    EFFECT  b"effect";
 }
 
 impl Intrinsic {
@@ -599,8 +599,6 @@ impl Objects {
                 && self.equal(a.right.erase(), b.right.erase()),
             (INTR(a), INTR(b))    => a.func == b.func
                 && self.allequal(cast_args(&a.args), cast_args(&b.args)),
-            (LOAD(a),  LOAD(b))   => a.addr == b.addr
-                && self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (NEW(a),   NEW(b))    => self.allequal(cast_args(&a.shape), cast_args(&b.shape)),
             (TGET(a),  TGET(b))    => a.idx == b.idx && self.equal(a.value.erase(), b.value.erase()),
             (CALL(_),  CALL(_))  => todo!(),
