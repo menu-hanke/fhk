@@ -421,6 +421,8 @@ define_intrinsics! {
     LEN     b"len";
     LOAD    b"load";
     LOG     b"log";
+    MAX     b"max";
+    MIN     b"min";
     NOT     b"not";
     REP     b"rep";
     SELECT  b"select";

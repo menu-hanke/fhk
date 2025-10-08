@@ -1115,6 +1115,25 @@ macro_rules! instantiate {
     }};
 }
 
+fn visitminmax(ctx: &mut TypeInfer, args: &[Ty], scope: Scope) -> Ty {
+    let e = ctx.sub.push(Tv::unbound(scope, Some(PRI_NUM)));
+    let mut accumulator: Option<TypeVar> = None;
+    for &a in args {
+        let (ae, ad) = unpacktensor(&mut ctx.sub, a, scope);
+        unifyvv(&mut ctx.sub, e, ae);
+        accumulator = Some(match accumulator {
+            Some(acc) => {
+                let d = newtypevar(&mut ctx.sub, scope);
+                constraint(ctx, Constraint::BinOp(Ty::link(d), Ty::link(acc), Ty::link(ad)));
+                d
+            },
+            None => ad
+        });
+    }
+    let d = accumulator.unwrap();
+    newcontype(&mut ctx.sub, Constructor::Tensor, &[Ty::link(e), Ty::link(d)])
+}
+
 fn visitselect(tcx: &mut Tcx, cond: Ty, tru: Ty, fal: Ty, scope: Scope) -> Ty {
     let (ce,cd) = unpacktensor(&mut tcx.data.sub, cond, scope);
     let (te,td) = unpacktensor(&mut tcx.data.sub, tru, scope);
@@ -1152,6 +1171,7 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
         EFFECT => I!(a ...b :: b[pri Primitive::FX] => a),
         LEN => I!(_a ...b :: b[pri PRI_IDX] => pri PRI_IDX),
         LOAD => I!(p ...s,r :: p[pri Primitive::PTR], s[pri PRI_IDX] => r),
+        MAX | MIN => visitminmax(&mut tcx.data, aty, scope),
         NOT => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => a),
         REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
         SELECT => {

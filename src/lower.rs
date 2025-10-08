@@ -626,6 +626,14 @@ fn emitjumpifnot(func: &Func, ctr: &mut InsId, cond: InsId, target: InsId) -> In
     next
 }
 
+fn emitminmax(func: &Func, left: InsId, right: InsId, ty: Type, min: bool) -> InsId {
+    let check = func.code.push(Ins::LT(left, right));
+    func.code.push(match min {
+        true  => Ins::CMOV(ty, check, left, right),
+        false => Ins::CMOV(ty, check, right, left)
+    })
+}
+
 fn newcall(idx: InsId, init: InsId, node: FuncId, inline: bool) -> Ins {
     let opcode = match inline {
         false => Opcode::CALLC,
@@ -2721,6 +2729,65 @@ fn visitload(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
     }
 }
 
+fn visitminmax(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &INTR { ann, func, ref args, .. } = &objs[expr];
+    let ismin = func == Intrinsic::MIN as _;
+    match visit {
+        Visit::Materialize(slot) if objs[ann].op == Obj::TTEN => {
+            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
+        },
+        Visit::Materialize(slot) => {
+            debug_assert!(objs[ann].op == Obj::TPRI);
+            let ty = Primitive::from_u8(objs[ann.cast::<TPRI>()].ty).to_ir();
+            let mut accumulator: IndexOption<InsId> = None.into();
+            for &a in args {
+                let value = emitexprv(lcx, a, &mut slot.ctr);
+                accumulator = Some(match accumulator.unpack() {
+                    Some(acc) => emitminmax(&lcx.data.func, acc, value, ty, ismin),
+                    None => value
+                }).into();
+            }
+            slot.value = accumulator.unwrap();
+        },
+        Visit::Shape(slot) => {
+            let mut shape: IndexOption<InsId> = None.into();
+            for &a in args {
+                if objs[objs[a].ann].op == Obj::TTEN {
+                    let s = emitexprs(lcx, a, &mut slot.ctr);
+                    shape = Some(match shape.unpack() {
+                        Some(ss) => emitminmax(&lcx.data.func, s, ss, IRT_IDX, true),
+                        None => s
+                    }).into();
+                } else {
+                    visitexpr(lcx, a, Visit::None(&mut slot.ctr));
+                }
+            }
+            slot.value = shape.unwrap();
+        },
+        Visit::Iterate(iter) => {
+            let mut accumulator: IndexOption<InsId> = None.into();
+            let mut want_shape = iter.shape.is_some();
+            let ty = elementtype(objs, ann).to_ir();
+            for &a in args {
+                let shape = if want_shape && objs[objs[a].ann].op == Obj::TTEN {
+                    want_shape = false;
+                    iter.shape.as_mut()
+                } else {
+                    None
+                };
+                let value = emitbroadcastv(lcx, a, &mut iter.loop_, shape);
+                accumulator = Some(match accumulator.unpack() {
+                    Some(acc) => emitminmax(&lcx.data.func, acc, value, ty, ismin),
+                    None => value
+                }).into();
+            }
+            iter.element = accumulator.unwrap();
+        },
+        Visit::None(_) => unreachable!() // short-circuited in visitexpr
+    }
+}
+
 fn visitlen(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit)  {
     let args = &lcx.objs[expr].args;
     let expr = args[0];
@@ -2844,6 +2911,7 @@ fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
         CONV => todo!(),
         LEN => visitlen(lcx, expr, visit),
         LOAD => visitload(lcx, expr, visit),
+        MAX | MIN => visitminmax(lcx, expr, visit),
         REP => todo!(),
         SELECT => visitselect(lcx, expr, visit),
         EFFECT => visiteffect(lcx, expr, visit),
