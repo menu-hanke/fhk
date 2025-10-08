@@ -360,6 +360,7 @@ define_opcodes! {
     MOV       V;
     MOVB      V;
     MOVF      V V;
+    CMOV      V V V, decode_CMOV;      // cond tru fal
     CONV      V X,   decode_CONV;
 
     ADD       V V;
@@ -664,6 +665,10 @@ impl Ins {
     decode_fn!(pub fn decode_V -> V);
     decode_fn!(pub fn decode_VV -> V V);
     decode_fn!(pub fn decode_CALLC -> V V F); // CALLC and CALLCI
+
+    pub fn decode__V(self) -> InsId {
+        zerocopy::transmute!(self.b())
+    }
 
 }
 

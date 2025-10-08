@@ -198,6 +198,15 @@ fn ins_mov(ecx: &mut Ecx, id: InsId) {
     emit.values[id] = emit.values[value];
 }
 
+fn ins_cmov(ecx: &mut Ecx, id: InsId) {
+    let emit = &mut *ecx.data;
+    let (cond, tru, fal) = emit.code[id].decode_CMOV();
+    let cond = emit.values[cond].value();
+    let tru = emit.values[tru].value();
+    let fal = emit.values[fal].value();
+    emit.values[id] = InsValue::from_value(emit.fb.ins().select(cond, tru, fal));
+}
+
 fn ins_conv(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (value, conv) = emit.code[id].decode_CONV();
@@ -520,6 +529,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             KSTR => todo!(),
             KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
+            CMOV => ins_cmov(ecx, id),
             CONV => ins_conv(ecx, id),
             ADD | SUB | MUL | DIV | UDIV => ins_arith(ecx, id),
             POW => ins_pow(ecx, id),

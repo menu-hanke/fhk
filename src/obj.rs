@@ -423,6 +423,7 @@ define_intrinsics! {
     LOG     b"log";
     NOT     b"not";
     REP     b"rep";
+    SELECT  b"select";
     SUM     b"sum";
     WHICH   b"which";
 }

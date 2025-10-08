@@ -38,7 +38,7 @@ macro_rules! define_costs {
 define_costs! {
     NOP | JMP | GOTO | UB | ABORT | PHI | KINT | KINT64 | KFP64 | KSTR | KREF
        | MOV | MOVB | MOVF | CONV | ABOX | BREF | CARG | RES | RET  => 0,
-    ADD | SUB | MUL | DIV | UDIV | NEG | ADDP | EQ | NE | LT | LE | ULT | ULE
+    CMOV | ADD | SUB | MUL | DIV | UDIV | NEG | ADDP | EQ | NE | LT | LE | ULT | ULE
         | STORE | LOAD | QLOAD | BOX | IF => 1,
     POW | ALLOC | CALLC | CALLCI => 5,
     CALL | CINIT | LO | LOV | LOVV | LOVX | LOX | LOXX => 255

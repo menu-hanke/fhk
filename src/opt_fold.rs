@@ -229,7 +229,18 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         // MOVF x NOP -> x
         // MOVF NOP x -> x
         MOVF if m!(_ (NOP)) => FoldStatus::New(ins.decode_V()),
-        MOVF if m!((NOP) _) => FoldStatus::New(ins.decode_VV().1),
+        MOVF if m!((NOP) _) => FoldStatus::New(ins.decode__V()),
+
+        // eliminate CMOV const
+        CMOV if m!(const) => {
+            let (cond, left, right) = ins.decode_CMOV();
+            let value = code[cond];
+            debug_assert!(value == Ins::KINT(Type::B1, 0) || value == Ins::KINT(Type::B1, 1));
+            FoldStatus::New(if value == Ins::KINT(Type::B1, 0) { right } else { left })
+        },
+
+        // CMOV _ x x -> x
+        CMOV if ins.b() == ins.c() => FoldStatus::New(ins.decode__V()),
 
         // eliminate nop CONVs
         CONV if ins.type_() == code[ins.decode_V()].type_() => FoldStatus::New(ins.decode_V()),

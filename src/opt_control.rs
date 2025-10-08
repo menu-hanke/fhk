@@ -190,7 +190,7 @@ fn switch_run(
                         chain = if kjmp == Ins::KINT(Type::B1, 0) { fal } else { tru };
                     } else {
                         let opcode = code[cond].opcode();
-                        let kswitch = code[code[cond].decode_VV().1];
+                        let kswitch = code[code[cond].decode__V()];
                         debug_assert!((Opcode::EQ|Opcode::NE).contains(opcode));
                         // note: this assumes two constants are equal iff the instructions are equal.
                         // this works as long as the KINT/KINT64/KFP64 logic is consistent everywhere,

@@ -1115,6 +1115,26 @@ macro_rules! instantiate {
     }};
 }
 
+fn visitselect(tcx: &mut Tcx, cond: Ty, tru: Ty, fal: Ty, scope: Scope) -> Ty {
+    let (ce,cd) = unpacktensor(&mut tcx.data.sub, cond, scope);
+    let (te,td) = unpacktensor(&mut tcx.data.sub, tru, scope);
+    let (fe,fd) = unpacktensor(&mut tcx.data.sub, fal, scope);
+    // must require e to be primitive here to prevent the potential creation of a
+    // zero-dimension non-primitive tensor (which makes the typing unsound).
+    // this restriction isn't actually always needed: if cond is scalar, we could just require
+    // tru=fal and return that. for now, this is not implemented because it requires creating
+    // a new constraint type.
+    let e = tcx.data.sub.push(Tv::unbound(scope, Some(EnumSet::all())));
+    let d = newtypevar(&mut tcx.data.sub, scope); // must be e+1
+    let d1 = newtypevar(&mut tcx.data.sub, scope);
+    unifyvt(&mut tcx.data.sub, ce, Ty::primitive(Primitive::B1));
+    unifyvv(&mut tcx.data.sub, e, te);
+    unifyvv(&mut tcx.data.sub, e, fe);
+    constraint(&mut tcx.data, Constraint::BinOp(Ty::link(d1), Ty::link(td), Ty::link(fd)));
+    constraint(&mut tcx.data, Constraint::BinOp(Ty::link(d), Ty::link(d1), Ty::link(cd)));
+    Ty::constructor(Constructor::Tensor, e)
+}
+
 fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
     use Intrinsic::*;
     let base = tcx.tmp.end();
@@ -1134,6 +1154,10 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
         LOAD => I!(p ...s,r :: p[pri Primitive::PTR], s[pri PRI_IDX] => r),
         NOT => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => a),
         REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
+        SELECT => {
+            let &[c,t,f] = aty else { unreachable!() };
+            visitselect(tcx, c, t, f, scope)
+        },
         SUM => I!(a,e[PRI_NUM] n :: a[Tensor e n] => e),
         // TODO (?): generalize WHICH to return tuples.
         WHICH => I!(a :: a[Tensor Ty::primitive(Primitive::B1) Ty::V1D]

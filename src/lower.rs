@@ -691,10 +691,6 @@ fn emitmultistore(
     store
 }
 
-// fn vardata(objs: &HashMap<ObjRef, BumpRef<()>>, var: ObjRef<VAR>) -> BumpRef<Var> {
-//     objs[&var.erase()].cast()
-// }
-
 fn alloctensordata(
     lcx: &mut Lcx,
     ctr: InsId,
@@ -864,6 +860,23 @@ fn emitloopstore(
         emitreduce(func, loop_, Type::FX, nop, next, store_accumulator+i, store_result+i);
     }
     store_result
+}
+
+fn emittensorcollect(
+    lcx: &mut Lcx,
+    loop_: &mut Loop,
+    anchor: InsId,
+    ty: &TTEN,
+    element: InsId,
+    shape: InsId
+) -> InsId {
+    let (ptrs, esizes) = alloctensordata(lcx, anchor, ty, shape);
+    let eds = decomposition_size(&lcx.objs, ty.elem);
+    let stores = emitloopstore(&lcx.data.func, loop_, element, esizes, ptrs, eds);
+    let ret = lcx.data.func.code.extend(
+        (0..eds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, stores+i)));
+    lcx.data.func.code.extend((0..ty.dim as isize).map(|i| Ins::MOV(IRT_IDX, shape+i)));
+    ret
 }
 
 /* ---- Indexing ------------------------------------------------------------ */
@@ -1323,14 +1336,9 @@ fn emitexprim(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId) -> InsId {
     let cty: &TTEN = &objs[objs[expr].ann.cast()];
     let mut loop_ = newloop(&lcx.data.func);
     let (element, shape) = emitexpris(lcx, expr, &mut loop_, ctr);
-    let (ptrs, esizes) = alloctensordata(lcx, *ctr, cty, shape);
-    let eds = decomposition_size(objs, cty.elem);
-    let stores = emitloopstore(&lcx.data.func, &mut loop_, element, esizes, ptrs, eds);
+    let value = emittensorcollect(lcx, &mut loop_, *ctr, cty, element, shape);
     ctrcloseloop(&lcx.data.func, loop_, ctr);
-    let ret = lcx.data.func.code.extend(
-        (0..eds as isize).map(|i| Ins::MOVF(Type::PTR, ptrs+i, stores+i)));
-    lcx.data.func.code.extend((0..cty.dim as isize).map(|i| Ins::MOV(IRT_IDX, shape+i)));
-    ret
+    value
 }
 
 // materialize then iterate
@@ -2728,7 +2736,97 @@ fn visitlen(lcx: &mut Lcx, expr: ObjRef<INTR>, mut visit: Visit)  {
     slot.value = emitexprs(lcx, expr, &mut slot.ctr) + axis as isize;
 }
 
-// TODO: split these into their own nodes?
+fn emitrepcollect(
+    lcx: &mut Lcx,
+    ctr: &mut InsId,
+    ty: &TTEN,
+    element: InsId,
+    shape: InsId
+) -> InsId {
+    let mut loop_ = newloop(&lcx.data.func);
+    let zero = lcx.data.func.code.push(Ins::KINT(IRT_IDX, 0));
+    let len = emitshapelen(&lcx.data.func, shape, ty.dim as _);
+    emitrangeloop(&lcx.data.func, &mut loop_, IRT_IDX, zero, len);
+    let value = emittensorcollect(lcx, &mut loop_, *ctr, ty, element, shape);
+    ctrcloseloop(&lcx.data.func, loop_, ctr);
+    value
+}
+
+fn visitselect(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &INTR { ann, args: ref args @ [cond, tru, fal], .. }
+        = &objs[expr] else { unreachable!() };
+    let isvcond = objs[objs[cond].ann].op == Obj::TTEN;
+    let (out, c, t, f, a) = match visit {
+        Visit::Materialize(slot) if isvcond => {
+            // vector condition -> collect loop
+            slot.value = emitexprim(lcx, expr.cast(), &mut slot.ctr);
+            return
+        },
+        Visit::Materialize(slot) => {
+            // scalar condition -> emit scalar cmov
+            let c = emitexprv(lcx, cond, &mut slot.ctr);
+            let mut t = emitexprv(lcx, tru, &mut slot.ctr);
+            let mut f = emitexprv(lcx, fal, &mut slot.ctr);
+            debug_assert!(objs[fal].ann == ann || objs[tru].ann == ann);
+            if objs[tru].ann != objs[fal].ann {
+                debug_assert!(objs[ann].op == Obj::TTEN);
+                let ty: &TTEN = &objs[ann.cast()];
+                if objs[tru].ann != ann {
+                    t = emitrepcollect(lcx, &mut slot.ctr, ty, t, extractshape(objs, f, ty));
+                } else {
+                    f = emitrepcollect(lcx, &mut slot.ctr, ty, f, extractshape(objs, t, ty));
+                }
+            }
+            (&mut slot.value, c, t, f, ann)
+        },
+        Visit::Shape(slot) if isvcond => {
+            // vector condition -> shape is condition shape
+            slot.value = emitexprs(lcx, cond, &mut slot.ctr);
+            visitexpr(lcx, tru, Visit::None(&mut slot.ctr));
+            visitexpr(lcx, fal, Visit::None(&mut slot.ctr));
+            return
+        },
+        Visit::Shape(slot) => {
+            // scalar condition -> binop logic (shape is tensor arg shape)
+            let (a, b) = if objs[tru].ann == ann { (tru, fal) }
+                else { (fal, tru) };
+            visitexpr(lcx, b, Visit::None(&mut slot.ctr));
+            slot.value = emitexprs(lcx, a, &mut slot.ctr);
+            return
+        }
+        Visit::Iterate(iter) => {
+            debug_assert!(objs[ann].op == Obj::TTEN);
+            let (cs, ts, fs) = if isvcond {
+                (iter.shape.as_mut(), None, None)
+            } else if objs[tru].ann == ann {
+                (None, iter.shape.as_mut(), None)
+            } else {
+                (None, None, iter.shape.as_mut())
+            };
+            let c = emitbroadcastv(lcx, cond, &mut iter.loop_, cs);
+            let t = emitbroadcastv(lcx, tru, &mut iter.loop_, ts);
+            let f = emitbroadcastv(lcx, fal, &mut iter.loop_, fs);
+            (&mut iter.element, c, t, f, objs[ann.cast::<TTEN>()].elem)
+        },
+        Visit::None(ctr) => {
+            for &a in args {
+                visitexpr(lcx, a, Visit::None(ctr));
+            }
+            return
+        }
+    };
+    let base = lcx.tmp.end();
+    let deco = decomposition(objs, a, &mut lcx.tmp);
+    let o = reserve(&lcx.data.func, deco.len());
+    *out = o;
+    for (i, &ty) in deco.iter().enumerate() {
+        let i = i as isize;
+        lcx.data.func.code.set(o+i, Ins::CMOV(ty, c, t+i, f+i));
+    }
+    lcx.tmp.truncate(base);
+}
+
 fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
     use Intrinsic::*;
     let objs = Access::borrow(&lcx.objs);
@@ -2747,6 +2845,7 @@ fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
         LEN => visitlen(lcx, expr, visit),
         LOAD => visitload(lcx, expr, visit),
         REP => todo!(),
+        SELECT => visitselect(lcx, expr, visit),
         EFFECT => visiteffect(lcx, expr, visit),
         WHICH => visitwhich(lcx, expr, visit),
     }
