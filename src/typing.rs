@@ -53,7 +53,7 @@ impl Primitive {
         const PRI2IR: &'static [Type] = {
             use Type::*;
             // ORDER PRI
-            &[F64, F32, I64, I32, I16, I8, I64, I32, I16, I8, B1, FX, PTR]
+            &[F64, F32, I64, I32, I16, I8, I64, I32, I16, I8, B1, FX, PTR, PTR]
         };
         PRI2IR[self as usize]
     }
