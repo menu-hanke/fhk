@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-mod array;
 mod bitmap;
 mod bump;
 mod compile;
@@ -29,8 +28,8 @@ mod obj;
 mod parse;
 mod parser;
 mod relation;
+mod runtime;
 mod schedule;
-mod support;
 mod trace;
 mod translate;
 mod typeinfer;

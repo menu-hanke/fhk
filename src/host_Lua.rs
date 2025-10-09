@@ -17,8 +17,7 @@ use crate::obj::{Obj, ObjRef, Operator, EXPR, QUERY, TAB, TUPLE};
 use crate::optimize::parse_optflags;
 use crate::parse::{parse_expand_tab, parse_expand_var, parse_template, parse_toplevel_def, parse_toplevel_expr, ExpandResult};
 use crate::parser::{parse, pushtemplate, stringify, Parser, SequenceType};
-
-use crate::image::fhk_vmcall_native as fhk_vmcall;
+use crate::runtime::{fhk_vmcall, newinstance};
 use crate::FHK_VERSION_STRING;
 
 type lua_State = c_void;
@@ -264,7 +263,7 @@ unsafe extern "C" fn fhk_newinstance(
             None => ((*template).host.alloc,
                 if udata.is_null() { (*template).host.udata } else { udata })
         };
-        let inst = image.instantiate(template, reset, |size, align| alloc(udata, size, align));
+        let inst = newinstance(image, template, reset, |size, align| alloc(udata, size, align));
         (*inst).host = HostInst { alloc, udata, err: core::ptr::null() };
         inst
     }

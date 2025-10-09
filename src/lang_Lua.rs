@@ -12,7 +12,6 @@ use crate::bump::{self, BumpRef, BumpVec};
 use crate::compile::{self, Ccx, FFIError};
 use crate::data::{CALL_LUA, TENSOR_LUA};
 use crate::emit::{irt2cl, Ecx, Emit, InsValue};
-use crate::image::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance, SwapInit};
 use crate::intern::Interned;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lang::{Lang, Language};
@@ -22,7 +21,7 @@ use crate::mmap::{Mmap, Prot};
 use crate::obj::{Obj, ObjRef, ObjectRef, Objects, CALL, EXPR, NEW, TPRI, TTEN, TTUP};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, Pcx};
-use crate::support::SuppFunc;
+use crate::runtime::{fhk_swap, fhk_swap_exit, fhk_swap_init, fhk_swap_instance, RtFunc, SwapInit};
 
 #[cfg(all(unix, not(feature="host-Lua")))]
 const LJ_LIBNAME: &'static [u8] = b"libluajit.so\0libluajit-5.1.so\0";
@@ -491,7 +490,7 @@ fn emitcall(ecx: &mut Ecx, id: InsId) -> InsValue {
         }
         args = next;
     }
-    let swap = emit.fb.importsupp(&ecx.ir, SuppFunc::SWAP);
+    let swap = emit.fb.importrtfunc(&ecx.ir, RtFunc::SWAP);
     let jump = emit.fb.ins().iconst(irt2cl(Type::I64), jump as i64);
     emit.fb.ins().call(swap, &[base, jump]); // base+0 = coro
     unsafe { lib.lua_getfield(L, -2, c"returns".as_ptr()); }

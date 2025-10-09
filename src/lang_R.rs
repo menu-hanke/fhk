@@ -14,19 +14,19 @@ use alloc::boxed::Box;
 use cranelift_codegen::ir::InstBuilder;
 use zerocopy::Unalign;
 
-use crate::array::{Array, ArrayBuf, ArrayMut, ArrayType};
 use crate::bump::AlignedBytes;
 use crate::compile::{Ccx, FFIError};
 use crate::data::CALL_R;
 use crate::dl::LibBox;
 use crate::emit::{irt2cl, signature, Ecx, Emit, InsValue, Signature, NATIVE_CALLCONV};
-use crate::image::{fhk_vmexit, Instance};
+use crate::image::Instance;
 use crate::intern::Interned;
 use crate::ir::{Func, Ins, InsId, LangOp, Opcode, Type};
 use crate::lower::{areserve, decompose, decomposition, decomposition_size, reserve, CLcx};
 use crate::mcode::MCodeOffset;
 use crate::mem::{CursorA, CursorType};
-use crate::typing::{Idx, Primitive, IRT_IDX};
+use crate::runtime::{fhk_vmexit, Array, ArrayBuf, ArrayMut, ArrayType, Idx, RtStr, IRT_IDX};
+use crate::typing::Primitive;
 use crate::{compile, dl};
 use crate::lang::{Lang, Language};
 use crate::lex::Token;
@@ -156,6 +156,7 @@ r_api! {
     rt fn Rf_setAttrib(vec: SEXP, name: SEXP, val: SEXP) -> SEXP;
     rt fn Rf_getAttrib(vec: SEXP, name: SEXP) -> SEXP;
     rt fn Rf_length(x: SEXP) -> R_len_t;
+    rt fn Rf_mkCharLen(s: *const c_char, n: c_int) -> SEXP;
     rt fn CDR(x: SEXP) -> SEXP;
     rt fn SETCAR(x: SEXP, y: SEXP) -> SEXP;
     rt fn SET_TYPEOF(x: SEXP, ty: SEXPTYPE) -> SEXP;
@@ -167,7 +168,6 @@ r_api! {
     fn R_ParseEvalString(str: *const c_char, env: SEXP) -> SEXP;
     fn Rf_initEmbeddedR(argc: c_int, argv: *const *const c_char) -> c_int;
     fn Rf_endEmbeddedR(fatal: c_int);
-    fn Rf_mkCharLen(s: *const c_char, n: c_int) -> SEXP;
     fn Rf_lang3(x1: SEXP, x2: SEXP, x3: SEXP) -> SEXP;
     fn SET_STRING_ELT(x: SEXP, i: R_xlen_t, v: SEXP);
     rt extern R_GlobalEnv: SEXP;
@@ -441,7 +441,7 @@ fn pri2sexp(pri: Primitive) -> SEXPTYPE {
     }
 }
 
-unsafe fn importprivalue(dst: *mut (), src: *const (), pri: Primitive) {
+unsafe fn importprivalue(lib: &RuntimeLibR, dst: *mut (), src: *const (), pri: Primitive) {
     use Primitive::*;
     unsafe {
         match pri {
@@ -453,7 +453,11 @@ unsafe fn importprivalue(dst: *mut (), src: *const (), pri: Primitive) {
             I8  => *dst.cast::<c_int>()     = *src.cast::<i8>() as _,
             U16 => *dst.cast::<c_int>()     = *src.cast::<u16>() as _,
             U8|B1 => *dst.cast::<c_int>()   = *src.cast::<u8>() as _,
-            STR|PTR => todo!("importprivalue ptr"), // is str c_char?
+            STR => *dst.cast::<SEXP>() = {
+                let s = RtStr::from_ptr(*(src as *const *const u8));
+                (lib.Rf_mkCharLen)(s.data() as _, s.len() as _)
+            },
+            PTR => todo!("importprivalue ptr"), // is str c_char?
             FX => unreachable!()
         }
     }
@@ -462,7 +466,14 @@ unsafe fn importprivalue(dst: *mut (), src: *const (), pri: Primitive) {
 unsafe fn importscalar(lib: &RuntimeLibR, src: *const (), pri: Primitive) -> SEXP {
     unsafe {
         let v = (lib.Rf_allocVector)(pri2sexp(pri), 1);
-        importprivalue((lib.DATAPTR)(v) as _, src, pri);
+        if pri == Primitive::STR {
+            // importprivalue allocates a char vector
+            (lib.Rf_protect)(v);
+        }
+        importprivalue(lib, (lib.DATAPTR)(v) as _, src, pri);
+        if pri == Primitive::STR {
+            (lib.Rf_unprotect)(1);
+        }
         v
     }
 }
@@ -501,12 +512,19 @@ unsafe fn importarray(lib: &RuntimeLibR, array: Array) -> SEXP {
             unsafe { core::ptr::copy_nonoverlapping(src, data, dsize*size); }
         } else {
             let esize = pri.size();
+            if pri == Primitive::STR {
+                // importprivalue allocates char vectors
+                unsafe { (lib.Rf_protect)(vec); }
+            }
             for _ in 0..size {
                 unsafe {
-                    importprivalue(data.cast(), src.cast(), pri);
+                    importprivalue(lib, data.cast(), src.cast(), pri);
                     data = data.add(dsize);
                     src = src.add(esize);
                 }
+            }
+            if pri == Primitive::STR {
+                unsafe { (lib.Rf_unprotect)(1); }
             }
         }
     } else {

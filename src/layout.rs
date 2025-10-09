@@ -13,7 +13,7 @@ use crate::index::{self, index, IndexSlice, IndexVec, InvalidValue};
 use crate::intern::Interned;
 use crate::ir::{Func, FuncId, FuncKind, Opcode, Type};
 use crate::mem::{BitOffset, Chunk, Offset, ParamId, Query, QueryId, ResetId, SizeClass};
-use crate::support::DynSlot;
+use crate::runtime::DynSlot;
 use crate::trace::trace;
 use crate::typestate::Absent;
 

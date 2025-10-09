@@ -18,8 +18,9 @@ local PRI_U32 = 7
 local PRI_U16 = 8
 local PRI_U8  = 9
 local PRI_B1  = 10
-local PRI_PTR = 11
-local PRI_STR = 12
+local PRI_FX  = 11
+local PRI_PTR = 12
+local PRI_STR = 13
 local PRI_CT = {
 	[PRI_F64] = ffi.typeof("double"),
 	[PRI_F32] = ffi.typeof("float"),
@@ -32,8 +33,9 @@ local PRI_CT = {
 	[PRI_U16] = ffi.typeof("uint16_t"),
 	[PRI_U8]  = ffi.typeof("uint8_t"),
 	[PRI_B1]  = ffi.typeof("bool"),
+	[PRI_FX]  = nil,
 	[PRI_PTR] = ffi.typeof("void *"),
-	[PRI_STR] = nil, -- TODO: const char *? should these be null terminated?
+	[PRI_STR] = ffi.typeof("const char *")
 }
 
 local function scalar_ctype(pri)

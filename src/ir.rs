@@ -354,7 +354,7 @@ define_opcodes! {
     KINT      XX;
     KINT64    XX;
     KFP64     XX;
-    KSTR      XX;
+    KSTR.PTR  XX;
     KREF.LSV  XX;
 
     MOV       V;

@@ -22,7 +22,8 @@ use crate::lower::CLcx;
 use crate::obj::{Obj, ObjRef, CALL, EXPR, TPRI, TTEN};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, require, Pcx};
-use crate::typing::{Primitive, IRT_IDX};
+use crate::runtime::IRT_IDX;
+use crate::typing::Primitive;
 
 const LOP_CSYM: u8 = 0;
 const LOP_CRES: u8 = 1;
@@ -604,7 +605,11 @@ fn lower_call(
                     ann = lcx.objs[ann.cast::<TTEN>()].elem;
                 }
                 debug_assert!(lcx.objs[ann].op == Obj::TPRI);
-                let havepri = Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty);
+                let mut havepri = Primitive::from_u8(lcx.objs[ann.cast::<TPRI>()].ty);
+                if havepri == Primitive::STR {
+                    havepri = Primitive::I8;
+                    indir += 1;
+                }
                 let needpri = ctype.primitive();
                 if havepri.to_ir() != needpri.to_ir() {
                     if indir > 0 {

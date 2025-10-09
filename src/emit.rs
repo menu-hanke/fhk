@@ -16,14 +16,13 @@ use crate::bump::Bump;
 use crate::compile::{self, Ccx, Stage};
 use crate::controlflow::BlockId;
 use crate::dump::{dump_mcode, dump_schedule};
-use crate::image::Image;
 use crate::index::{self, IndexVec, InvalidValue};
 use crate::ir::{Conv, Func, FuncId, FuncKind, Ins, InsId, PhiId, Type, IR};
 use crate::lang::{Lang, LangState};
 use crate::mcode::{MCode, MCodeOffset, Reloc, Segment, Sym};
 use crate::mem::{CursorA, SizeClass, BitOffset};
+use crate::runtime::{emitrtfunc, fhk_swap_bytes, NativeFunc, RtFunc};
 use crate::schedule::{compute_schedule, Gcm};
-use crate::support::{emitsupport, NativeFunc, SuppFunc};
 use crate::trace::trace;
 use crate::translate::translate;
 use crate::typestate::{Absent, R, RW};
@@ -36,7 +35,7 @@ pub struct Frame {
 pub struct FuncBuilder {
     pub ctx: cranelift_codegen::Context,
     pub block: cranelift_codegen::ir::Block,
-    pub supp: EnumSet<SuppFunc>, // stored here for borrowing reasons
+    pub rtf: EnumSet<RtFunc>, // stored here for borrowing reasons
 }
 
 // this is roughly the equivalent of
@@ -340,11 +339,11 @@ impl FuncBuilder {
         self.importfuncref(sig, name, true)
     }
 
-    pub fn importsupp(&mut self, ir: &IR, supp: SuppFunc) -> FuncRef {
-        self.supp |= supp;
+    pub fn importrtfunc(&mut self, ir: &IR, rtf: RtFunc) -> FuncRef {
+        self.rtf |= rtf;
         let mut sig = cranelift_codegen::ir::Signature::new(CallConv::Fast);
-        supp.signature().to_cranelift(&mut sig);
-        let name = UserExternalName::new(Sym::Label as _, ir.funcs.raw.len() as u32 + supp as u32);
+        rtf.signature().to_cranelift(&mut sig);
+        let name = UserExternalName::new(Sym::Label as _, ir.funcs.raw.len() as u32 + rtf as u32);
         self.importfuncref(sig, name, true)
     }
 
@@ -581,16 +580,16 @@ fn emitirfunc(ecx: &mut Ecx, fid: FuncId) -> compile::Result {
     Ok(())
 }
 
-fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
+fn emitrtfuncx(ecx: &mut Ecx, rtf: RtFunc) {
     if trace!(CLIF) || trace!(MCODE) {
-        trace!("---------- SUPP {:?} ----------", supp);
+        trace!("---------- RTFUNC {:?} ----------", rtf);
     }
-    let loc = match supp {
-        SuppFunc::SWAP => emitmcode(&mut ecx.image.mcode, Image::fhk_swap_bytes()),
+    let loc = match rtf {
+        RtFunc::SWAP => emitmcode(&mut ecx.image.mcode, fhk_swap_bytes()),
         _ => {
             let emit = &mut *ecx.data;
             resetemit(emit);
-            supp.signature().to_cranelift(&mut emit.fb.ctx.func.signature);
+            rtf.signature().to_cranelift(&mut emit.fb.ctx.func.signature);
             let entry = emit.fb.newblock();
             // supp code uses this to get function args:
             debug_assert!(entry == block2cl(BlockId::START));
@@ -598,11 +597,11 @@ fn emitsuppfunc(ecx: &mut Ecx, supp: SuppFunc) {
                 emit.fb.ctx.func.stencil.dfg.append_block_param(entry, param.value_type);
             }
             emit.fb.block = entry;
-            emitsupport(ecx, supp);
+            emitrtfunc(ecx, rtf);
             compilefunc(ecx)
         }
     };
-    let label = zerocopy::transmute!(ecx.ir.funcs.raw.len() as u32 + supp as u32);
+    let label = zerocopy::transmute!(ecx.ir.funcs.raw.len() as u32 + rtf as u32);
     ecx.image.mcode.labels[label] = loc;
 }
 
@@ -610,10 +609,10 @@ fn emitfuncs(ecx: &mut Ecx) -> compile::Result {
     for id in index::iter_span(ecx.ir.funcs.end()) {
         emitirfunc(ecx, id)?;
     }
-    let mut havesupp: EnumSet<SuppFunc> = EnumSet::empty();
-    while let Some(supp) = ecx.data.fb.supp.difference(havesupp).iter().next() {
-        havesupp |= supp;
-        emitsuppfunc(ecx, supp);
+    let mut have: EnumSet<RtFunc> = EnumSet::empty();
+    while let Some(rtf) = ecx.data.fb.rtf.difference(have).iter().next() {
+        have |= rtf;
+        emitrtfuncx(ecx, rtf);
     }
     Ok(())
 }
@@ -642,7 +641,7 @@ impl Stage for Emit {
             fb: FuncBuilder {
                 ctx: cranelift_codegen::Context::new(),
                 block: cranelift_codegen::ir::Block::reserved_value(),
-                supp: Default::default(),
+                rtf: Default::default(),
             },
             frame: None,
             gcm: Default::default(),
@@ -659,7 +658,7 @@ impl Stage for Emit {
     }
 
     fn run(ccx: &mut Ccx<Self>) -> compile::Result {
-        ccx.image.mcode.labels.raw.resize(ccx.ir.funcs.raw.len() + SuppFunc::COUNT, 0);
+        ccx.image.mcode.labels.raw.resize(ccx.ir.funcs.raw.len() + RtFunc::COUNT, 0);
         ccx.freeze_ir(emitfuncs)?;
         take(&mut ccx.data.lang).finish(ccx)
     }

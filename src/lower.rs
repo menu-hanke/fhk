@@ -19,9 +19,10 @@ use crate::lang::Lang;
 use crate::mem::{BitOffset, Param, ParamId, QueryId, ResetId, SizeClass};
 use crate::obj::{cast_args, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, KSTR, LET, LGET, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, VAR, VGET, VSET};
 use crate::relation::Relation;
+use crate::runtime::IRT_IDX;
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
-use crate::typing::{Primitive, IRT_IDX};
+use crate::typing::Primitive;
 
 index!(struct TabId(u16) debug("tab{}"));
 index!(struct ModId(u32) debug("mod{}"));
@@ -1276,8 +1277,11 @@ fn visitexpr(lcx: &mut Lcx, expr: ObjRef<EXPR>, mut visit: Visit) {
         return
     }
     match lcx.objs[expr].op {
-        Obj::KINT|Obj::KINT64|Obj::KFP64|Obj::KSTR => {
-            visit.unwrap_materialize().value = emitk(lcx, expr)
+        Obj::KINT | Obj::KINT64 | Obj::KFP64 => {
+            visit.unwrap_materialize().value = emitknum(lcx, expr);
+        },
+        Obj::KSTR => {
+            visit.unwrap_materialize().value = emitkstr(lcx, expr.cast());
         },
         Obj::LET => visitlet(lcx, expr.cast(), visit),
         Obj::LGET => visitlget(lcx, expr.cast(), visit),
@@ -1430,16 +1434,23 @@ fn emitexprcv(lcx: &mut Lcx, expr: ObjRef<EXPR>, ctr: &mut InsId, fail: InsId) -
     value
 }
 
-fn emitk(lcx: &mut Lcx, expr: ObjRef<EXPR>) -> InsId {
-    let ObjectRef::TPRI(&TPRI { ty, .. }) = lcx.objs.get(lcx.objs[expr].ann) else { unreachable!() };
+fn emitknum(lcx: &mut Lcx, expr: ObjRef<EXPR>) -> InsId {
+    let ObjectRef::TPRI(&TPRI { ty, .. }) = lcx.objs.get(lcx.objs[expr].ann)
+        else { unreachable!() };
     let ty = Primitive::from_u8(ty).to_ir();
     match lcx.objs.get(expr.erase()) {
         ObjectRef::KINT(&KINT { k, .. }) => lcx.data.func.code.push(Ins::KINT(ty, k as _)),
-        ObjectRef::KINT64(&KINT64 { k, .. }) => lcx.data.func.code.push(Ins::KINT64(ty, zerocopy::transmute!(k))),
-        ObjectRef::KFP64(&KFP64 { k, .. }) => lcx.data.func.code.push(Ins::KFP64(ty, zerocopy::transmute!(k))),
-        ObjectRef::KSTR(&KSTR { k, .. }) => lcx.data.func.code.push(Ins::KSTR(ty, zerocopy::transmute!(k))),
+        ObjectRef::KINT64(&KINT64 { k, .. }) => lcx.data.func.code.push(
+            Ins::KINT64(ty, zerocopy::transmute!(k))),
+        ObjectRef::KFP64(&KFP64 { k, .. }) => lcx.data.func.code.push(
+            Ins::KFP64(ty, zerocopy::transmute!(k))),
         _ => unreachable!()
     }
+}
+
+fn emitkstr(lcx: &mut Lcx, expr: ObjRef<KSTR>) -> InsId {
+    let &KSTR { k, .. } = &lcx.objs[expr];
+    lcx.data.func.code.push(Ins::KSTR(zerocopy::transmute!(k)))
 }
 
 fn emitdim(lcx: &mut Lcx, axis: usize) -> InsId {
@@ -2442,15 +2453,14 @@ fn emitscalarbinop(
     right: InsId
 ) -> InsId {
     use BinOp::*;
-    let irt = ty.to_ir();
     match op {
         OR|AND => emitlogic(&lcx.data.func, ctr, left, right, op),
-        ADD   => lcx.data.func.code.push(Ins::ADD(irt, left, right)),
-        SUB   => lcx.data.func.code.push(Ins::SUB(irt, left, right)),
-        MUL   => lcx.data.func.code.push(Ins::MUL(irt, left, right)),
-        DIV if ty.is_unsigned() => lcx.data.func.code.push(Ins::UDIV(irt, left, right)),
-        DIV   => lcx.data.func.code.push(Ins::DIV(irt, left, right)),
-        POW   => lcx.data.func.code.push(Ins::POW(irt, left, right)),
+        ADD   => lcx.data.func.code.push(Ins::ADD(ty.to_ir(), left, right)),
+        SUB   => lcx.data.func.code.push(Ins::SUB(ty.to_ir(), left, right)),
+        MUL   => lcx.data.func.code.push(Ins::MUL(ty.to_ir(), left, right)),
+        DIV if ty.is_unsigned() => lcx.data.func.code.push(Ins::UDIV(ty.to_ir(), left, right)),
+        DIV   => lcx.data.func.code.push(Ins::DIV(ty.to_ir(), left, right)),
+        POW   => lcx.data.func.code.push(Ins::POW(ty.to_ir(), left, right)),
         EQ    => lcx.data.func.code.push(Ins::EQ(left, right)),
         NE    => lcx.data.func.code.push(Ins::NE(left, right)),
         LT|LE => emitcmp(&lcx.data.func, left, right, op, ty)

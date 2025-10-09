@@ -50,10 +50,16 @@ local function codegen(funcs, base)
 		if not ok then return false, func end
 		buf:put("local func, J, swap, base")
 		local upvalues = {func, J, fhk_swap, base}
+		local ffistr = false
 		for i,input in ipairs(f.inputs) do
 			if type(input) == "table" then
 				buf:putf(", i%d", i)
 				table.insert(upvalues, ffi.cast(ffi.typeof("$*", input.ctype), baseaddr+input.offset))
+				if input.ctype == ffi.typeof("const char *") and not ffistr then
+					ffistr = true
+					buf:put(", ffi_string")
+					table.insert(upvalues, ffi.string)
+				end
 			end
 		end
 		for i,o in ipairs(f.returns) do
@@ -77,7 +83,11 @@ local function codegen(funcs, base)
 				if type(f.inputs[idx]) == "number" then
 					idx = f.inputs[idx]
 				end
-				buf:putf("i%d[0]", idx)
+				if f.inputs[idx].ctype == ffi.typeof("const char *") then
+					buf:putf("ffi_string(i%d[0])", idx)
+				else
+					buf:putf("i%d[0]", idx)
+				end
 			else
 				buf:put(string.char(b))
 			end

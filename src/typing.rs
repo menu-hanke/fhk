@@ -2,7 +2,7 @@
 
 use enumset::EnumSetType;
 
-use crate::ir::{self, Type};
+use crate::ir::Type;
 
 macro_rules! define_primitives {
     ($($name:ident $lname:literal;)*) => {
@@ -97,10 +97,3 @@ impl Constructor {
     }
 
 }
-
-// use signed int here so that -1 can be used as a dummy (and checked via "<0")
-pub const PRI_IDX: Primitive = Primitive::I32;
-pub const IRT_IDX: ir::Type = PRI_IDX.to_ir();
-
-// for rust code dealing with indices coming from compiled code (note the sign difference)
-pub type Idx = u32;

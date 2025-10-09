@@ -10,7 +10,7 @@ use crate::mem::{CursorType, Offset, SizeClass};
 use crate::compile;
 use crate::emit::{block2cl, cast_values, irt2cl, loadslot, storeslot, Ecx, Emit, InsValue, MEM_VMCTX};
 use crate::ir::{Conv, FuncKind, InsId, LangOp, Opcode, PhiId, Type};
-use crate::support::{NativeFunc, SuppFunc};
+use crate::runtime::{NativeFunc, RtFunc};
 
 fn ctrargs(emit: &mut Emit, target: BlockId, jmp: Option<(PhiId, Value)>) {
     let mut src = emit.blockparams[emit.block]
@@ -124,7 +124,7 @@ fn ins_ub(ecx: &mut Ecx) {
 fn ins_abort(ecx: &mut Ecx) {
     let emit = &mut *ecx.data;
     coldblock(emit);
-    let abort = emit.fb.importsupp(&ecx.ir, SuppFunc::ABORT);
+    let abort = emit.fb.importrtfunc(&ecx.ir, RtFunc::ABORT);
     emit.fb.ins().call(abort, &[]);
     // the call above doesn't return. this trap is here just to satisfy cranelift.
     emit.fb.ins().trap(TrapCode::User(0));
@@ -190,6 +190,13 @@ fn ins_kfp64(ecx: &mut Ecx, id: InsId) {
     };
     let ptr = emit.fb.usedata(data);
     emit.values[id] = InsValue::from_value(emit.fb.kload(type_, ptr));
+}
+
+fn ins_kstr(ecx: &mut Ecx, id: InsId) {
+    let s: Interned<[u8]> = zerocopy::transmute!(ecx.data.code[id].bc());
+    let ofs = ecx.image.intern_string(&ecx.intern[s], &mut ecx.tmp);
+    let ptr = ecx.data.fb.usedata(ofs);
+    ecx.data.values[id] = InsValue::from_value(ptr);
 }
 
 fn ins_mov(ecx: &mut Ecx, id: InsId) {
@@ -295,7 +302,7 @@ fn ins_cmp(ecx: &mut Ecx, id: InsId) {
             };
             emit.fb.ins().fcmp(cmp, left, right)
         },
-        I8 | I16 | I32 | I64 => {
+        I8 | I16 | I32 | I64 | PTR => {
             let cmp = match opcode {
                 EQ  => IntCC::Equal,
                 NE  => IntCC::NotEqual,
@@ -327,7 +334,7 @@ fn ins_cmp(ecx: &mut Ecx, id: InsId) {
 fn ins_alloc(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (size, align) = emit.code[id].decode_VV();
-    let alloc = emit.fb.importsupp(&ecx.ir, SuppFunc::ALLOC);
+    let alloc = emit.fb.importrtfunc(&ecx.ir, RtFunc::ALLOC);
     let size = emit.fb.coerce(emit.values[size].value(), Type::I64, Conv::Unsigned);
     let align = emit.fb.coerce(emit.values[align].value(), Type::I64, Conv::Unsigned);
     let call = emit.fb.ins().call(alloc, &[size, align]);
@@ -496,7 +503,7 @@ fn ins_cinit(ecx: &mut Ecx, id: InsId) {
     let func = &ecx.ir.funcs[chunk];
     if !func.scl.is_dynamic() { /* NOP */ return }
     let FuncKind::Chunk(cid) = func.kind else { unreachable!() };
-    let dsinit = emit.fb.importsupp(&ecx.ir, SuppFunc::INIT);
+    let dsinit = emit.fb.importrtfunc(&ecx.ir, RtFunc::INIT);
     let tab = emit.fb.usedata(ecx.layout.chunks[cid].dynslots);
     let nret: usize = func.ret.into();
     // bitmap + one for each return
@@ -526,7 +533,7 @@ pub fn translate(ecx: &mut Ecx, id: InsId) -> compile::Result {
             PHI => ins_phi(ecx, id),
             KINT | KINT64 => ins_kintx(ecx, id),
             KFP64 => ins_kfp64(ecx, id),
-            KSTR => todo!(),
+            KSTR => ins_kstr(ecx, id),
             KREF => { /* NOP */ },
             MOV | MOVB | MOVF => ins_mov(ecx, id),
             CMOV => ins_cmov(ecx, id),

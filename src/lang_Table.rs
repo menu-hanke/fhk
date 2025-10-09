@@ -33,7 +33,7 @@ use crate::mcode::{MCodeOffset, Reloc};
 use crate::obj::{ObjRef, CALL};
 use crate::parse::parse_expr;
 use crate::parser::{check, consume, next, Pcx};
-use crate::typing::IRT_IDX;
+use crate::runtime::IRT_IDX;
 
 // (LOXX) lsv TREF ...
 // (LOVV) idx TROW (TREF) (CARG idxlist)

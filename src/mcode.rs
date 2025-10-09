@@ -10,7 +10,7 @@ use crate::compile;
 use crate::hash::fxhash;
 use crate::index::{index, IndexVec};
 use crate::mmap::{Mmap, Prot};
-use crate::support::NativeFunc;
+use crate::runtime::NativeFunc;
 use crate::trace::trace;
 
 // cranelift uses:

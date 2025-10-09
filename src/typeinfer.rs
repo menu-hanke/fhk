@@ -18,9 +18,10 @@ use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intern::Interned;
 use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LET, LGET, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
 use crate::relation::Relation;
+use crate::runtime::PRI_IDX;
 use crate::trace::trace;
 use crate::typestate::{Absent, Access, R};
-use crate::typing::{Constructor, Primitive, PRI_IDX};
+use crate::typing::{Constructor, Primitive};
 
 index!(struct TypeVar(u32) debug("t{}"));
 index!(struct FuncId(u32) invalid(!0));

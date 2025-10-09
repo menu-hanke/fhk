@@ -166,9 +166,14 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
             debug_assert!(ins.type_() == Type::B1);
             let value = if left.type_().is_fp() {
                 foldfpcmp(op, kfpvalue(fcx, left), kfpvalue(fcx, right))
-            } else {
-                debug_assert!(left.type_().is_int());
+            } else if left.type_().is_int() {
                 foldintcmp(op, kintvalue(fcx, left), kintvalue(fcx, right))
+            } else {
+                // string comparison. string literals are always interned.
+                debug_assert!(left.type_() == Type::PTR
+                    && (EQ|NE).contains(op)
+                    && (left.opcode() == KSTR && right.opcode() == KSTR));
+                (left.bc() == right.bc()) == (op == EQ)
             };
             FoldStatus::Done(Ins::KINT(Type::B1, value as _))
         },
