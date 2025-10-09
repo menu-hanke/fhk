@@ -1,7 +1,7 @@
 //! Type inference.
 
 use core::cmp::min;
-use core::fmt::Debug;
+use core::fmt::{Debug, Write};
 use core::hash::Hasher;
 use core::iter::{repeat_n, zip};
 use core::mem::replace;
@@ -12,8 +12,9 @@ use hashbrown::hash_table::Entry;
 use hashbrown::HashTable;
 use rustc_hash::FxHasher;
 
+use crate::bump::Bump;
 use crate::compile::{self, Ccx, Stage};
-use crate::dump::trace_objs;
+use crate::dump::{dump_shortobj, trace_objs};
 use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intern::Interned;
 use crate::obj::{obj_index_of, BinOp, Intrinsic, LocalId, Obj, ObjRef, ObjectRef, Objects, Operator, APPLY, BINOP, CALL, CAT, EXPR, FLAT, FUNC, INTR, KFP64, KINT, KINT64, LET, LGET, MOD, NEW, PGET, QUERY, SPEC, SPLAT, TAB, TGET, TPRI, TTEN, TTUP, TUPLE, VAR, VGET, VSET};
@@ -83,6 +84,12 @@ enum Constraint {
     Index(Ty, Ty, Ty), // b:tensor, c:dim :: a = b[c]
 }
 
+#[derive(Clone)]
+struct ConstraintData {
+    obj: ObjRef,
+    con: Constraint
+}
+
 struct Func {
     name: Interned<[u8]>, // original objs[func].name; objs name is FuncId during inference
     obj: ObjRef<FUNC>,
@@ -95,13 +102,31 @@ struct Monomorphization {
     generics: TypeVar
 }
 
+enum ErrMsg {
+    Recursive(Tv),      // recursive type
+    Unify(Tv, Tv),      // cannot assign $1 to $2
+    Index(u8, u8),      // expected $1 dimensions, got $2
+    // Signature(u8, u8)   // expected $1 arguments, got $2
+}
+
+struct TypeError {
+    ctx: ObjRef,
+    msg: ErrMsg
+}
+
+struct ErrCtx {
+    obj: ObjRef,
+    errors: Vec<TypeError>
+}
+
 pub struct TypeInfer {
     sub: IndexVec<TypeVar, Tv>,
-    con: Vec<Constraint>,
+    err: ErrCtx,
+    con: Vec<ConstraintData>,
     locals: IndexVec<LocalId, TypeVar>,
     func: IndexVec<FuncId, Func>,
     func_generic: Relation<FuncId, /* packed Option<EnumSet<Primitive>>: */u16>,
-    func_con: Relation<FuncId, Constraint>,
+    func_con: Relation<FuncId, ConstraintData>,
     tobj: HashTable<ObjRef>,
     monotab: HashTable<MonoId>,
     mono: IndexVec<MonoId, Monomorphization>,
@@ -174,7 +199,7 @@ impl Debug for Type {
         match *self {
             Type::Link(i) => i.fmt(f),
             Type::Primitive(p) => p.fmt(f),
-            Type::Generic(i) => write!(f,"<{}>", i),
+            Type::Generic(i) => write!(f,"${}", i),
             Type::Constructor(Constructor::Tensor, base) => write!(f, "{:?}[{:?}]", base, base+1),
             Type::Constructor(Constructor::Pair, base) => write!(f, "({:?}, {:?})", base, base+1),
             Type::Constructor(Constructor::Func, base) => write!(f, "{:?} -> {:?}", base, base+1),
@@ -326,30 +351,54 @@ fn isconcretetype(sub: &IndexSlice<TypeVar, Tv>, ty: Ty, scope: Scope) -> bool {
     }
 }
 
-fn occursv(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: TypeVar, scope: Scope) {
+fn terr(ecx: &mut ErrCtx, msg: ErrMsg) {
+    ecx.errors.push(TypeError { ctx: ecx.obj, msg });
+}
+
+fn occursv(
+    sub: &mut IndexSlice<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    a: TypeVar,
+    b: TypeVar,
+    scope: Scope
+) -> bool {
     use TVar::*;
     if a == b {
-        // TODO: type error recursive type
-        todo!()
+        terr(ecx, ErrMsg::Recursive(sub[a]));
+        sub[a] = Tv::bound(Ty::NEVER);
+        sub[b] = Tv::bound(Ty::NEVER);
+        return true
     }
     match sub[b].unpack() {
-        Bound(t) => occurs(sub, a, t, scope),
-        Unbound(Scope::Global, _) => { /* ok */ },
-        Unbound(Scope::Local, _) if scope == Scope::Local => { /* ok */ },
-        Unbound(Scope::Local, pri) => sub[b] = Tv::unbound(Scope::Global, pri)
+        Bound(t) => occurs(sub, ecx, a, t, scope),
+        Unbound(Scope::Global, _) => false,
+        Unbound(Scope::Local, _) if scope == Scope::Local => false,
+        Unbound(Scope::Local, pri) => {
+            sub[b] = Tv::unbound(Scope::Global, pri);
+            false
+        }
     }
 }
 
-fn occurs(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: Ty, scope: Scope) {
+fn occurs(
+    sub: &mut IndexSlice<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    a: TypeVar,
+    b: Ty,
+    scope: Scope
+) -> bool {
     use Type::*;
     match b.unpack() {
-        Link(i) => occursv(sub, a, i, scope),
+        Link(i) => occursv(sub, ecx, a, i, scope),
         Constructor(c, d) => {
             for i in 0..c.arity() as isize {
-                occursv(sub, a, d+i, scope);
+                if occursv(sub, ecx, a, d+i, scope) {
+                    return true;
+                }
             }
+            false
         },
-        _ => { /* ok */ }
+        _ => false
     }
 }
 
@@ -361,14 +410,14 @@ fn unifyss(a: Scope, b: Scope) -> Scope {
     }
 }
 
-fn unifyvv(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: TypeVar) {
+fn unifyvv(sub: &mut IndexSlice<TypeVar, Tv>, ecx: &mut ErrCtx, a: TypeVar, b: TypeVar) {
     use TVar::*;
     trace!(TYPE "unify {a:?} = {b:?}");
     if a == b { return }
     match (sub[a].unpack(), sub[b].unpack()) {
-        (Bound(ta), Bound(tb)) => unifytt(sub, ta, tb),
-        (Bound(t), Unbound(_, _)) => unifyvt(sub, b, t),
-        (Unbound(_, _), Bound(t)) => unifyvt(sub, a, t),
+        (Bound(ta), Bound(tb)) => unifytt(sub, ecx, ta, tb),
+        (Bound(t), Unbound(_, _)) => unifyvt(sub, ecx, b, t),
+        (Unbound(_, _), Bound(t)) => unifyvt(sub, ecx, a, t),
         (Unbound(sa, pa), Unbound(sb, pb)) => {
             let pri = match (pa, pb) {
                 (Some(pa), Some(pb)) => Some(pa&pb),
@@ -376,8 +425,12 @@ fn unifyvv(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: TypeVar) {
                 (None, None) => None
             };
             sub[a] = match pri {
-                Some(pri) if pri.is_empty() => { todo!() /* type error */ },
-                Some(pri) if pri.len() == 1 => Tv::bound(Ty::primitive(pri.iter().next().unwrap())),
+                Some(pri) if pri.is_empty() => {
+                    terr(ecx, ErrMsg::Unify(sub[a], sub[b]));
+                    Tv::bound(Ty::NEVER)
+                },
+                Some(pri) if pri.len() == 1 => Tv::bound(
+                    Ty::primitive(pri.iter().next().unwrap())),
                 _ => Tv::unbound(unifyss(sa, sb), pri)
             };
             sub[b] = Tv::bound(Ty::link(a));
@@ -385,15 +438,23 @@ fn unifyvv(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: TypeVar) {
     }
 }
 
-fn unifyvpri(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: EnumSet<Primitive>) {
+fn unifyvpri(
+    sub: &mut IndexSlice<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    a: TypeVar,
+    b: EnumSet<Primitive>
+) {
     use TVar::*;
     trace!(TYPE "unify {a:?} in {b:?}");
     match sub[a].unpack() {
-        Bound(t) => unifytpri(sub, t, b),
+        Bound(t) => unifytpri(sub, ecx, t, b),
         Unbound(scope, p) => {
             let pri = b & p.unwrap_or(EnumSet::all());
             sub[a] = match pri.len() {
-                0 => { todo!() /* type error */ },
+                0 => {
+                    terr(ecx, ErrMsg::Unify(sub[a], Tv::unbound(scope, Some(b))));
+                    Tv::bound(Ty::NEVER)
+                },
                 1 => Tv::bound(Ty::primitive(pri.iter().next().unwrap())),
                 _ => Tv::unbound(scope, Some(pri))
             };
@@ -401,70 +462,76 @@ fn unifyvpri(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, b: EnumSet<Primitive
     }
 }
 
-fn unifyvt(sub: &mut IndexSlice<TypeVar, Tv>, a: TypeVar, mut b: Ty) {
+fn unifyvt(sub: &mut IndexSlice<TypeVar, Tv>, ecx: &mut ErrCtx, a: TypeVar, b: Ty) {
     use {Type::*,TVar::*};
     trace!(TYPE "unify {a:?} = {b:?}");
     match (sub[a].unpack(), b.unpack()) {
-        (_, Link(i)) => unifyvv(sub, a, i),
-        (Bound(t), _) => unifytt(sub, t, b),
+        (_, Link(i)) => unifyvv(sub, ecx, a, i),
+        (Bound(t), _) => unifytt(sub, ecx, t, b),
         (Unbound(scope, pri), t) => {
             match (pri, t) {
                 (Some(pri), Primitive(p)) if pri.contains(p) => { /* ok */ },
-                (Some(pri), Constructor(self::Constructor::Tensor, base)) => {
-                    unifyvpri(sub, base, pri);
-                    unifyvt(sub, base+1, Ty::UNIT);
-                    b = Ty::link(base);
+                (Some(_), Constructor(self::Constructor::Tensor, base)) => {
+                    unifyvt(sub, ecx, base+1, Ty::UNIT);
+                    unifyvv(sub, ecx, a, base);
+                    return
                 },
                 (None, _) => { /* ok */ },
-                _ => { todo!() /* type error */ }
+                _ => {
+                    terr(ecx, ErrMsg::Unify(sub[a], Tv::bound(b)));
+                    sub[a] = Tv::bound(Ty::NEVER);
+                    return;
+                }
             }
-            occurs(sub, a, b, scope);
-            sub[a] = Tv::bound(b);
+            if !occurs(sub, ecx, a, b, scope) {
+                sub[a] = Tv::bound(b);
+            } // else: occurs sets both to NEVER
         }
     }
 }
 
-fn unifytt(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: Ty) {
+fn unifytt(sub: &mut IndexSlice<TypeVar, Tv>, ecx: &mut ErrCtx, a: Ty, b: Ty) {
     use Type::*;
     trace!(TYPE "unify {a:?} = {b:?}");
     match (a.unpack(), b.unpack()) {
-        (Link(i), Link(j)) => unifyvv(sub, i, j),
-        (Link(i), _) => unifyvt(sub, i, b),
-        (_, Link(j)) => unifyvt(sub, j, a),
+        (Link(i), Link(j)) => unifyvv(sub, ecx, i, j),
+        (Link(i), _) => unifyvt(sub, ecx, i, b),
+        (_, Link(j)) => unifyvt(sub, ecx, j, a),
         (Primitive(p), Primitive(q)) if p==q => { /* ok */ },
         (Generic(i), Generic(j)) if i==j => { /* ok */ },
         (Constructor(c, c0), Constructor(d, d0)) if c==d => {
             for i in 0..c.arity() as isize {
-                unifyvv(sub, c0 + i, d0 + i)
+                unifyvv(sub, ecx, c0 + i, d0 + i)
             }
         },
         (Constructor(self::Constructor::Tensor, base), _) => {
-            unifyvt(sub, base, b);
-            unifyvt(sub, base+1, Ty::UNIT);
+            unifyvt(sub, ecx, base, b);
+            unifyvt(sub, ecx, base+1, Ty::UNIT);
         },
         (_, Constructor(self::Constructor::Tensor, base)) => {
-            unifyvt(sub, base, a);
-            unifyvt(sub, base+1, Ty::UNIT);
+            unifyvt(sub, ecx, base, a);
+            unifyvt(sub, ecx, base+1, Ty::UNIT);
         },
         (Constructor(self::Constructor::Never, _), _)
             | (_, Constructor(self::Constructor::Never, _)) => { /* ok */ },
-        _ => {
-            // TODO: type error
-            todo!()
-        }
+        _ => terr(ecx, ErrMsg::Unify(Tv::bound(a), Tv::bound(b)))
     }
 }
 
-fn unifytpri(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: EnumSet<Primitive>) {
+fn unifytpri(sub: &mut IndexSlice<TypeVar, Tv>, ecx: &mut ErrCtx, a: Ty, b: EnumSet<Primitive>) {
     use Type::*;
     match a.unpack() {
-        Link(i) => unifyvpri(sub, i, b),
+        Link(i) => unifyvpri(sub, ecx, i, b),
         Primitive(p) if b.contains(p) => { /* ok */ },
         Constructor(self::Constructor::Tensor, base) => {
-            unifyvpri(sub, base, b);
-            unifyvt(sub, base+1, Ty::UNIT);
+            unifyvpri(sub, ecx, base, b);
+            unifyvt(sub, ecx, base+1, Ty::UNIT);
         },
-        _ => { todo!() /* type error */ }
+        _ => {
+            // possibly wrong scope, but it doesn't matter, it's not even shown in the error
+            // message.
+            terr(ecx, ErrMsg::Unify(Tv::bound(a), Tv::unbound(Scope::Global, Some(b))));
+        }
     }
 }
 
@@ -508,7 +575,7 @@ fn isconcretec(sub: &IndexSlice<TypeVar, Tv>, con: &Constraint) -> bool {
 fn generalizec(ctx: &mut TypeInfer, func: FuncId) {
     let mut idx = 0;
     while idx < ctx.con.len() {
-        if isconcretec(&ctx.sub, &ctx.con[idx]) {
+        if isconcretec(&ctx.sub, &ctx.con[idx].con) {
             idx += 1;
         } else {
             ctx.func_con.add(func, ctx.con.swap_remove(idx));
@@ -582,26 +649,35 @@ fn instantiatef(ctx: &mut TypeInfer, fid: FuncId) -> (TypeVar, Ty) {
     let scope = func2scope(ctx.func_args);
     ctx.sub.raw.extend(generics.iter().map(|&c| Tv::unbound(scope, EnumSet::try_from_u16(c))));
     let ncon = ctx.func_con[fid].len();
+    let eobj = ctx.err.obj;
     for i in 0..ncon {
-        let con = instantiatec(&mut ctx.sub, generics_base, &ctx.func_con[fid][i]);
+        let cd = &ctx.func_con[fid][i];
+        ctx.err.obj = cd.obj;
+        let con = instantiatec(&mut ctx.sub, generics_base, &cd.con);
         constraint(ctx, con);
     }
+    ctx.err.obj = eobj;
     (generics_base, instantiatet(&mut ctx.sub, generics_base, type_))
 }
 
-fn unpacktensor(sub: &mut IndexVec<TypeVar, Tv>, ten: Ty, scope: Scope) -> (TypeVar, TypeVar) {
+fn unpacktensor(
+    sub: &mut IndexVec<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    ten: Ty,
+    scope: Scope
+) -> (TypeVar, TypeVar) {
     match ten.unpack() {
         Type::Constructor(Constructor::Tensor, base) => return (base, base+1),
         Type::Link(i) => {
             if let TVar::Bound(t) = sub[i].unpack() {
-                return unpacktensor(sub, t, scope);
+                return unpacktensor(sub, ecx, t, scope);
             }
         },
         _ => {}
     }
     let e = newtypevar(sub, scope);
     let d = newtypevar(sub, scope);
-    unifytt(sub, ten, Ty::constructor(Constructor::Tensor, e));
+    unifytt(sub, ecx, ten, Ty::constructor(Constructor::Tensor, e));
     (e, d)
 }
 
@@ -687,7 +763,13 @@ fn shallowdimension(sub: &IndexSlice<TypeVar, Tv>, ty: Ty) -> Option<Ty> {
     }
 }
 
-fn simplify_binop(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: Ty, c: Ty) -> bool {
+fn simplify_binop(
+    sub: &mut IndexSlice<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    a: Ty,
+    b: Ty,
+    c: Ty
+) -> bool {
     match (
         shallowdimension(sub, a),
         shallowdimension(sub, b),
@@ -695,26 +777,33 @@ fn simplify_binop(sub: &mut IndexSlice<TypeVar, Tv>, a: Ty, b: Ty, c: Ty) -> boo
     ) {
         (_, Some(Ty::UNIT), _) => {
             // scalar lhs -> output is rhs
-            unifytt(sub, a, c);
+            unifytt(sub, ecx, a, c);
             true
         },
         (_, _, Some(Ty::UNIT)) => {
             // scalar rhs -> output is lhs
-            unifytt(sub, a, b);
+            unifytt(sub, ecx, a, b);
             true
         },
         (Some(Ty::UNIT), _, _) | (_, Some(_), Some(_)) => {
             // scalar output -> scalar inputs
             // two tensor inputs -> tensor output
-            unifytt(sub, a, b);
-            unifytt(sub, a, c);
+            unifytt(sub, ecx, a, b);
+            unifytt(sub, ecx, a, c);
             true
         }
         _ => false
     }
 }
 
-fn simplify_index(sub: &mut IndexVec<TypeVar, Tv>, a: Ty, b: Ty, c: Ty, scope: Scope) -> bool {
+fn simplify_index(
+    sub: &mut IndexVec<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    a: Ty,
+    b: Ty,
+    c: Ty,
+    scope: Scope
+) -> bool {
     match (
         shallowdimension(sub, a),
         shallowdimension(sub, b),
@@ -722,41 +811,41 @@ fn simplify_index(sub: &mut IndexVec<TypeVar, Tv>, a: Ty, b: Ty, c: Ty, scope: S
     ) {
         (Some(Ty::UNIT), _, _) => {
             // output is scalar -> we are indexing a 1-d tensor with a scalar
-            let (e, d) = unpacktensor(sub, b, scope);
-            unifyvt(sub, e, a);
-            unifyvt(sub, d, Ty::V1D);
-            unifytt(sub, c, Ty::UNIT);
+            let (e, d) = unpacktensor(sub, ecx, b, scope);
+            unifyvt(sub, ecx, e, a);
+            unifyvt(sub, ecx, d, Ty::V1D);
+            unifytt(sub, ecx, c, Ty::UNIT);
             true
         },
         (Some(_), _, Some(Ty::UNIT)) => {
             // output is n-d tensor and index is scalar -> we are indexing an (n+1)-d tensor
-            let (eb, db) = unpacktensor(sub, b, scope);
-            let (ea, da) = unpacktensor(sub, a, scope);
-            unifyvv(sub, eb, ea);
-            unifyvt(sub, db, Ty::constructor(Constructor::Next, da));
+            let (eb, db) = unpacktensor(sub, ecx, b, scope);
+            let (ea, da) = unpacktensor(sub, ecx, a, scope);
+            unifyvv(sub, ecx, eb, ea);
+            unifyvt(sub, ecx, db, Ty::constructor(Constructor::Next, da));
             true
         },
         (_, _, Some(d)) if d != Ty::UNIT => {
             // index is tensor -> we are indexing an n-d tensor with a 1-d tensor
-            unifytt(sub, a, b);
-            unifytt(sub, c, Ty::V1D);
+            unifytt(sub, ecx, a, b);
+            unifytt(sub, ecx, c, Ty::V1D);
             true
         },
         (Some(da), Some(db), _) if match equaltt(sub, None, da, db) {
             Some(true) => {
                 // input and output have same dimension -> indexing with a 1-d tensor
-                unifytt(sub, a, b);
-                unifytt(sub, c, Ty::V1D);
+                unifytt(sub, ecx, a, b);
+                unifytt(sub, ecx, c, Ty::V1D);
                 true
             },
             Some(false) => {
                 // input and output have different dimensions, and output is known to be a tensor
                 // -> scalar index of n-d tensor (n>1) -> tensor result
-                let (ea, da) = unpacktensor(sub, a, scope);
-                let (eb, db) = unpacktensor(sub, b, scope);
-                unifyvv(sub, eb, ea);
-                unifyvt(sub, db, Ty::constructor(Constructor::Next, da));
-                unifytt(sub, c, Ty::UNIT);
+                let (ea, da) = unpacktensor(sub, ecx, a, scope);
+                let (eb, db) = unpacktensor(sub, ecx, b, scope);
+                unifyvv(sub, ecx, eb, ea);
+                unifyvt(sub, ecx, db, Ty::constructor(Constructor::Next, da));
+                unifytt(sub, ecx, c, Ty::UNIT);
                 true
             },
             None => false
@@ -765,16 +854,16 @@ fn simplify_index(sub: &mut IndexVec<TypeVar, Tv>, a: Ty, b: Ty, c: Ty, scope: S
             Some(ddb) => match shallowdimension(sub, ddb) {
                 Some(Ty::UNIT) => {
                     // scalar index of 1-d tensor -> scalar result.
-                    let (eb, _) = unpacktensor(sub, b, scope);
-                    unifyvt(sub, eb, a);
+                    let (eb, _) = unpacktensor(sub, ecx, b, scope);
+                    unifyvt(sub, ecx, eb, a);
                     true
                 },
                 Some(_) => {
                     // scalar index of n-d tensor (n>1) -> tensor result.
-                    let (ea, da) = unpacktensor(sub, a, scope);
-                    let (eb, db) = unpacktensor(sub, b, scope);
-                    unifyvv(sub, eb, ea);
-                    unifyvt(sub, db, Ty::constructor(Constructor::Next, da));
+                    let (ea, da) = unpacktensor(sub, ecx, a, scope);
+                    let (eb, db) = unpacktensor(sub, ecx, b, scope);
+                    unifyvv(sub, ecx, eb, ea);
+                    unifyvt(sub, ecx, db, Ty::constructor(Constructor::Next, da));
                     true
                 },
                 None => false
@@ -787,14 +876,15 @@ fn simplify_index(sub: &mut IndexVec<TypeVar, Tv>, a: Ty, b: Ty, c: Ty, scope: S
 
 fn simplifyconstraint(ctx: &mut TypeInfer, con: Constraint) -> bool {
     match con {
-        Constraint::BinOp(a, b, c) => simplify_binop(&mut ctx.sub, a, b, c),
-        Constraint::Index(a, b, c) => simplify_index(&mut ctx.sub, a, b, c, func2scope(ctx.func_args))
+        Constraint::BinOp(a, b, c) => simplify_binop(&mut ctx.sub, &mut ctx.err,  a, b, c),
+        Constraint::Index(a, b, c) => simplify_index(&mut ctx.sub, &mut ctx.err, a, b, c,
+            func2scope(ctx.func_args))
     }
 }
 
 fn constraint(ctx: &mut TypeInfer, con: Constraint) {
     if !simplifyconstraint(ctx, con.clone()) {
-        ctx.con.push(con);
+        ctx.con.push(ConstraintData { obj: ctx.err.obj, con });
     }
 }
 
@@ -803,7 +893,8 @@ fn simplify(ctx: &mut TypeInfer) {
         let mut fixpoint = true;
         let mut idx = 0;
         while idx < ctx.con.len() {
-            if simplifyconstraint(ctx, ctx.con[idx].clone()) {
+            ctx.err.obj = ctx.con[idx].obj;
+            if simplifyconstraint(ctx, ctx.con[idx].con.clone()) {
                 ctx.con.swap_remove(idx);
                 fixpoint = false;
             } else {
@@ -915,7 +1006,7 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
     let axes = &objs[objs[objs[var].tab].shape].fields;
     let need = axes.len();
     if have > need {
-        // too many indices mentioned.
+        terr(&mut tcx.data.err, ErrMsg::Index(have as _, need as _));
         return Ty::NEVER;
     }
     let prefix = min(objs.dim(tcx.data.tab), need-have);
@@ -963,45 +1054,50 @@ fn visitvref(tcx: &mut Tcx, var: ObjRef<VAR>, idx: &[ObjRef<EXPR>], mut have: us
                 Obj::SPEC if objs[e].data == SPEC::SLURP => {
                     // dimension can't go to zero here because this is always followed by an
                     // explicit index, so we don't need a constraint.
-                    let (_, dim) = unpacktensor(&mut tcx.data.sub, v, scope);
-                    let dim = newcontype(&mut tcx.data.sub, Constructor::Next, &[Ty::link(dim)]);
-                    v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, dim]);
+                    let ctx = &mut *tcx.data;
+                    let (_, dim) = unpacktensor(&mut ctx.sub, &mut ctx.err, v, scope);
+                    let dim = newcontype(&mut ctx.sub, Constructor::Next, &[Ty::link(dim)]);
+                    v = newcontype(&mut ctx.sub, Constructor::Tensor, &[ty, dim]);
                 },
                 Obj::FLAT => {
                     // dimension can't go to zero here because this behaves like a 1D tensor index,
                     // so we don't need a constraint.
                     visitexpr(tcx, e);
+                    let ctx = &mut *tcx.data;
                     let m = objs[e.cast::<FLAT>()].idx.len();
                     if m > 1 {
-                        let (_, dim) = unpacktensor(&mut tcx.data.sub, v, scope);
+                        let (_, dim) = unpacktensor(&mut ctx.sub, &mut ctx.err, v, scope);
                         let mut dim = Ty::link(dim);
                         for _ in 1..m {
-                            dim = newcontype(&mut tcx.data.sub, Constructor::Next, &[dim]);
+                            dim = newcontype(&mut ctx.sub, Constructor::Next, &[dim]);
                         }
-                        v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, dim]);
+                        v = newcontype(&mut ctx.sub, Constructor::Tensor, &[ty, dim]);
                     }
                 },
                 _ => {
                     let ety = visitexpr(tcx, e);
-                    let (elem, edim) = unpacktensor(&mut tcx.data.sub, Ty::link(ety), scope);
-                    unifyvt(&mut tcx.data.sub, elem, Ty::primitive(PRI_IDX));
-                    let vnext = newtypevar(&mut tcx.data.sub, scope);
-                    constraint(&mut tcx.data, Constraint::Index(Ty::link(vnext), v, Ty::link(edim)));
+                    let ctx = &mut *tcx.data;
+                    let (elem, edim) = unpacktensor(&mut ctx.sub, &mut ctx.err, Ty::link(ety),
+                        scope);
+                    unifyvt(&mut ctx.sub, &mut ctx.err, elem, Ty::primitive(PRI_IDX));
+                    let vnext = newtypevar(&mut ctx.sub, scope);
+                    constraint(ctx, Constraint::Index(Ty::link(vnext), v, Ty::link(edim)));
                     v = Ty::link(vnext);
                 }
             }
         }
         // increment dimension if we have implicit dimensions
         if dim > 0 {
-            let vdim = newtypevar(&mut tcx.data.sub, scope);
-            let vten = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, Ty::link(vdim)]);
-            unifytt(&mut tcx.data.sub, vten, v);
+            let ctx = &mut *tcx.data;
+            let vdim = newtypevar(&mut ctx.sub, scope);
+            let vten = newcontype(&mut ctx.sub, Constructor::Tensor, &[ty, Ty::link(vdim)]);
+            unifytt(&mut ctx.sub, &mut ctx.err, vten, v);
             let mut rdim = Ty::constructor(Constructor::Next, vdim);
             for _ in 0..dim {
-                rdim = newcontype(&mut tcx.data.sub, Constructor::Next, &[rdim]);
+                rdim = newcontype(&mut ctx.sub, Constructor::Next, &[rdim]);
             }
-            let rdim = tcx.data.sub.push(Tv::bound(rdim));
-            v = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[ty, Ty::link(rdim)]);
+            let rdim = ctx.sub.push(Tv::bound(rdim));
+            v = newcontype(&mut ctx.sub, Constructor::Tensor, &[ty, Ty::link(rdim)]);
         }
         v
     }
@@ -1016,7 +1112,12 @@ fn visittuple(tcx: &mut Tcx, elements: &[ObjRef<EXPR>]) -> Ty {
     ty
 }
 
-fn indextuple(sub: &mut IndexVec<TypeVar, Tv>, mut ty: Ty, mut field: usize) -> TypeVar {
+fn indextuple(
+    sub: &mut IndexVec<TypeVar, Tv>,
+    ecx: &mut ErrCtx,
+    mut ty: Ty,
+    mut field: usize
+) -> Ty {
     use {Type::*, TVar::*, self::Constructor::*};
     let (scope, mut tvar) = loop {
         match ty.unpack() {
@@ -1025,15 +1126,16 @@ fn indextuple(sub: &mut IndexVec<TypeVar, Tv>, mut ty: Ty, mut field: usize) -> 
                 Unbound(scope, _) => break (scope, i)
             },
             Constructor(Pair, base) => match field {
-                0 => return base,
+                0 => return Ty::link(base),
                 _ => {
                     ty = Ty::link(base+1);
                     field -= 1;
                 }
             },
             _ => {
-                // TODO: anything else is a type error
-                todo!()
+                terr(ecx, ErrMsg::Unify(Tv::bound(ty),
+                    Tv::bound(Ty::constructor(Pair, TypeVar::UNIT))));
+                return Ty::NEVER;
             }
         }
     };
@@ -1041,9 +1143,9 @@ fn indextuple(sub: &mut IndexVec<TypeVar, Tv>, mut ty: Ty, mut field: usize) -> 
         let element = newtypevar(sub, scope);
         let next = newtypevar(sub, scope);
         let repr = newpairtype(sub, Ty::link(element), Ty::link(next));
-        unifyvt(sub, tvar, repr);
+        unifyvt(sub, ecx, tvar, repr);
         match field {
-            0 => return element,
+            0 => return Ty::link(element),
             _ => {
                 tvar = next;
                 field -= 1;
@@ -1052,12 +1154,12 @@ fn indextuple(sub: &mut IndexVec<TypeVar, Tv>, mut ty: Ty, mut field: usize) -> 
     }
 }
 
-fn unpackvarg(sub: &mut IndexVec<TypeVar, Tv>, args: &[Ty]) -> Ty {
+fn unpackvarg(sub: &mut IndexVec<TypeVar, Tv>, ecx: &mut ErrCtx, args: &[Ty]) -> Ty {
     match args {
         [] => Ty::NEVER,
         &[first, ref rest@..] => {
             for &r in rest {
-                unifytt(sub, first, r);
+                unifytt(sub, ecx, first, r);
             }
             first
         }
@@ -1069,14 +1171,14 @@ macro_rules! instantiate {
     (@type pri $v:expr ; $($_:tt)*) => {
         Ty::primitive($v)
     };
-    (@type $con:ident $($t:expr)+ ; $tcx:expr) => {
-        newcontype(&mut $tcx.data.sub, Constructor::$con, &[$($t),+])
+    (@type $con:ident $($t:expr)+ ; $ctx:expr) => {
+        newcontype(&mut $ctx.sub, Constructor::$con, &[$($t),+])
     };
     (@type $v:tt ; $($_:tt)*) => {
         $v
     };
     (
-        $tcx:expr,
+        $ctx:expr,
         $scope:expr,
         $args:expr;
         $($unpack:ident)*
@@ -1091,11 +1193,11 @@ macro_rules! instantiate {
     ) => {{
         let &[ $($unpack,)* $(ref $varg@..)? ] = $args
             else { unreachable!() /* TODO: should be type error */ };
-        $(let $varg = unpackvarg(&mut $tcx.data.sub, $varg);)?
+        $(let $varg = unpackvarg(&mut $ctx.sub, &mut $ctx.err, $varg);)?
         $(
             $(
                 let $new = Ty::link(
-                    $tcx.data.sub.push(
+                    $ctx.sub.push(
                         Tv::unbound(
                             $scope,
                             None $( .or(Some($bound)) )?
@@ -1107,12 +1209,12 @@ macro_rules! instantiate {
         $(
             $(
                 {
-                    let rhs = instantiate!(@type $($rhs)* ; $tcx);
-                    unifytt(&mut $tcx.data.sub, $lhs, rhs);
+                    let rhs = instantiate!(@type $($rhs)* ; $ctx);
+                    unifytt(&mut $ctx.sub, &mut $ctx.err, $lhs, rhs);
                 }
             )*
         )?
-        instantiate!(@type $($ret)* ; $tcx)
+        instantiate!(@type $($ret)* ; $ctx)
     }};
 }
 
@@ -1120,8 +1222,8 @@ fn visitminmax(ctx: &mut TypeInfer, args: &[Ty], scope: Scope) -> Ty {
     let e = ctx.sub.push(Tv::unbound(scope, Some(PRI_NUM)));
     let mut accumulator: Option<TypeVar> = None;
     for &a in args {
-        let (ae, ad) = unpacktensor(&mut ctx.sub, a, scope);
-        unifyvv(&mut ctx.sub, e, ae);
+        let (ae, ad) = unpacktensor(&mut ctx.sub, &mut ctx.err, a, scope);
+        unifyvv(&mut ctx.sub, &mut ctx.err, e, ae);
         accumulator = Some(match accumulator {
             Some(acc) => {
                 let d = newtypevar(&mut ctx.sub, scope);
@@ -1135,23 +1237,23 @@ fn visitminmax(ctx: &mut TypeInfer, args: &[Ty], scope: Scope) -> Ty {
     newcontype(&mut ctx.sub, Constructor::Tensor, &[Ty::link(e), Ty::link(d)])
 }
 
-fn visitselect(tcx: &mut Tcx, cond: Ty, tru: Ty, fal: Ty, scope: Scope) -> Ty {
-    let (ce,cd) = unpacktensor(&mut tcx.data.sub, cond, scope);
-    let (te,td) = unpacktensor(&mut tcx.data.sub, tru, scope);
-    let (fe,fd) = unpacktensor(&mut tcx.data.sub, fal, scope);
+fn visitselect(ctx: &mut TypeInfer, cond: Ty, tru: Ty, fal: Ty, scope: Scope) -> Ty {
+    let (ce,cd) = unpacktensor(&mut ctx.sub, &mut ctx.err, cond, scope);
+    let (te,td) = unpacktensor(&mut ctx.sub, &mut ctx.err, tru, scope);
+    let (fe,fd) = unpacktensor(&mut ctx.sub, &mut ctx.err, fal, scope);
     // must require e to be primitive here to prevent the potential creation of a
     // zero-dimension non-primitive tensor (which makes the typing unsound).
     // this restriction isn't actually always needed: if cond is scalar, we could just require
     // tru=fal and return that. for now, this is not implemented because it requires creating
     // a new constraint type.
-    let e = tcx.data.sub.push(Tv::unbound(scope, Some(EnumSet::all())));
-    let d = newtypevar(&mut tcx.data.sub, scope); // must be e+1
-    let d1 = newtypevar(&mut tcx.data.sub, scope);
-    unifyvt(&mut tcx.data.sub, ce, Ty::primitive(Primitive::B1));
-    unifyvv(&mut tcx.data.sub, e, te);
-    unifyvv(&mut tcx.data.sub, e, fe);
-    constraint(&mut tcx.data, Constraint::BinOp(Ty::link(d1), Ty::link(td), Ty::link(fd)));
-    constraint(&mut tcx.data, Constraint::BinOp(Ty::link(d), Ty::link(d1), Ty::link(cd)));
+    let e = ctx.sub.push(Tv::unbound(scope, Some(EnumSet::all())));
+    let d = newtypevar(&mut ctx.sub, scope); // must be e+1
+    let d1 = newtypevar(&mut ctx.sub, scope);
+    unifyvt(&mut ctx.sub, &mut ctx.err, ce, Ty::primitive(Primitive::B1));
+    unifyvv(&mut ctx.sub, &mut ctx.err, e, te);
+    unifyvv(&mut ctx.sub, &mut ctx.err, e, fe);
+    constraint(ctx, Constraint::BinOp(Ty::link(d1), Ty::link(td), Ty::link(fd)));
+    constraint(ctx, Constraint::BinOp(Ty::link(d), Ty::link(d1), Ty::link(cd)));
     Ty::constructor(Constructor::Tensor, e)
 }
 
@@ -1163,8 +1265,9 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
         tcx.tmp.push(Ty::link(ety));
     }
     let aty: &[Ty] = &tcx.tmp[base.cast_up()..];
-    let scope = func2scope(tcx.data.func_args);
-    macro_rules! I { ($($t:tt)*) => { instantiate!(tcx, scope, aty; $($t)*) }; }
+    let ctx = &mut *tcx.data;
+    let scope = func2scope(ctx.func_args);
+    macro_rules! I { ($($t:tt)*) => { instantiate!(ctx, scope, aty; $($t)*) }; }
     let ty = match func {
         UNM | EXP | LOG => I!(a,e[PRI_NUM] n :: a[Tensor e n] => a),
         ALL | ANY => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => pri Primitive::B1),
@@ -1172,12 +1275,12 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
         EFFECT => I!(a ...b :: b[pri Primitive::FX] => a),
         LEN => I!(_a ...b :: b[pri PRI_IDX] => pri PRI_IDX),
         LOAD => I!(p ...s,r :: p[pri Primitive::PTR], s[pri PRI_IDX] => r),
-        MAX | MIN => visitminmax(&mut tcx.data, aty, scope),
+        MAX | MIN => visitminmax(ctx, aty, scope),
         NOT => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => a),
         REP => I!(a,e n m :: a[Tensor e n] => Tensor e m),
         SELECT => {
             let &[c,t,f] = aty else { unreachable!() };
-            visitselect(tcx, c, t, f, scope)
+            visitselect(ctx, c, t, f, scope)
         },
         SUM => I!(a,e[PRI_NUM] n :: a[Tensor e n] => e),
         // TODO (?): generalize WHICH to return tuples.
@@ -1195,82 +1298,95 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
         // skip KINT logic for TRUE and FALSE
         return tv;
     }
-    let scope = func2scope(tcx.data.func_args);
+    let ctx = &mut *tcx.data;
+    let scope = func2scope(ctx.func_args);
     match objs.get(idx.erase()) {
         ObjectRef::SPEC(_) => {
-            unifyvt(&mut tcx.data.sub, tv, Ty::UNIT);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, Ty::UNIT);
         },
         ObjectRef::SPLAT(&SPLAT { value, .. }) => {
             let vty = visitexpr(tcx, value);
-            unifyvv(&mut tcx.data.sub, tv, vty);
+            let ctx = &mut *tcx.data;
+            unifyvv(&mut ctx.sub, &mut ctx.err, tv, vty);
         },
         ObjectRef::FLAT(FLAT { idx, .. }) => {
-            unifyvt(&mut tcx.data.sub, tv, Ty::UNIT);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, Ty::UNIT);
             for &i in idx {
                 if objs[i].op != Obj::SPEC {
                     let ety = visitexpr(tcx, i);
-                    let (e, _) = unpacktensor(&mut tcx.data.sub, Ty::link(ety), scope);
-                    unifyvt(&mut tcx.data.sub, e, Ty::primitive(PRI_IDX));
+                    let ctx = &mut *tcx.data;
+                    let (e, _) = unpacktensor(&mut ctx.sub, &mut ctx.err, Ty::link(ety), scope);
+                    unifyvt(&mut ctx.sub, &mut ctx.err, e, Ty::primitive(PRI_IDX));
                 }
             }
         },
-        ObjectRef::KINT(&KINT { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kintpri(k as _)),
-        ObjectRef::KINT64(&KINT64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kintpri(tcx.intern[k])),
-        ObjectRef::KFP64(&KFP64 { k, .. }) => unifyvpri(&mut tcx.data.sub, tv, kfpri(tcx.intern[k])),
-        ObjectRef::KSTR(_) => unifyvt(&mut tcx.data.sub, tv, Ty::primitive(Primitive::STR)),
+        ObjectRef::KINT(&KINT { k, .. }) => unifyvpri(&mut ctx.sub, &mut ctx.err, tv,
+            kintpri(k as _)),
+        ObjectRef::KINT64(&KINT64 { k, .. }) => unifyvpri(&mut ctx.sub, &mut ctx.err, tv,
+            kintpri(tcx.intern[k])),
+        ObjectRef::KFP64(&KFP64 { k, .. }) => unifyvpri(&mut ctx.sub, &mut ctx.err, tv,
+            kfpri(tcx.intern[k])),
+        ObjectRef::KSTR(_) => unifyvt(&mut ctx.sub, &mut ctx.err, tv,
+            Ty::primitive(Primitive::STR)),
         ObjectRef::TUPLE(TUPLE { fields, .. }) => {
             let ty = visittuple(tcx, fields);
-            unifyvt(&mut tcx.data.sub, tv, ty);
+            let ctx = &mut *tcx.data;
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, ty);
         },
         ObjectRef::LET(&LET { value, expr, .. }) => {
             let vty = visitexpr(tcx, value);
             tcx.data.locals.push(vty);
             let ety = visitexpr(tcx, expr);
             tcx.data.locals.raw.pop();
-            unifyvv(&mut tcx.data.sub, tv, ety);
+            let ctx = &mut *tcx.data;
+            unifyvv(&mut ctx.sub, &mut ctx.err, tv, ety);
         },
         ObjectRef::LGET(&LGET { slot, .. }) => {
-            let lv = tcx.data.locals[slot];
-            unifyvv(&mut tcx.data.sub, lv, tv)
+            let lv = ctx.locals[slot];
+            unifyvv(&mut ctx.sub, &mut ctx.err, lv, tv)
         },
         ObjectRef::APPLY(&APPLY { func, ref args, .. }) => {
             let func: FuncId = zerocopy::transmute!(objs[func].name);
             let aty = visittuple(tcx, args);
-            let ty = newcontype(&mut tcx.data.sub, Constructor::Func, &[aty, Ty::link(tv)]);
-            let (generics, fty) = instantiatef(&mut tcx.data, func);
-            tcx.data.sub[tv+1] = Tv::bound(Ty::link(generics));
-            unifytt(&mut tcx.data.sub, fty, ty);
+            let ctx = &mut *tcx.data;
+            let ty = newcontype(&mut ctx.sub, Constructor::Func, &[aty, Ty::link(tv)]);
+            let (generics, fty) = instantiatef(ctx, func);
+            ctx.sub[tv+1] = Tv::bound(Ty::link(generics));
+            unifytt(&mut ctx.sub, &mut ctx.err, fty, ty);
         },
         ObjectRef::PGET(&PGET { idx, .. }) => {
-            match tcx.data.func_args {
+            match ctx.func_args {
                 Some(args) => {
-                    let t = indextuple(&mut tcx.data.sub, args, idx as _);
-                    unifyvv(&mut tcx.data.sub, tv, t);
+                    let t = indextuple(&mut ctx.sub, &mut ctx.err, args, idx as _);
+                    unifyvt(&mut ctx.sub, &mut ctx.err, tv, t);
                 },
                 None => {
                     // dimension
-                    unifyvt(&mut tcx.data.sub, tv, Ty::primitive(PRI_IDX));
+                    unifyvt(&mut ctx.sub, &mut ctx.err, tv, Ty::primitive(PRI_IDX));
                 }
             }
         },
         ObjectRef::VGET(&VGET { dim, var, ref idx, .. }) => {
             let t = visitvref(tcx, var, idx, dim as _);
-            unifyvt(&mut tcx.data.sub, tv, t);
+            let ctx = &mut *tcx.data;
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, t);
         },
         ObjectRef::CAT(CAT { elems, .. } ) => {
-            let e = newtypevar(&mut tcx.data.sub, scope);
-            let d = newtypevar(&mut tcx.data.sub, scope);
+            let e = newtypevar(&mut ctx.sub, scope);
+            let d = newtypevar(&mut ctx.sub, scope);
             let ty = Ty::constructor(Constructor::Tensor, e);
-            unifyvt(&mut tcx.data.sub, tv, ty);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, ty);
             for &v in elems {
                 let ety = visitexpr(tcx, v);
                 if objs[v].op == Obj::SPLAT {
-                    unifyvt(&mut tcx.data.sub, ety, ty);
+                    let ctx = &mut *tcx.data;
+                    unifyvt(&mut ctx.sub, &mut ctx.err, ety, ty);
                 } else {
                     let ety = visitexpr(tcx, v);
-                    let (ee, ed) = unpacktensor(&mut tcx.data.sub, Ty::link(ety), scope);
-                    unifyvv(&mut tcx.data.sub, e, ee);
-                    unifyvt(&mut tcx.data.sub, d, Ty::constructor(Constructor::Next, ed));
+                    let ctx = &mut *tcx.data;
+                    let (ee, ed) = unpacktensor(&mut ctx.sub, &mut ctx.err, Ty::link(ety), scope);
+                    unifyvv(&mut ctx.sub, &mut ctx.err, e, ee);
+                    unifyvt(&mut ctx.sub, &mut ctx.err, d, Ty::constructor(Constructor::Next, ed));
                 }
             }
         },
@@ -1282,54 +1398,59 @@ fn visitexpr(tcx: &mut Tcx, idx: ObjRef<EXPR>) -> TypeVar {
                 // this should probably convert to IRT_IDX because there's not much benefit
                 // in supporting other length sizes.
                 let sty = visitexpr(tcx, s);
-                unifyvt(&mut tcx.data.sub, sty, Ty::primitive(PRI_IDX));
+                let ctx = &mut *tcx.data;
+                unifyvt(&mut ctx.sub, &mut ctx.err, sty, Ty::primitive(PRI_IDX));
             }
-            let elem = newtypevar(&mut tcx.data.sub, scope);
-            let dim = createdimtype(&mut tcx.data, shape.len() as _);
-            let ty = newcontype(&mut tcx.data.sub, Constructor::Tensor,
+            let ctx = &mut *tcx.data;
+            let elem = newtypevar(&mut ctx.sub, scope);
+            let dim = createdimtype(ctx, shape.len() as _);
+            let ty = newcontype(&mut ctx.sub, Constructor::Tensor,
                 &[Ty::link(elem), Ty::link(dim)]);
-            unifyvt(&mut tcx.data.sub, tv, ty);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, ty);
         },
         ObjectRef::TGET(&TGET { value, idx, .. }) => {
             let vty = visitexpr(tcx, value);
-            let ety = indextuple(&mut tcx.data.sub, Ty::link(vty), idx as _);
-            unifyvv(&mut tcx.data.sub, tv, ety);
+            let ctx = &mut *tcx.data;
+            let ety = indextuple(&mut ctx.sub, &mut ctx.err, Ty::link(vty), idx as _);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, ety);
         },
         ObjectRef::BINOP(&BINOP { binop, left, right, .. }) => {
             use BinOp::*;
-            let td = newtypevar(&mut tcx.data.sub, scope);
             let lty = visitexpr(tcx, left);
             let rty = visitexpr(tcx, right);
-            let (le, ld) = unpacktensor(&mut tcx.data.sub, Ty::link(lty), scope);
-            let (re, rd) = unpacktensor(&mut tcx.data.sub, Ty::link(rty), scope);
-            unifyvv(&mut tcx.data.sub, le, re);
-            constraint(&mut tcx.data, Constraint::BinOp(Ty::link(td), Ty::link(ld), Ty::link(rd)));
+            let ctx = &mut *tcx.data;
+            let td = newtypevar(&mut ctx.sub, scope);
+            let (le, ld) = unpacktensor(&mut ctx.sub, &mut ctx.err, Ty::link(lty), scope);
+            let (re, rd) = unpacktensor(&mut ctx.sub, &mut ctx.err, Ty::link(rty), scope);
+            unifyvv(&mut ctx.sub, &mut ctx.err, le, re);
+            constraint(ctx, Constraint::BinOp(Ty::link(td), Ty::link(ld), Ty::link(rd)));
             let res = match BinOp::from_u8(binop) {
                 OR | AND => {
-                    unifyvt(&mut tcx.data.sub, le, Ty::primitive(Primitive::B1));
+                    unifyvt(&mut ctx.sub, &mut ctx.err, le, Ty::primitive(Primitive::B1));
                     Ty::primitive(Primitive::B1)
                 },
                 EQ | NE => {
                     Ty::primitive(Primitive::B1)
                 },
                 LT | LE => {
-                    unifyvpri(&mut tcx.data.sub, le, PRI_NUM);
+                    unifyvpri(&mut ctx.sub, &mut ctx.err, le, PRI_NUM);
                     Ty::primitive(Primitive::B1)
                 },
                 ADD | SUB | MUL | DIV => {
                     Ty::link(le)
                 },
                 POW => {
-                    unifyvt(&mut tcx.data.sub, le, Ty::primitive(Primitive::F64));
+                    unifyvt(&mut ctx.sub, &mut ctx.err, le, Ty::primitive(Primitive::F64));
                     Ty::primitive(Primitive::F64)
                 }
             };
-            let t = newcontype(&mut tcx.data.sub, Constructor::Tensor, &[res, Ty::link(td)]);
-            unifyvt(&mut tcx.data.sub, tv, t);
+            let t = newcontype(&mut ctx.sub, Constructor::Tensor, &[res, Ty::link(td)]);
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, t);
         },
         ObjectRef::INTR(&INTR { func, ref args, .. }) => {
             let t = visitintrinsic(tcx, Intrinsic::from_u8(func), args);
-            unifyvt(&mut tcx.data.sub, tv, t);
+            let ctx = &mut *tcx.data;
+            unifyvt(&mut ctx.sub, &mut ctx.err, tv, t);
         }
         ObjectRef::CALL(CALL { inputs, .. }) => {
             for &input in inputs {
@@ -1392,6 +1513,62 @@ fn visitfuncs(ccx: &mut Ccx<TypeInfer>) {
     ccx.data.func_args = None;
 }
 
+fn dumptv(buf: &mut Bump, sub: &IndexSlice<TypeVar, Tv>, tv: Tv) {
+    match tv.unpack() {
+        TVar::Bound(ty) => match ty.unpack() {
+            Type::Link(i) => dumptv(buf, sub, sub[i]),
+            // TODO: implement Primitive.name()
+            Type::Primitive(p) => write!(buf, "{:?}", p).unwrap(),
+            Type::Generic(i) => write!(buf, "${}", i).unwrap(),
+            Type::Constructor(con, base) => {
+                // TODO: implement Constructor.name() or something similar
+                write!(buf, "{:?}", con).unwrap();
+                if con.arity() > 0 {
+                    buf.push(b'<');
+                    for i in 0..con.arity() {
+                        if i>0 { buf.push(b','); }
+                        dumptv(buf, sub, sub[base+i as isize]);
+                    }
+                    buf.push(b'>');
+                }
+            }
+        },
+        TVar::Unbound(_, Some(pri)) => write!(buf, "{:?}", pri).unwrap(),
+        TVar::Unbound(_, None) => { buf.write("any"); }
+    }
+}
+
+fn checkerrors(ccx: &mut Ccx<TypeInfer>) -> compile::Result {
+    if ccx.data.err.errors.is_empty() {
+        return Ok(())
+    }
+    let base = ccx.tmp.end();
+    for e in &ccx.data.err.errors {
+        dump_shortobj(&mut ccx.tmp, &ccx.intern, &ccx.objs, e.ctx);
+        ccx.tmp.write(": type checking error: ");
+        match e.msg {
+            ErrMsg::Recursive(t) => {
+                ccx.tmp.write("recursive type: ");
+                dumptv(&mut ccx.tmp, &ccx.data.sub, t);
+            },
+            ErrMsg::Unify(a, b) => {
+                ccx.tmp.write("cannot assign ");
+                dumptv(&mut ccx.tmp, &ccx.data.sub, a);
+                ccx.tmp.write(" to ");
+                dumptv(&mut ccx.tmp, &ccx.data.sub, b);
+            },
+            ErrMsg::Index(exp, got) =>
+                write!(ccx.tmp, "expected at most {} dimensions, got {}", exp, got).unwrap(),
+            // ErrMsg::Signature(exp, got) =>
+            //     write!(ccx.tmp, "expected {} function parameters, got {}", exp, got).unwrap()
+        }
+        ccx.tmp.push(b'\n');
+    }
+    ccx.host.set_error_bytes(&ccx.tmp[base..]);
+    ccx.tmp.truncate(base);
+    Err(())
+}
+
 fn shapetype(tcx: &mut Tcx, idx: &[ObjRef<EXPR>]) -> Ty {
     let base = tcx.tmp.end();
     let fields = tcx.tmp.align_for::<Ty>();
@@ -1445,24 +1622,28 @@ fn modeltype(tcx: &mut Tcx, vsets: &[ObjRef<VSET>]) -> Ty {
 fn visitglobals(tcx: &mut Tcx) {
     let objs = Access::borrow(&tcx.objs);
     for (idx, o) in objs.pairs() {
+        tcx.data.err.obj = idx;
         match o {
             ObjectRef::TAB(&TAB { shape, .. }) => {
                 trace!(TYPE "tab {:?}", idx);
                 tcx.data.tab = ObjRef::GLOBAL;
                 let ty = shapetype(tcx, &objs[shape].fields);
                 let ety = visitexpr(tcx, shape.cast());
-                unifyvt(&mut tcx.data.sub, ety, ty);
+                let ctx = &mut *tcx.data;
+                unifyvt(&mut ctx.sub, &mut ctx.err, ety, ty);
             },
             ObjectRef::MOD(&MOD { tab, guard, value, ref outputs, .. }) => {
                 trace!(TYPE "mod {:?}", idx);
                 tcx.data.tab = tab;
                 if !guard.is_nil() {
                     let ety = visitexpr(tcx, guard);
-                    unifyvt(&mut tcx.data.sub, ety, Ty::primitive(Primitive::B1));
+                    let ctx = &mut *tcx.data;
+                    unifyvt(&mut ctx.sub, &mut ctx.err, ety, Ty::primitive(Primitive::B1));
                 }
                 let ty = modeltype(tcx, outputs);
                 let ety = visitexpr(tcx, value);
-                unifyvt(&mut tcx.data.sub, ety, ty);
+                let ctx = &mut *tcx.data;
+                unifyvt(&mut ctx.sub, &mut ctx.err, ety, ty);
             },
             ObjectRef::QUERY(&QUERY { value, .. }) => {
                 trace!(TYPE "query {:?}", idx);
@@ -1878,6 +2059,10 @@ impl Stage for TypeInfer {
         sub.push(Tv::bound(Ty::V1D));
         Ok(TypeInfer {
             sub,
+            err: ErrCtx {
+                obj: ObjRef::NIL,
+                errors: Default::default()
+            },
             con: Default::default(),
             locals: Default::default(),
             func_generic: Default::default(),
@@ -1897,13 +2082,18 @@ impl Stage for TypeInfer {
         collectfuncs(ccx);
         deannotate(ccx);
         visitfuncs(ccx);
+        checkerrors(ccx)?;
         ccx.freeze_graph(visitglobals);
+        checkerrors(ccx)?;
         simplify(&mut ccx.data);
+        checkerrors(ccx)?;
         ccx.freeze_graph(fixvars);
+        checkerrors(ccx)?;
         simplify(&mut ccx.data);
+        checkerrors(ccx)?;
         debug_assert!(ccx.data.con.is_empty());
         monomorphize(ccx);
-        // TODO: check for errors
+        checkerrors(ccx)?;
         if trace!(TYPE) {
             trace_objs(&ccx.intern, &ccx.objs, ObjRef::NIL);
         }

@@ -89,12 +89,8 @@ pub fn trace_objs(sequences: &Intern, objs: &Objects, start: ObjRef) {
     }
 }
 
-/* ---- IR ------------------------------------------------------------------ */
-
-fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugSource) {
-    let op = objs[src.obj()].operator();
-    write!(buf, "{}{:?}", op.name(), src.obj()).unwrap();
-    match objs.get(src.obj()) {
+pub fn dump_shortobj(buf: &mut Bump, intern: &Intern, objs: &Objects, obj: ObjRef) {
+    match objs.get(obj) {
         ObjectRef::VAR(&VAR { name, .. })
                 | ObjectRef::TAB(&TAB { name, .. })
                 | ObjectRef::FUNC(&FUNC { name, .. }) => {
@@ -114,6 +110,14 @@ fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugS
         },
         _ => {}
     }
+}
+
+/* ---- IR ------------------------------------------------------------------ */
+
+fn dump_debugsource(buf: &mut Bump, intern: &Intern, objs: &Objects, src: DebugSource) {
+    let op = objs[src.obj()].operator();
+    write!(buf, "{}{:?}", op.name(), src.obj()).unwrap();
+    dump_shortobj(buf, intern, objs, src.obj());
     let flags = src.flags();
     if flags.contains(DebugFlag::VALUE) {
         buf.write(".value");

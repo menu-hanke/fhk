@@ -69,7 +69,7 @@ impl Primitive {
 
 }
 
-#[derive(EnumSetType)]
+#[derive(EnumSetType, Debug)]
 pub enum Constructor {
     Tensor, // (elem dim)
     Pair,   // (left right)
