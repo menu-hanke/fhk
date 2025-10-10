@@ -482,6 +482,13 @@ fn try_match(
                 cap = Some((px, cx, pp, cp));
             },
             None => {
+                // special case: a lonely trailing capture (`'{$cap}`) matches the empty sequence.
+                if c.is_none() && &pattern[px..] ==
+                    &[Token::Apostrophe as _, Token::LCurly as _, TK_CAPTURE, Token::RCurly as _]
+                {
+                    captures.push((cx as u32)..(cx as u32));
+                    return true;
+                }
                 // failed and no pending starting point => no match.
                 return false;
             }
@@ -560,6 +567,7 @@ fn parse_name_seq(pcx: &mut Pcx, sty: SequenceType) -> compile::Result<Interned<
     if check(pcx, Token::Scope)? { save(pcx); }
     consume(pcx, Token::Ident)?;
     if pcx.data.token == Token::Apostrophe {
+        let subscript = pcx.tmp.end();
         save(pcx);
         next(pcx)?;
         // canonicalize subscripted names to curly brackets, no matter whether brackets are used
@@ -578,7 +586,12 @@ fn parse_name_seq(pcx: &mut Pcx, sty: SequenceType) -> compile::Result<Interned<
             savemaybecap(pcx, sty)?;
         }
         next(pcx)?; // skip subscript token or closing parenthesis
-        pcx.tmp.push(Token::RCurly as u8);
+        if pcx.tmp.end() == subscript.add(2) {
+            // canonicalize empty subscript '{} -> no subscript
+            pcx.tmp.truncate(subscript);
+        } else {
+            pcx.tmp.push(Token::RCurly as u8);
+        }
     }
     let name = pcx.intern.intern(&pcx.tmp[base..]);
     pcx.tmp.truncate(base);
