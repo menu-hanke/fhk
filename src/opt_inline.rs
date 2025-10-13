@@ -116,7 +116,9 @@ fn visitcallers(ir: &IR, inline: &mut Inline, fid: FuncId) {
             let f = ins.decode_F();
             let fd = &mut inline.func[f];
             let callers = fd.callers;
-            if op != Opcode::CALLCI || ir.funcs[f].reset != ir.funcs[fid].reset {
+            if op == Opcode::CALLC
+                || (op == Opcode::CALLCI && ir.funcs[f].reset != ir.funcs[fid].reset)
+            {
                 fd.callers |= CALLER_CALLX;
             } else {
                 fd.callers += 1;
