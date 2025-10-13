@@ -68,7 +68,7 @@ fn refvar(pcx: &mut Pcx, tab: ObjRef<TAB>, name: Interned<[u8]>) -> ObjRef<VAR> 
 fn newanonvar(pcx: &mut Pcx, tab: ObjRef<TAB>, ann: ObjRef/*TY*/, value: ObjRef<EXPR>) -> ObjRef<VAR> {
     let var = pcx.objs.push(VAR::new(Interned::EMPTY, tab, ann));
     let vset = pcx.objs.push_args::<VSET>(VSET::new(0, var), &[]);
-    pcx.objs.push_args::<MOD>(MOD::new(tab, ObjRef::NIL.cast(), value), &[vset]);
+    pcx.objs.push_args::<MOD>(MOD::new(0, tab, ObjRef::NIL.cast(), value), &[vset]);
     var
 }
 
@@ -516,7 +516,12 @@ fn parse_table(pcx: &mut Pcx) -> compile::Result {
     Ok(())
 }
 
-fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<VAR>>) -> compile::Result {
+struct ModBlock {
+    guard: ObjRef/*VAR|NIL*/,
+    order: u8
+}
+
+fn parse_model_def(pcx: &mut Pcx, block: &ModBlock) -> compile::Result {
     let base = pcx.tmp.end();
     // push (vset, ann) pairs
     loop {
@@ -567,21 +572,32 @@ fn parse_model_def(pcx: &mut Pcx, blockguard: Option<ObjRef<VAR>>) -> compile::R
         true  => Some(parse_expr(pcx)?),
         false => None
     };
-    let blockguard = blockguard
-        .map(|v| pcx.objs.push_args::<VGET>(VGET::new(0, ObjRef::B1.erase(), v), &[]).cast());
+    let blockguard = (!block.guard.is_nil()).then(|| pcx.objs.push_args::<VGET>(
+            VGET::new(0, ObjRef::B1.erase(), block.guard.cast()), &[]).cast());
     let guard = match (blockguard, guard) {
         (Some(g), None) | (None, Some(g)) => g,
         (Some(b), Some(g)) => pcx.objs.push(BINOP::new(BinOp::AND as _, ObjRef::NIL, b, g)).cast(),
         (None, None) => ObjRef::NIL.cast()
     };
     // pcx.data.tab is guaranteed to be set here because we came here from parse_model
-    pcx.objs.push_args::<MOD>(MOD::new(pcx.data.tab, guard, value), cast_args(&pcx.tmp[ref_base..]));
+    pcx.objs.push_args::<MOD>(
+        MOD::new(block.order, pcx.data.tab, guard, value), cast_args(&pcx.tmp[ref_base..]));
     pcx.tmp.truncate(base);
     Ok(())
 }
 
+// model(order) tab[idx1,...,idxN] { model-def* } | model-def
+//      ^^^^^^^    ^^^^^^^^^^^^^^^
+//      optional       optional
 fn parse_model(pcx: &mut Pcx) -> compile::Result {
     next(pcx)?; // skip `model`
+    let order = if check(pcx, Token::LParen)? {
+        let order = consume(pcx, Token::Int)?;
+        consume(pcx, Token::RParen)?;
+        order as _
+    } else {
+        0
+    };
     let tab = match pcx.data.token {
         Token::OpThis => match pcx.objs[pcx.data.this].op {
             Obj::VAR => {
@@ -601,13 +617,14 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     };
     pcx.data.tab = tab;
     debug_assert!(pcx.data.bindings.is_empty());
-    let blockguard = match check(pcx, Token::Where)? {
+    let guard = match check(pcx, Token::Where)? {
         true => {
             let value = parse_expr(pcx)?;
-            Some(newanonvar(pcx, tab, ObjRef::B1.erase(), value))
+            newanonvar(pcx, tab, ObjRef::B1.erase(), value).erase()
         },
-        false => None
+        false => ObjRef::NIL
     };
+    let block = ModBlock { guard, order };
     if check(pcx, Token::LBracket)? {
         while pcx.data.token != Token::RBracket {
             if pcx.data.token == Token::Colon {
@@ -627,11 +644,11 @@ fn parse_model(pcx: &mut Pcx) -> compile::Result {
     pcx.data.bindparams = pcx.data.bindings.len() as _;
     if check(pcx, Token::LCurly)? {
         while pcx.data.token != Token::RCurly {
-            parse_model_def(pcx, blockguard)?;
+            parse_model_def(pcx, &block)?;
         }
         next(pcx)?;
     } else {
-        parse_model_def(pcx, blockguard)?;
+        parse_model_def(pcx, &block)?;
     }
     pcx.data.bindings.clear();
     pcx.data.bindparams = 0;

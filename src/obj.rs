@@ -289,7 +289,7 @@ define_ops! {
     FUNC.arity  { name: Name, expr: ObjRef<EXPR>, args: ObjRef/*TTUP*/ };
     FPROT.arity { name: Name, expr: ObjRef<EXPR>, unused: u32 };
     // non-named objects.
-    MOD         { tab: ObjRef<TAB>, guard: ObjRef<EXPR>, value: ObjRef<EXPR> } outputs: [ObjRef<VSET>];
+    MOD.order   { tab: ObjRef<TAB>, guard: ObjRef<EXPR>, value: ObjRef<EXPR> } outputs: [ObjRef<VSET>];
     QUERY       { value: ObjRef<TUPLE> };
     VSET.dim    { var: ObjRef<VAR> } idx: [ObjRef<EXPR/*|SPEC*/>];
     // types

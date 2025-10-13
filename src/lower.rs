@@ -1,6 +1,6 @@
 //! Graph -> IR.
 
-use core::cmp:: min;
+use core::cmp::{ min, Ordering};
 use core::iter::{repeat_n, zip};
 use core::marker::PhantomData;
 use core::mem::{replace, swap};
@@ -553,38 +553,67 @@ fn ftoposort(ctx: &mut Ccx<Lower>, idx: ObjRef) {
 
 fn collectobjs(ctx: &mut Ccx<Lower>) {
     ctx.objs.clear_marks();
-    // pass 1: count vsets and toposort functions
+    let base = ctx.tmp.end();
+    // pass 1: toposort functions and collect other objects
     let mut idx = ObjRef::NIL;
     while let Some(i) = ctx.objs.next(idx) {
         idx = i;
         match ctx.objs[idx].op {
             // TODO: move this to the loop below
             Obj::FUNC => ftoposort(ctx, idx),
+            Obj::TAB|Obj::VAR|Obj::MOD => { ctx.tmp.push(i); },
+            Obj::QUERY => {
+                ctx.data.queries.push(idx.cast());
+                ctx.layout.queries.push(Default::default());
+            },
             _ => {}
         }
     }
-    // pass 2: allocate objs and ir functions (note: depends on objs being in topo order).
+    // pass 2: allocate objs and ir functions.
     ctx.freeze_graph(|ctx| {
         let objs = Access::borrow(&ctx.objs);
-        for (idx, obj) in objs.pairs() {
-            let p = match obj {
-                ObjectRef::TAB(tab)   => {
-                    let tabid: u16 = zerocopy::transmute!(createtab(ctx, idx.cast(), tab));
+        // sort objects in ir creation order:
+        // 1. TABs in any order
+        // 2. VARs in any order
+        // 3. MODs in (obj.order desc, objref idx asc)
+        let iro: &mut [ObjRef] = &mut ctx.tmp[base.cast_up()..];
+        iro.sort_unstable_by(|&i, &j| {
+            let ii: u32 = zerocopy::transmute!(i);
+            let jj: u32 = zerocopy::transmute!(j);
+            match (objs[i].op, objs[j].op) {
+                (Obj::MOD, Obj::MOD) => {
+                    // higher mod.order goes first
+                    objs[j].data.cmp(&objs[i].data).then(ii.cmp(&jj))
+                },
+                (Obj::TAB, Obj::TAB) | (Obj::VAR, Obj::VAR) => {
+                    // it would be correct to return equal here, but prefer source order so
+                    // that trace output is easier to read and API users can assume a
+                    // consistent ordering.
+                    ii.cmp(&jj)
+                },
+                (Obj::TAB, _ /*VAR|MOD*/) => Ordering::Less,
+                (_ /*VAR|MOD*/, Obj::TAB) => Ordering::Greater,
+                (Obj::VAR, _ /*MOD*/) => Ordering::Less,
+                (_ /*MOD*/, _ /*VAR*/) => Ordering::Greater,
+            }
+        });
+        for i in 0..iro.len() {
+            let idx: ObjRef = ctx.tmp[base.cast_up().add(i)];
+            let p = match objs[idx].op {
+                Obj::TAB => {
+                    let tabid: u16 = zerocopy::transmute!(
+                        createtab(ctx, idx.cast(), &objs[idx.cast()]));
                     tabid as _
                 },
-                ObjectRef::VAR(var)   => zerocopy::transmute!(createvar(ctx, idx.cast(), var)),
-                ObjectRef::MOD(model) => zerocopy::transmute!(createmod(ctx, idx.cast(), model)),
-                ObjectRef::QUERY(_)   => {
-                    ctx.data.queries.push(idx.cast());
-                    ctx.layout.queries.push(Default::default());
-                    continue
-                },
-                _ => continue
+                Obj::VAR => zerocopy::transmute!(createvar(ctx, idx.cast(), &objs[idx.cast()])),
+                Obj::MOD => zerocopy::transmute!(createmod(ctx, idx.cast(), &objs[idx.cast()])),
+                _ => unreachable!()
             };
             ctx.data.objs.insert(idx, p);
         }
     });
     debug_assert!(ctx.data.objs[&ObjRef::GLOBAL.erase()] == 0);
+    ctx.tmp.truncate(base);
 }
 
 /* ---- Emit helpers -------------------------------------------------------- */
