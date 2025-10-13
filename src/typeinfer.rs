@@ -731,8 +731,12 @@ fn equaltt(sub: &IndexSlice<TypeVar, Tv>, generics: Option<TypeVar>, a: Ty, b: T
         (_, Link(j)) => equalvt(sub, generics, j, a),
         (Primitive(p), Primitive(q)) => Some(p==q),
         (Generic(i), Generic(j)) if i==j => Some(true),
-        (Generic(i), Generic(j)) => match generics {
-            Some(base) => equalvv(sub, generics, base + i as isize, base + j as isize),
+        (Generic(i), _) => match generics {
+            Some(base) => equalvt(sub, generics, base + i as isize, b),
+            None => None
+        },
+        (_, Generic(j)) => match generics {
+            Some(base) => equalvt(sub, generics, base + j as isize, a),
             None => None
         },
         (Constructor(c, c0), Constructor(d, d0)) if c==d => {
@@ -1999,6 +2003,7 @@ fn reannotateglobals(ccx: &mut Ccx<TypeInfer>) {
                 let r: ObjRef = zerocopy::transmute!(ccx.objs.get_raw(idx)[1+j]);
                 if Operator::is_expr_raw(ccx.objs[r].op) {
                     visitexprtype(ccx, r.cast());
+                    debug_assert!(ccx.objs[r].mark == MARK_MONO);
                 }
             }
         } else if ccx.objs[idx].op == Obj::VAR {
