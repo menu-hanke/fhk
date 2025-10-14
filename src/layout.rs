@@ -400,7 +400,7 @@ fn layoutquery(
         }
     }
     let cursors = ccx.tmp.get_dst(cursors, ccx.layout.queries.raw.len());
-    let mut end = 0;
+    let mut end = cursor;
     for (query,&cursor) in zip(&mut ccx.layout.queries.raw, &cursors.raw) {
         let qend = cursor.align_byte(1).byte();
         end = max(end, qend);
