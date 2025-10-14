@@ -94,7 +94,7 @@ const SPACE_BETWEEN: u64 = {
         | (1 << Fp64 as u64) | (1 << Not as u64) | (1 << Call as u64) | (1 << Macro as u64)
         | (1 << Var as u64) | (1 << Model as u64) | (1 << Table as u64) | (1 << Func as u64)
         | (1 << Where as u64) | (1 << Out as u64) | (1 << Let as u64) | (1 << In as u64)
-        | (1 << True as u64) | (1 << False as u64)
+        | (1 << True as u64) | (1 << False as u64) | (1 << And as u64) | (1 << Or as u64)
 };
 
 const TK_DATA: u8 = Token::Literal as _;
