@@ -277,6 +277,7 @@ fn compute_cmat(
     cfg_back: &Relation<BlockId, BlockId>,
     inst: &IndexSlice<InsId, Range<u16>>,
     place: &[BlockId],
+    idom: &IndexSlice<BlockId, BlockId>,
     mat: &mut BitMatrix<BlockId, InsId>,
     work: &mut BitmapVec,
     work_blocks: &mut Vec<BlockId>
@@ -309,6 +310,13 @@ fn compute_cmat(
             addintersect(mat, i, &work_blocks, work);
             addintersect(mat, i, &cfg_back[i], work);
             work_blocks.clear();
+            // bandaid fix: A dominates B => cmat(A) ⊂ cmat(B).
+            // XXX: this algorithm is still not correct and it should be written in terms
+            // of the domtree and post-domtree.
+            if i != BlockId::START {
+                let [a,b] = mat.get_rows_mut([idom[i], i]);
+                b.union(a);
+            }
             fixpoint &= mat[i].popcount() == pop;
         }
         if fixpoint { break }
@@ -495,6 +503,7 @@ impl ControlFlow {
             &self.cfg.backward,
             &self.inst,
             &self.place,
+            &self.idom,
             &mut self.cmat,
             &mut self.work_bitmap,
             &mut self.work_blocks
