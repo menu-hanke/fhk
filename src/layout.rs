@@ -333,7 +333,7 @@ fn qalloc_put(
     sty: SlotType,
     quse: &Bitmap<QueryId>
 ) -> BitOffset {
-    let pos = quse
+    let Some(pos) = quse
         .ones()
         .map(|qid| {
             let pos = tmp[cursors.elem(qid)];
@@ -344,7 +344,7 @@ fn qalloc_put(
             }
         })
         .max()
-        .unwrap();
+        else { return BitOffset::default() /* dead slot, ofs doesn't matter */ };
     let end = match sty { SlotType::Data => pos.next_byte(size), _ => pos.next_bit() };
     for q in quse {
         if queries[q].vmctx_start == 0 {
