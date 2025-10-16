@@ -601,6 +601,10 @@ local function newgraph()
 	graph.objs   = makeobjtab(graph)
 	graph.seq_mt = makeseqmt(graph)
 	graph.seq    = makeseqtab(graph)
+	local opt = os.getenv("FHK_OPTIMIZE")
+	if opt then
+		graph_optimize(graph, opt)
+	end
 	return graph
 end
 
