@@ -1,6 +1,6 @@
 //! Memory layout.
 
-use core::cmp::max;
+use core::cmp::{max, min};
 use core::iter::{repeat_n, zip};
 use core::mem::swap;
 use core::ops::Range;
@@ -9,7 +9,7 @@ use crate::bitmap::{BitMatrix, Bitmap, BitmapWord};
 use crate::bump::{self, Bump, BumpPtr, BumpRef};
 use crate::compile::{self, Ccx, Stage};
 use crate::image::{BreakpointId, Instance};
-use crate::index::{self, index, IndexSlice, IndexVec, InvalidValue};
+use crate::index::{self, index, IndexSlice, IndexVec};
 use crate::intern::Interned;
 use crate::ir::{Func, FuncId, FuncKind, Opcode, Type};
 use crate::mem::{BitOffset, Chunk, Offset, ParamId, Query, QueryId, ResetId, SizeClass};
@@ -39,10 +39,10 @@ use crate::typestate::Absent;
 index!(struct SlotId(u32) invalid(!0));
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SlotType {
-    Data,
-    Bitmap,
-    BitmapDup
+enum SlotData {
+    Bytes(/*size:*/ Offset, /*align:*/ u8),
+    Bits,
+    BitsDup
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,8 +55,7 @@ enum Segment {
 struct SlotDef {
     owner: FuncId,
     loc: BitOffset,
-    size: u8, // also alignment, pointer size for dynamic slots
-    sty: SlotType,
+    data: SlotData,
     seg: Segment
 }
 
@@ -65,6 +64,17 @@ pub struct ComputeLayout {
     slots: IndexVec<SlotId, SlotDef>,
     func_quse: BitMatrix<FuncId, QueryId>,    // does the query call the function?
     param_quse: BitMatrix<ParamId, QueryId>,  // does the query use the parameter?
+}
+
+impl SlotData {
+
+    fn element_align(self) -> usize {
+        match self {
+            Self::Bytes(_, align) => align as _,
+            _ => 1
+        }
+    }
+
 }
 
 fn computequse(ccx: &mut Ccx<ComputeLayout>) {
@@ -107,6 +117,7 @@ fn computequse(ccx: &mut Ccx<ComputeLayout>) {
         swap(f, g);
     }
     ccx.data.func_quse.solve(constraints);
+    // crate::trace::trace!("func_quse:\n{:?}", ccx.data.func_quse);
     // collect query parameters
     for (qid,&fid) in ccx.tmp.get_dst(query_func, ccx.layout.queries.raw.len()).pairs() {
         let puse = &func_puse[fid];
@@ -147,10 +158,6 @@ fn computequse(ccx: &mut Ccx<ComputeLayout>) {
     ccx.tmp.truncate(base);
 }
 
-fn slotsize(scl: SizeClass, type_: Type) -> usize {
-    if scl.is_dynamic() { Type::PTR } else { type_ }.size()
-}
-
 fn collectslots(ccx: &mut Ccx<ComputeLayout>) {
     // order must match save
     for (fid, func) in ccx.ir.funcs.pairs() {
@@ -163,10 +170,9 @@ fn collectslots(ccx: &mut Ccx<ComputeLayout>) {
                 ccx.data.slots.push(SlotDef {
                     owner: fid,
                     loc: Default::default(),
-                    size: slotsize(func.scl, ty) as _,
-                    sty: match ty {
-                        Type::B1 => SlotType::Bitmap,
-                        _ => SlotType::Data
+                    data: match ty {
+                        Type::B1 => SlotData::Bits,
+                        _ => SlotData::Bytes(ty.size() as _, ty.size() as _)
                     },
                     seg: if isquery {
                         Segment::Query
@@ -184,11 +190,10 @@ fn collectslots(ccx: &mut Ccx<ComputeLayout>) {
         ccx.data.slots.push(SlotDef {
             owner: fid,
             loc: Default::default(),
-            size: slotsize(func.scl, Type::B1) as _,
-            sty: if hasptr && func.scl.is_dynamic() && !isquery {
-                SlotType::BitmapDup
+            data: if hasptr && func.scl.is_dynamic() && !isquery {
+                SlotData::BitsDup
             } else {
-                SlotType::Bitmap
+                SlotData::Bits
             },
             seg: if isquery {
                 Segment::Query
@@ -201,12 +206,12 @@ fn collectslots(ccx: &mut Ccx<ComputeLayout>) {
 
 // pushes sorted slot ids on ccx.tmp.
 // sort order:
-//   (1) segment
+//   (1) segment: static->mask->query
 //   (2) mask segment: reset mask (arbitrary order)
 //       query segment: owner chunk query popcount, large->small
-//   (3) size class (arbitrary order)
-//   (4) slot size, large->small
-//   (5) slot type (arbitrary order)
+//   (3) size class, dynamic->static
+//   (4) slot alignment, large->small
+//   (5) datatype (arbitrary order)
 fn sortslots(ccx: &mut Ccx<ComputeLayout>) {
     let base = ccx.tmp.extend(index::iter_span(ccx.data.slots.end()));
     ccx.tmp[base..].sort_unstable_by_key(|&i| {
@@ -217,8 +222,13 @@ fn sortslots(ccx: &mut Ccx<ComputeLayout>) {
             Segment::Mask => zerocopy::transmute!(owner.reset),
             Segment::Query => !ccx.data.func_quse[slot.owner].popcount()
         };
+        let align = if owner.scl.is_dynamic() {
+            Type::PTR.size()
+        } else {
+            slot.data.element_align()
+        };
         let scl: u32 = zerocopy::transmute!(owner.scl);
-        (slot.seg, sort2, scl, !slot.size, slot.sty)
+        (slot.seg, sort2, !scl, !align, slot.data)
     });
 }
 
@@ -230,146 +240,178 @@ fn countseg(slots: &[SlotDef]) -> [usize; 3] {
     count
 }
 
+#[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct LayoutCursor {
+    scl: SizeClass,  // in bytes, only set while inside a bitfield (ofs.bit() > 0)
+    ofs: BitOffset,  // next free
+}
+
+impl LayoutCursor {
+
+    fn new(ofs: BitOffset) -> Self {
+        Self { scl: SizeClass::INVALID, ofs }
+    }
+
+    fn close_bitfield(&mut self) {
+        if self.ofs.bit() != 0 {
+            let size = if self.scl.is_dynamic() {
+                Type::PTR.size() as _
+            } else {
+                self.scl.static_size()
+            };
+            self.scl = SizeClass::INVALID;
+            self.ofs = BitOffset::new_byte(self.ofs.byte() + size);
+        }
+    }
+
+    fn next_byte(&mut self, size: Offset, align: Offset) -> BitOffset {
+        self.close_bitfield();
+        let byte = (self.ofs.byte() + align-1) & !(align-1);
+        self.ofs = BitOffset::new_byte(byte + size);
+        BitOffset::new_byte(byte)
+    }
+
+    fn next_bit(&mut self, scl: SizeClass) -> BitOffset {
+        if scl != self.scl {
+            self.close_bitfield();
+        }
+        let mut ofs = self.ofs;
+        debug_assert!(ofs.bit() == 0 || scl.is_static()
+            || ofs.byte() & (Type::PTR as Offset - 1) == 0);
+        match ofs.bit() {
+            0 => {
+                // start new bitfield
+                let mut byte = ofs.byte();
+                if scl.is_dynamic() {
+                    byte = (byte + Type::PTR.size() as Offset - 1)
+                        & !(Type::PTR.size() as Offset - 1);
+                }
+                self.scl = scl;
+                ofs = BitOffset::new_byte(byte);
+                self.ofs = ofs.set_bit(1);
+            },
+            7 => {
+                // finish full bitfield
+                self.close_bitfield();
+            },
+            _ => {
+                self.ofs = ofs.set_bit(ofs.bit()+1);
+            }
+        }
+        ofs
+    }
+
+    fn next(&mut self, scl: SizeClass, data: SlotData) -> BitOffset {
+        match data {
+            SlotData::Bytes(_, _) if scl.is_dynamic() =>
+                self.next_byte(Type::PTR.size() as _, Type::PTR.size() as _),
+            SlotData::Bytes(size, align) =>
+                self.next_byte(scl.static_size() * size, align as _),
+            SlotData::Bits | SlotData::BitsDup => self.next_bit(scl)
+        }
+    }
+
+}
+
 fn layoutstatic(
     ccx: &mut Ccx<ComputeLayout>,
     order: Range<BumpRef<SlotId>>,
-    cursor: Offset
-) -> Offset {
-    let mut cursor = BitOffset::new_byte(cursor);
-    let mut previd: SlotId = SlotId::INVALID.into();
-    let mut sc = SizeClass::INVALID;
-    for &id in &ccx.tmp[order] {
-        let SlotDef { owner, size, sty, .. } = ccx.data.slots[id];
-        let Func { scl, .. } = ccx.ir.funcs[owner];
-        if cursor.bit() != 0 && (scl != sc || sty == SlotType::Data) {
-            // size class or data type changed mid-bitfield: close bitfield
-            cursor = cursor.next_byte(ccx.data.slots[previd].size as _);
-            sc = scl;
-        }
-        if cursor.bit() == 0 {
-            cursor = cursor.align_byte(size as _);
-        } else {
-            debug_assert!(cursor.byte() & (size as Offset - 1) == 0);
-        }
-        ccx.data.slots[id].loc = cursor;
-        if sty != SlotType::Data {
-            cursor = cursor.next_bit_in_byte_wrapping();
-        }
-        if cursor.bit() == 0 {
-            cursor = cursor.next_byte(size as _);
-        }
-        previd = id;
-    }
-    cursor.align_byte(8).byte()
-}
-
-fn putbreakpoint(
-    ccx: &mut Ccx<ComputeLayout>,
-    breakpoint: BreakpointId,
-    reset: Interned<[BitmapWord<ResetId>]>
+    cursor: &mut LayoutCursor
 ) {
-    for r in Bitmap::from_words(&ccx.intern[reset]) {
-        ccx.layout.resets[r].mask.set(breakpoint);
+    for &id in &ccx.tmp[order] {
+        let &mut SlotDef { owner, data, ref mut loc, .. } = &mut ccx.data.slots[id];
+        let Func { scl, .. } = ccx.ir.funcs[owner];
+        *loc = cursor.next(scl, data);
     }
+    cursor.close_bitfield();
 }
 
 fn layoutreset(
     ccx: &mut Ccx<ComputeLayout>,
     order: Range<BumpRef<SlotId>>,
-    cursor: Offset
-) -> Offset {
-    let mut cursor = BitOffset::new_byte(cursor);
+    cursor: &mut LayoutCursor
+) {
     let mut rs: Interned<[BitmapWord<ResetId>]> = Interned::EMPTY;
-    let mut sc = SizeClass::INVALID;
-    let mut bt = SlotType::Data;
+    let mut isdup = false;
     let mut bpid: BreakpointId = 0.into();
     for pid in bump::iter_range(order.clone()) {
         let id = ccx.tmp[pid];
-        let SlotDef { owner, size, sty, .. } = ccx.data.slots[id];
+        let &mut SlotDef { owner, data, ref mut loc, .. } = &mut ccx.data.slots[id];
         let Func { reset, scl, .. } = ccx.ir.funcs[owner];
-        if (rs, sc, sty) != (reset, scl, bt) {
-            if cursor.bit() != 0 {
-                // reset, size class, or type changed mid-bitfield: close bitfield
-                cursor = cursor.next_byte(ccx.data.slots[ccx.tmp[pid.offset(-1)]].size as _);
-            }
-            sc = scl;
+        if rs != reset || isdup != (data == SlotData::BitsDup) {
+            cursor.close_bitfield();
+            isdup = data == SlotData::BitsDup;
         }
         if rs != reset {
             // reset changed, begin new interval
             // TODO: handle bpid>64, merge some intervals
-            ccx.image.breakpoints[bpid] = cursor.byte();
-            putbreakpoint(ccx, bpid, reset);
+            debug_assert!(cursor.ofs.bit() == 0);
+            ccx.image.breakpoints[bpid] = cursor.ofs.byte();
+            for r in Bitmap::from_words(&ccx.intern[reset]) {
+                ccx.layout.resets[r].mask.set(bpid);
+            }
             bpid += 1;
             rs = reset;
         }
-        // align cursor
-        if cursor.bit() == 0 {
-            cursor = cursor.align_byte(size as _);
-        } else {
-            debug_assert!(cursor.byte() & (size as Offset - 1) == 0);
-        }
-        ccx.data.slots[id].loc = cursor;
-        if sty != SlotType::Data {
-            // if we are allocating a bitfield, increment bit.
-            // if this wraps, the next `if` will increment the byte.
-            cursor = cursor.next_bit_in_byte_wrapping();
-            bt = sty;
-        }
-        if cursor.bit() == 0 {
-            cursor = cursor.next_byte(size as _);
-            bt = SlotType::Data;
-        }
+        *loc = cursor.next(scl, data);
     }
-    cursor = cursor.align_byte(8);
-    ccx.image.breakpoints[bpid] = cursor.byte();
-    cursor.byte()
+    cursor.close_bitfield();
+    ccx.image.breakpoints[bpid] = cursor.ofs.byte();
 }
 
 fn qalloc_put(
     tmp: &mut BumpPtr,
     queries: &mut IndexSlice<QueryId, Query>,
-    cursors: BumpRef<IndexSlice<QueryId, BitOffset>>,
-    size: Offset,
-    sty: SlotType,
-    quse: &Bitmap<QueryId>
+    quse: &Bitmap<QueryId>,
+    cursors: BumpRef<IndexSlice<QueryId, LayoutCursor>>,
+    scl: SizeClass,
+    data: SlotData
 ) -> BitOffset {
-    let Some(pos) = quse
-        .ones()
-        .map(|qid| {
-            let pos = tmp[cursors.elem(qid)];
-            match sty {
-                SlotType::Data => pos.align_byte(size as _),
-                SlotType::Bitmap => pos.align_byte_bit(size as _),
-                SlotType::BitmapDup => unreachable!()
-            }
-        })
-        .max()
-        else { return BitOffset::default() /* dead slot, ofs doesn't matter */ };
-    let end = match sty { SlotType::Data => pos.next_byte(size), _ => pos.next_bit() };
-    for q in quse {
-        if queries[q].vmctx_start == 0 {
-            queries[q].vmctx_start = pos.byte();
-        }
-        tmp[cursors.elem(q)] = end;
+    if quse.is_empty() {
+        // dead slot, offset doesn't matter
+        return BitOffset::new_byte(0);
     }
-    pos
+    let mut ofs = BitOffset::new_byte(0);
+    let mut end = LayoutCursor::new(ofs);
+    for qid in quse.ones() {
+        let mut cursor = tmp[cursors.elem(qid)].clone();
+        let o = cursor.next(scl, data);
+        if o > ofs {
+            debug_assert!(cursor.ofs > end.ofs);
+            (ofs, end) = (o, cursor);
+        }
+    }
+    for qid in quse.ones() {
+        if queries[qid].vmctx_start == 0 {
+            queries[qid].vmctx_start = ofs.byte();
+        }
+        tmp[cursors.elem(qid)] = end.clone();
+    }
+    ofs
 }
 
 fn layoutquery(
     ccx: &mut Ccx<ComputeLayout>,
     order: Range<BumpRef<SlotId>>,
-    cursor: Offset
-) -> Offset {
+    cursor: &mut LayoutCursor
+) {
     let base = ccx.tmp.end();
     // create at least 1 cursor, even if there are no queries, so that the allocator doesn't
     // crash when no queries are defined
-    let cursors = ccx.tmp.extend(repeat_n(BitOffset::new_byte(cursor),
+    let cursors = ccx.tmp.extend(repeat_n(cursor.clone(),
        max(ccx.layout.queries.raw.len(), 1))).cast();
     for pid in bump::iter_range(order) {
         let id = ccx.tmp[pid];
-        let SlotDef { owner, size, sty, .. } = ccx.data.slots[id];
-        ccx.data.slots[id].loc = qalloc_put(&mut ccx.tmp, &mut ccx.layout.queries, cursors,
-            size as _, sty, &ccx.data.func_quse[owner]);
+        let SlotDef { owner, data, .. } = ccx.data.slots[id];
+        let Func { scl, .. } = ccx.ir.funcs[owner];
+        ccx.data.slots[id].loc = qalloc_put(
+            &mut ccx.tmp,
+            &mut ccx.layout.queries,
+            &ccx.data.func_quse[owner],
+            cursors,
+            scl,
+            data
+        );
     }
     #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
     struct ParamDef {
@@ -390,8 +432,18 @@ fn layoutquery(
     ccx.tmp[params..].sort_unstable_by_key(|p| (!p.pop, !p.size));
     for pd in bump::iter_range(params..ccx.tmp.end().cast()) {
         let ParamDef { id, size, .. } = ccx.tmp[pd];
-        let loc = qalloc_put(&mut ccx.tmp, &mut ccx.layout.queries, cursors,
-            if size == 0xffff { 1 } else { size as _ }, SlotType::Data, &ccx.data.param_quse[id]);
+        let loc = qalloc_put(
+            &mut ccx.tmp,
+            &mut ccx.layout.queries,
+            &ccx.data.param_quse[id],
+            cursors,
+            SizeClass::GLOBAL,
+            if size == 0xffff {
+                SlotData::Bits
+            } else {
+                SlotData::Bytes(size as _, min(size as _, 8))
+            }
+        );
         let param = &mut ccx.layout.params[id];
         if size == 0xffff {
             param.check = loc;
@@ -400,16 +452,17 @@ fn layoutquery(
         }
     }
     let cursors = ccx.tmp.get_dst(cursors, ccx.layout.queries.raw.len());
-    let mut end = cursor;
-    for (query,&cursor) in zip(&mut ccx.layout.queries.raw, &cursors.raw) {
-        let qend = cursor.align_byte(1).byte();
-        end = max(end, qend);
+    for (query,qcur) in zip(&mut ccx.layout.queries.raw, &cursors.raw) {
+        let mut end = qcur.clone();
+        end.close_bitfield();
         if query.vmctx_start > 0 {
-            query.vmctx_end = qend;
+            query.vmctx_end = end.ofs.byte();
+        }
+        if end.ofs > cursor.ofs {
+            *cursor = end;
         }
     }
     ccx.tmp.truncate(base);
-    (end + 7) & !7
 }
 
 fn saveslots(ccx: &mut Ccx<ComputeLayout>) {
@@ -426,18 +479,19 @@ fn saveslots(ccx: &mut Ccx<ComputeLayout>) {
             for phi in index::iter_span(func.ret) {
                 let ty = func.phis.at(phi).type_;
                 if ty != Type::FX {
-                    let SlotDef { loc, sty, .. } = ccx.data.slots[ds];
-                    let dslot = match sty {
-                        SlotType::Data => DynSlot::new_data(loc.byte(), ty.size() as _),
-                        _ => DynSlot::new_bitmap(loc.byte(), false, loc.bit())
+                    let SlotDef { loc, data, .. } = ccx.data.slots[ds];
+                    let dslot = match data {
+                        SlotData::Bytes(..) => DynSlot::new_data(loc.byte(), ty.size() as _),
+                        SlotData::Bits => DynSlot::new_bitmap(loc.byte(), false, loc.bit()),
+                        SlotData::BitsDup => unreachable!()
                     };
                     ccx.image.mcode.write_data(&dslot);
                     ds += 1;
                 }
             }
-            let SlotDef { loc, sty, .. } = ccx.data.slots[ds];
+            let SlotDef { loc, data, .. } = ccx.data.slots[ds];
             ccx.image.mcode.write_data(
-                &DynSlot::new_bitmap(loc.byte(), sty == SlotType::BitmapDup, loc.bit()));
+                &DynSlot::new_bitmap(loc.byte(), data == SlotData::BitsDup, loc.bit()));
         }
         // alloc vmctx slots (fx slots don't matter, they will never be read/written)
         let slots = insert.end().cast();
@@ -471,16 +525,16 @@ impl Stage for ComputeLayout {
         sortslots(ccx);
         let slots_end: BumpRef<SlotId> = ccx.tmp.end().cast();
         let segn = countseg(&ccx.data.slots.raw);
-        let mut cursor = size_of::<Instance>() as Offset;
-        trace!(MEM "{} static slots, start {}", segn[0], cursor);
-        cursor = layoutstatic(ccx, slots_start..slots_start.add(segn[0]), cursor);
-        trace!(MEM "{} mask slots, start {}", segn[1], cursor);
-        cursor = layoutreset(ccx, slots_start.add(segn[0])..slots_start.add(segn[0]+segn[1]),
-            cursor);
-        trace!(MEM "{} query slots, start {}", segn[2], cursor);
-        cursor = layoutquery(ccx, slots_start.add(segn[0]+segn[1])..slots_end, cursor);
-        trace!(MEM "image size: {}", cursor);
-        ccx.image.size = cursor as _;
+        let mut cursor = LayoutCursor::new(BitOffset::new_byte(size_of::<Instance>() as _));
+        trace!(MEM "{} static slots, start {}", segn[0], cursor.ofs.byte());
+        layoutstatic(ccx, slots_start..slots_start.add(segn[0]), &mut cursor);
+        trace!(MEM "{} mask slots, start {}", segn[1], cursor.ofs.byte());
+        layoutreset(ccx, slots_start.add(segn[0])..slots_start.add(segn[0]+segn[1]), &mut cursor);
+        trace!(MEM "{} query slots, start {}", segn[2], cursor.ofs.byte());
+        layoutquery(ccx, slots_start.add(segn[0]+segn[1])..slots_end, &mut cursor);
+        trace!(MEM "image size: {}", cursor.ofs.byte());
+        debug_assert!(cursor.ofs.bit() == 0);
+        ccx.image.size = cursor.ofs.byte();
         saveslots(ccx);
         ccx.tmp.truncate(base);
         if trace!(MEM) {

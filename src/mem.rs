@@ -43,15 +43,16 @@ impl BitOffset {
 
     pub const INVALID: Self = Self(!0);
 
-    pub fn new(byte: Offset, bit: u8) -> Self {
-        Self((byte << 3) | (bit as u32))
+    pub fn new(byte: Offset, bit: u32) -> Self {
+        debug_assert!(bit <= 7);
+        Self((byte << 3) | (bit as Offset))
     }
 
     pub fn new_byte(byte: Offset) -> Self {
         Self::new(byte, 0)
     }
 
-    pub fn byte(self) -> u32 {
+    pub fn byte(self) -> Offset {
         self.0 >> 3
     }
 
@@ -59,31 +60,9 @@ impl BitOffset {
         self.0 & 0x7
     }
 
-    pub fn align_byte(self, align: Offset) -> Self {
-        Self::new_byte((self.byte() + ((self.bit() > 0) as Offset) + align - 1) & !(align - 1))
-    }
-
-    pub fn align_byte_bit(self, align: Offset) -> Self {
-        if self.byte() & (align - 1) == 0 {
-            self
-        } else {
-            self.align_byte(align)
-        }
-    }
-
-    pub fn next_byte(self, offset: Offset) -> Self {
-        Self::new_byte(self.byte() + offset)
-    }
-
-    pub fn next_bit_in_byte_wrapping(self) -> Self {
-        Self::new(self.byte(), ((self.bit()+1) & 0x7) as _)
-    }
-
-    pub fn next_bit(self) -> Self {
-        match self.bit() {
-            7 => self.next_byte(1),
-            _ => self.next_bit_in_byte_wrapping()
-        }
+    pub fn set_bit(self, bit: u32) -> Self {
+        debug_assert!(bit <= 7);
+        Self((self.0 & 0xfff8) | (bit as Offset))
     }
 
 }
@@ -98,7 +77,7 @@ impl Debug for BitOffset {
 }
 
 // static / obj
-#[derive(Clone, Copy, PartialEq, Eq, zerocopy::IntoBytes)]
+#[derive(Clone, Copy, PartialEq, Eq, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(transparent)]
 pub struct SizeClass(u32);
 
@@ -107,7 +86,7 @@ impl SizeClass {
     pub const INVALID: Self = Self(!0);
     pub const GLOBAL: Self = Self::static_class(1);
 
-    pub const fn static_class(size: u32) -> Self {
+    pub const fn static_class(size: Offset) -> Self {
         Self(size)
     }
 
@@ -117,6 +96,23 @@ impl SizeClass {
 
     pub fn is_dynamic(self) -> bool {
         (self.0 as i32) < 0
+    }
+
+    pub fn is_static(self) -> bool {
+        (self.0 as i32) >= 0
+    }
+
+    pub fn static_size(self) -> Offset {
+        debug_assert!(!self.is_dynamic());
+        self.0
+    }
+
+    pub fn bytes(self, esize: Offset) -> Self {
+        if self.is_dynamic() {
+            self
+        } else {
+            Self::static_class(self.0 * esize)
+        }
     }
 
 }

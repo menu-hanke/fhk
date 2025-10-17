@@ -364,16 +364,24 @@ fn ins_qload(ecx: &mut Ecx, id: InsId) {
     let emit = &mut *ecx.data;
     let (param, mut ofs) = emit.code[id].decode_QLOAD();
     let param = &ecx.layout.params[param];
-    let slot = if ofs == !0 {
+    let vmctx = emit.fb.vmctx();
+    let ischeck = ofs == !0;
+    let slot = if ischeck {
         ofs = 0;
         param.check
     } else {
+        // qload of value should never be colocated (at least for now)
+        debug_assert!(param.value.bit() == 0);
         param.value
     };
-    debug_assert!(slot.bit() == 0); // qload should never be colocated (at least for now)
-    let vmctx = emit.fb.vmctx();
-    emit.values[id] = InsValue::from_value(emit.fb.ins().load(irt2cl(emit.code[id].type_()),
-        MEM_VMCTX, vmctx, (slot.byte() + (ofs as Offset)) as i32));
+    let mut value = emit.fb.ins().load(irt2cl(emit.code[id].type_()),
+        MEM_VMCTX, vmctx, (slot.byte() + (ofs as Offset)) as i32);
+    if ischeck {
+        // TODO: only do this when it's actually colocated (store info somewhere)
+        value = emit.fb.ins().band_imm(value, 1 << slot.bit());
+        value = emit.fb.ins().icmp_imm(IntCC::NotEqual, value, 0);
+    }
+    emit.values[id] = InsValue::from_value(value);
 }
 
 // TODO: use BOX in lang_C (but lang_Lua can't use it because the "frame" address is fixed)
