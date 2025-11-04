@@ -247,6 +247,12 @@ fn fold(fcx: &mut Fcx, mut ins: Ins) -> FoldStatus {
         // CMOV _ x x -> x
         CMOV if ins.b() == ins.c() => FoldStatus::New(ins.decode__V()),
 
+        // CMOV x true false -> x
+        CMOV if m!(_ 1 0) => FoldStatus::New(ins.decode_V()),
+
+        // CMOV x false true -> NEG x
+        CMOV if m!(_ 0 1) => FoldStatus::Again(Ins::NEG(Type::B1, ins.decode_V())),
+
         // eliminate nop CONVs
         CONV if ins.type_() == code[ins.decode_V()].type_() => FoldStatus::New(ins.decode_V()),
 
