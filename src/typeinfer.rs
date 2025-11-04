@@ -1222,6 +1222,14 @@ macro_rules! instantiate {
     }};
 }
 
+fn visitanyall(ctx: &mut TypeInfer, args: &[Ty], scope: Scope) -> Ty {
+    for &a in args {
+        let (e, _) = unpacktensor(&mut ctx.sub, &mut ctx.err, a, scope);
+        unifyvt(&mut ctx.sub, &mut ctx.err, e, Ty::primitive(Primitive::B1));
+    }
+    Ty::primitive(Primitive::B1)
+}
+
 fn visitminmax(ctx: &mut TypeInfer, args: &[Ty], scope: Scope) -> Ty {
     let e = ctx.sub.push(Tv::unbound(scope, Some(PRI_NUM)));
     let mut accumulator: Option<TypeVar> = None;
@@ -1274,7 +1282,7 @@ fn visitintrinsic(tcx: &mut Tcx, func: Intrinsic, args: &[ObjRef<EXPR>]) -> Ty {
     macro_rules! I { ($($t:tt)*) => { instantiate!(ctx, scope, aty; $($t)*) }; }
     let ty = match func {
         UNM | EXP | LOG => I!(a,e[PRI_NUM] n :: a[Tensor e n] => a),
-        ALL | ANY => I!(a,n :: a[Tensor Ty::primitive(Primitive::B1) n] => pri Primitive::B1),
+        ALL | ANY => visitanyall(ctx, aty, scope),
         CONV => I!(a,b e n :: a[Tensor e n] => Tensor b n),
         EFFECT => I!(a ...b :: b[pri Primitive::FX] => a),
         LEN => I!(_a ...b :: b[pri PRI_IDX] => pri PRI_IDX),

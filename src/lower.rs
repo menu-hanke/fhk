@@ -2586,29 +2586,42 @@ fn emitanyall(func: &Func, loop_: &mut Loop, element: InsId, f: Intrinsic) -> In
     func.code.push(Ins::PHI(Type::B1, loop_.exit, resphi))
 }
 
-fn visitreduceintrinsic(
-    lcx: &mut Lcx,
-    intr: Intrinsic,
-    ty: Type,
-    arg: ObjRef<EXPR>,
-    mut visit: Visit
-) {
-    match visit.reborrow_mut() {
-        Visit::Materialize(slot) if lcx.objs[lcx.objs[arg].ann].op == Obj::TTEN => {
-            let mut loop_ = newloop(&lcx.data.func);
-            let element = emitexpri(lcx, arg, &mut loop_, None);
-            slot.value = match intr {
-                Intrinsic::SUM => emitsum(&lcx.data.func, &mut loop_, element, ty),
-                Intrinsic::ANY | Intrinsic::ALL => emitanyall(&lcx.data.func, &mut loop_, element, intr),
-                _ => unreachable!()
-            };
-            ctrcloseloop(&lcx.data.func, loop_, &mut slot.ctr);
-        },
-        Visit::Materialize(_) | Visit::None(_) => {
-            visitexpr(lcx, arg, visit);
-        },
-        Visit::Iterate(_) | Visit::Shape(_) => unreachable!(),
+fn visitreduceintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
+    let objs = Access::borrow(&lcx.objs);
+    let &INTR { ann, func, ref args, .. } = &objs[expr];
+    let func = Intrinsic::from_u8(func);
+    let Visit::Materialize(slot) = visit else {/* short-circuited in visitexpr */ unreachable!()};
+    let mut accumulator: IndexOption<InsId> = None.into();
+    let ty = elementtype(objs, ann).to_ir();
+    for &a in args {
+        let value = match objs[objs[a].ann].op {
+            Obj::TPRI => emitexprv(lcx, a, &mut slot.ctr),
+            Obj::TTEN => {
+                let mut loop_ = newloop(&lcx.data.func);
+                let element = emitexpri(lcx, a, &mut loop_, None);
+                let value = match func {
+                    Intrinsic::SUM => emitsum(&lcx.data.func, &mut loop_, element, ty),
+                    Intrinsic::ANY | Intrinsic::ALL =>
+                        emitanyall(&lcx.data.func, &mut loop_, element, func),
+                    _ => unreachable!()
+                };
+                ctrcloseloop(&lcx.data.func, loop_, &mut slot.ctr);
+                value
+            },
+            _ => unreachable!()
+        };
+        accumulator = Some(match (accumulator.unpack(), func) {
+            (None, _) => value,
+            (Some(acc), Intrinsic::SUM) => lcx.data.func.code.push(Ins::ADD(ty, acc, value)),
+            (Some(acc), Intrinsic::ANY) => lcx.data.func.code.push(Ins::CMOV(ty, acc, acc, value)),
+            (Some(acc), Intrinsic::ALL) => lcx.data.func.code.push(Ins::CMOV(ty, acc, value, acc)),
+            _ => unreachable!()
+        }).into();
     }
+    slot.value = match accumulator.unpack() {
+        Some(acc) => acc,
+        None => lcx.data.func.code.push(Ins::KINT(ty, (func == Intrinsic::ALL) as _))
+    };
 }
 
 fn emitwhich(
@@ -2936,17 +2949,10 @@ fn visitselect(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
 fn visitintrinsic(lcx: &mut Lcx, expr: ObjRef<INTR>, visit: Visit) {
     use Intrinsic::*;
     let objs = Access::borrow(&lcx.objs);
-    let &INTR { ann, func, ref args, .. } = &objs[expr];
-    let func = Intrinsic::from_u8(func);
-    match func {
-        UNM | EXP | LOG | NOT => {
-            visitbroadcastintrinsic(lcx, expr, visit);
-        },
-        ANY | ALL | SUM => {
-            let &[arg] = args else { unreachable!() };
-            let ObjectRef::TPRI(&TPRI { ty, .. }) = objs.get(ann) else { unreachable!() };
-            visitreduceintrinsic(lcx, func, Primitive::from_u8(ty).to_ir(), arg, visit);
-        },
+    let &INTR { func, .. } = &objs[expr];
+    match Intrinsic::from_u8(func) {
+        UNM | EXP | LOG | NOT => visitbroadcastintrinsic(lcx, expr, visit),
+        ANY | ALL | SUM => visitreduceintrinsic(lcx, expr, visit),
         CONV => todo!(),
         LEN => visitlen(lcx, expr, visit),
         LOAD => visitload(lcx, expr, visit),
