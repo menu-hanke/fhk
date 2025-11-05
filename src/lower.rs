@@ -3463,6 +3463,7 @@ fn emitquery(lcx: &mut Lcx, query: ObjRef<QUERY>) {
             fx = lcx.data.func.code.push(Ins::MOVF(Type::FX, fx, store));
             cursor += ty.size();
         }
+        cursor = (cursor + align - 1) & !(align - 1);
         lcx.tmp.truncate(base);
     }
     let out = lcx.data.func.code.push(Ins::RET());
