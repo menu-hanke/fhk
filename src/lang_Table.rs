@@ -125,10 +125,6 @@ impl TabDef {
     const INDEX_NONE: u8 = 0x7f;
 }
 
-impl DenseInput {
-    const SKIP: i64 = i64::MIN;
-}
-
 impl InputOperator {
 
     fn is_input_u8(op: u8) -> bool {
@@ -676,15 +672,16 @@ fn makedensetab(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) 
     {
         let col = ecx.perm[col];
         if InputOperator::is_input_u8(col.op) {
-            let bias = if cinfo.min == cinfo.max {
-                DenseInput::SKIP
+            let input = &mut ecx.perm[inputs.elem(col.idx as usize)];
+            if cinfo.min == cinfo.max {
+                // don't care if it fits in an integer.
+                input.bias = 0;
+                input.span = 0;
             } else {
                 debug_assert!(isrepresentable(cinfo.min, Type::I64));
-                cinfo.min as _
+                input.bias = cinfo.min as _;
+                input.span = 1 + (cinfo.max - cinfo.min) as usize;
             };
-            let input = &mut ecx.perm[inputs.elem(col.idx as usize)];
-            input.bias = bias;
-            input.span = 1 + (cinfo.max - cinfo.min) as usize;
         } else {
             let size = Type::from_u8(cinfo.ty).size();
             ecx.image.mcode.align_data(size);
@@ -693,12 +690,10 @@ fn makedensetab(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) 
             for r in 0..nrow {
                 let row = &ecx.perm[rows.add(r*ncol)..rows.add((r+1)*ncol)];
                 let mut pos = 0;
-                let mut colsize = 0;
                 for (j,(cc,cci)) in zip(columns, info).enumerate() {
                     if InputOperator::is_input_u8(cc.op) && cci.min != cci.max {
-                        pos *= colsize;
+                        pos *= 1 + (cci.max - cci.min) as usize;
                         pos += (row[j] - cci.min) as usize;
-                        colsize = 1 + (cci.max - cci.min) as usize;
                     }
                 }
                 writepacked(&mut data[pos*size..(pos+1)*size], cinfo, row[i]);
@@ -966,7 +961,6 @@ fn emittref(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result<(IndexType, 
 fn emitdenserow(ecx: &mut Ecx, data: BumpRef<DenseData>, mut args: InsId) -> Value {
     let emit = &mut *ecx.data;
     let mut row = emit.fb.ins().iconst(irt2cl(IRT_IDX), 0);
-    let mut prevspan = 0;
     let mut idx = 0;
     let inputs = ecx.perm[data].inputs;
     while emit.code[args].opcode() == Opcode::CARG {
@@ -974,15 +968,10 @@ fn emitdenserow(ecx: &mut Ecx, data: BumpRef<DenseData>, mut args: InsId) -> Val
         let mut value = emit.values[value].value();
         value = emit.fb.coerce(value, IRT_IDX, Conv::Signed);
         let DenseInput { bias, span } = ecx.perm[inputs.add(idx)];
-        if bias != DenseInput::SKIP {
-            if bias != 0 {
-                value = emit.fb.ins().iadd_imm(value, -bias);
-            }
-            if prevspan != 0 {
-                row = emit.fb.ins().imul_imm(row, prevspan);
-            }
+        if span > 0 {
+            row = emit.fb.ins().imul_imm(row, span as i64);
             row = emit.fb.ins().iadd(row, value);
-            prevspan = span as _;
+            row = emit.fb.ins().iadd_imm(row, -(bias as i64));
         }
         idx += 1;
         args = next;
