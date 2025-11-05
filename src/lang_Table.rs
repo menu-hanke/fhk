@@ -13,6 +13,7 @@
 // trait LangOpType (from_u8/to_u8/name)
 
 use core::cmp::Ordering;
+use core::fmt::Write;
 use core::iter::zip;
 use core::mem::{offset_of, MaybeUninit};
 use core::u32;
@@ -863,16 +864,22 @@ fn maketreetab(ecx: &mut Ecx, tab: BumpRef<TabDef>, info: BumpRef<ColumnInfo>) -
 }
 
 #[cfg(feature="csv")]
-fn readfile(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result {
+fn readfile(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> bool {
     let TabDef { file, ncol, .. } = ecx.perm[tab];
     let ncol = ncol as usize;
     let path = match str::from_utf8(&ecx.intern[file]) {
         Ok(path) => path,
-        Err(e) => return ecx.error(e)
+        Err(e) => {
+            write!(ecx.tmp, "{}", e).unwrap();
+            return false;
+        }
     };
     let mut reader = match csv::Reader::from_path(path) {
         Ok(reader) => reader,
-        Err(e) => return ecx.error(e)
+        Err(e) => {
+            write!(ecx.tmp, "{}", e).unwrap();
+            return false;
+        }
     };
     let mut rec = csv::StringRecord::new();
     let data = ecx.perm.align_for::<f64>().end();
@@ -884,14 +891,16 @@ fn readfile(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result {
             Ok(true) => {},
             Ok(false) => {
                 ecx.perm[tab].nrow = nrow-header;
-                return Ok(());
+                return true;
             },
-            Err(e) => return ecx.error(e)
+            Err(e) => {
+                write!(ecx.tmp, "{}", e).unwrap();
+                return false;
+            }
         }
         if rec.len() != ncol {
-            ecx.host.set_error(format_args!("{}: expected {} columns, found {}", path, ncol,
-                    rec.len()));
-            return Err(());
+            write!(ecx.tmp, "expected {} columns, found {}", ncol, rec.len()).unwrap();
+            return false;
         }
         let start = ecx.perm.end().cast::<f64>();
         for field in &rec {
@@ -905,7 +914,8 @@ fn readfile(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result {
                         header = 1;
                         break;
                     } else {
-                        return ecx.error(e);
+                        write!(ecx.tmp, "{}", e).unwrap();
+                        return false;
                     }
                 }
             };
@@ -921,10 +931,14 @@ fn readfile(ecx: &mut Ecx, _tab: BumpRef<TabDef>) -> compile::Result {
 }
 
 fn makedata(ecx: &mut Ecx, tab: BumpRef<TabDef>) -> compile::Result<(IndexType, BumpRef<()>)> {
-    if !ecx.perm[tab].file.is_empty() {
-        readfile(ecx, tab)?;
-    }
     let base = ecx.tmp.end();
+    if !ecx.perm[tab].file.is_empty() && !readfile(ecx, tab) {
+        ecx.tmp.write(" (while reading `");
+        ecx.tmp.write(&ecx.intern[ecx.perm[tab].file]);
+        ecx.tmp.write("')");
+        ecx.host.set_error_bytes(&ecx.tmp[base..]);
+        return Err(())
+    }
     let index = analyzetable(ecx, tab);
     ecx.perm[tab].index = index as _;
     let data = match index {
