@@ -1004,6 +1004,7 @@ pub fn parse_expand_var(
 
 pub fn parse_toplevel_def(pcx: &mut Pcx) -> compile::Result {
     parse_toplevel(pcx)?;
+    require(pcx, Token::Eof)?;
     expandobjs(pcx)?;
     Ok(())
 }
@@ -1014,6 +1015,7 @@ pub fn parse_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
 
 pub fn parse_toplevel_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
     let expr = parse_expr(pcx)?;
+    require(pcx, Token::Eof)?;
     expandobjs(pcx)?;
     Ok(expr)
 }
@@ -1021,6 +1023,7 @@ pub fn parse_toplevel_expr(pcx: &mut Pcx) -> compile::Result<ObjRef<EXPR>> {
 pub fn parse_template(pcx: &mut Pcx) -> compile::Result<Interned<[u8]>> {
     let base = pcx.tmp.end();
     parse_macro_body(pcx, Token::Eof.into(), true)?;
+    require(pcx, Token::Eof)?;
     let template = pcx.intern.intern(&pcx.tmp[base..]);
     pcx.tmp.truncate(base);
     Ok(template)
