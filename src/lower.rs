@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use enumset::EnumSet;
 
 use crate::bitmap::BitMatrix;
-use crate::bump::{self, Bump, BumpRef};
+use crate::bump::{Bump, BumpRef};
 use crate::compile::{self, Ccx, Stage};
 use crate::dump::dump_ir;
 use crate::hash::HashMap;
@@ -2164,7 +2164,9 @@ fn emitvgetfuse(
     mut prefix: InsId
 ) -> InsId {
     let objs = Access::borrow(&lcx.objs);
-    debug_assert!(objs[ann].op == Obj::TTEN);
+    debug_assert!(lcx.tmp[fuse].oaxis == 0);
+    debug_assert!(lcx.tmp[fuse].scalar_expr == 0);
+    debug_assert!(objs[ann.cast::<TTEN>()].dim == 1);
     let vid: VarId = zerocopy::transmute!(lcx.data.objs[&var.erase()]);
     let target = lcx.data.vars[vid].tab;
     let tcall = emittabcall(&lcx.data.func, lcx.data.tab_func[target]);
@@ -2175,21 +2177,16 @@ fn emitvgetfuse(
         prefix = lcx.data.func.code.push(Ins::ADD(IRT_IDX, prefix, value.unwrap()));
         start = start.offset(1);
     }
-    if let Some(outshape) = want_shape {
-        outshape.value = reserve(&lcx.data.func, objs[ann.cast::<TTEN>()].dim as _);
-        let outer_end = bump::iter_range(start..end)
-            .find(|&i| lcx.tmp[i].nest > 0)
-            .unwrap_or(end);
-        if let Some(p) = emitvgets(lcx, &mut outshape.ctr, start, outer_end,
-        outshape.value, tcall, target).unpack()
-        {
-            lcx.data.func.code.set(p, Ins::MOV(IRT_IDX, prefix));
-        }
-    }
     prefix = match lcx.tmp[fuse] {
-        VGETIdx { expr, axis, span, .. } if expr.is_nil() => emitsplatloop(&lcx.data, loop_, target,
-            prefix, tcall, axis as _, (axis+span) as _),
-        VGETIdx { expr, .. } => emitexpri(lcx, expr, loop_, None)
+        VGETIdx { expr, axis, span, .. } if expr.is_nil() => {
+            let (start, end) = emitsplatbounds(&lcx.data, target, prefix, tcall, axis as _,
+                (axis+span) as _);
+            if let Some(outshape) = want_shape {
+                outshape.value = lcx.data.func.code.push(Ins::SUB(IRT_IDX, end, start));
+            }
+            emitrangeloop(&lcx.data.func, loop_, IRT_IDX, start, end)
+        },
+        VGETIdx { expr, .. } => emitexpri(lcx, expr, loop_, want_shape)
     };
     let mut slot = ExprSlot { value: InsId::INVALID.into(), ctr: loop_.body };
     let flat = visitvgetinner(
@@ -2230,6 +2227,7 @@ fn visitvget(lcx: &mut Lcx, expr: ObjRef<VGET>, mut visit: Visit) {
     let prefix = idxtransfer(lcx, lcx.data.tab, target, source_dim, nprefix, INS_FLATIDX);
     let inline = isdisjointidx(&lcx.data, lcx.data.tab, target, &vget.idx);
     if let Visit::Iterate(iter) = visit.reborrow_mut() {
+        debug_assert!(objs[vget.ann].op == Obj::TTEN);
         if let Some(fuseidx) = maybefusevget(&lcx.tmp[base.cast()..idx_end]) {
             iter.element = emitvgetfuse(
                 lcx,
